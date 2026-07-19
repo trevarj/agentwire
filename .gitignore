@@ -1,0 +1,14 @@
+.direnv/
+.env
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.egg-info/
+result
+
+# Live configuration and identity material never belong in this repository.
+config.toml
+secrets.env
+*.pem
+*.key
+state.json

@@ -1,0 +1,59 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Literal
+
+EventKind = Literal[
+    "connected",
+    "disconnected",
+    "turn_started",
+    "turn_done",
+    "turn_failed",
+    "assistant",
+    "tool_started",
+    "tool_finished",
+    "approval",
+    "question",
+    "request_resolved",
+]
+
+
+@dataclass(slots=True, frozen=True)
+class SessionSummary:
+    id: str
+    cwd: str
+    title: str
+    updated_at: float = 0
+
+
+@dataclass(slots=True, frozen=True)
+class Question:
+    id: str
+    header: str
+    prompt: str
+    options: tuple[str, ...] = ()
+    multiple: bool = False
+    custom: bool = True
+    secret: bool = False
+
+
+@dataclass(slots=True)
+class BackendEvent:
+    kind: EventKind
+    backend: str
+    session_id: str | None = None
+    turn_id: str | None = None
+    item_id: str | None = None
+    request_token: str | int | None = None
+    text: str = ""
+    tool_kind: str = "tool"
+    success: bool | None = None
+    questions: tuple[Question, ...] = ()
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True, frozen=True)
+class ChannelBinding:
+    backend: str
+    session_id: str
+    cwd: str
