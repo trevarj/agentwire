@@ -1,5 +1,5 @@
-from irc_bridge.paste import scan_secrets
-from irc_bridge.text import clean_text, preview, truncate_utf8
+from agentwire.paste import scan_secrets
+from agentwire.text import clean_text, preview, truncate_utf8
 
 
 def test_utf8_truncation_never_splits_character() -> None:

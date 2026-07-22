@@ -3,7 +3,7 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "irc-agent-bridge"
+name = "agentwire"
 version = "0.1.0"
 description = "A private IRCv3 bridge for Codex and OpenCode sessions"
 readme = "README.md"
@@ -12,7 +12,8 @@ license = "MIT"
 dependencies = ["aiohttp>=3.11,<4"]
 
 [project.scripts]
-irc-bridge = "irc_bridge.cli:main"
+agentwire = "agentwire.cli:main"
+irc-bridge = "agentwire.cli:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

@@ -12,11 +12,11 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from irc_bridge.backends.codex import CodexBackend
-from irc_bridge.backends.opencode import OpenCodeBackend
-from irc_bridge.bridge import Bridge
-from irc_bridge.config import Config, install_secret_env
-from irc_bridge.irc import IRCClient
+from agentwire.backends.codex import CodexBackend
+from agentwire.backends.opencode import OpenCodeBackend
+from agentwire.bridge import Bridge
+from agentwire.config import Config, install_secret_env
+from agentwire.irc import IRCClient
 
 
 class StackError(RuntimeError):

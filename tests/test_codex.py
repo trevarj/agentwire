@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from irc_bridge.backends.codex import CodexBackend
-from irc_bridge.config import CodexConfig
+from agentwire.backends.codex import CodexBackend
+from agentwire.config import CodexConfig
 
 
 @pytest.mark.asyncio

@@ -1,10 +1,10 @@
-# IRC agent bridge: implementation plan
+# Agentwire: implementation plan
 
 ## Outcome
 
 Run one foreground command, `nix run .#stack`, to start an SSH tunnel to Ergo,
 the official Codex app-server, an OpenCode HTTP/SSE server, and an owner-only
-IRC bridge. `#codex` and `#opencode` each bind to one live agent session. The
+Agentwire. `#codex` and `#opencode` each bind to one live agent session. The
 same sessions remain attachable from the native TUIs.
 
 The stack is deliberately manual and ephemeral: no system service, no offline
@@ -14,7 +14,7 @@ command stops every child process.
 ## Architecture
 
 ```text
-IRC client -> Ergo <-TLS/SASL over SSH tunnel-> IRC bridge
+IRC client -> Ergo <-TLS/SASL over SSH tunnel-> Agentwire
                                                   |-- Codex app-server (UDS WebSocket)
                                                   `-- OpenCode serve (HTTP + global SSE)
 ```

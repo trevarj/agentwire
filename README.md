@@ -1,6 +1,6 @@
-# IRC agent bridge
+# Agentwire
 
-`irc-agent-bridge` connects two private IRC channels to live Codex and OpenCode
+Agentwire connects two private IRC channels to live Codex and OpenCode
 sessions. It is intentionally owner-only: commands are accepted only when Ergo's
 IRCv3 `account-tag` exactly matches the configured account.
 
@@ -15,9 +15,13 @@ and the bridge. `Ctrl-C` stops the whole tree. Nothing is installed as a system
 or user service.
 
 Live server details and all credentials live outside this repository in
-`~/.config/irc-bridge/`. Start from [`config.example.toml`](config.example.toml).
+`~/.config/agentwire/`. Start from [`config.example.toml`](config.example.toml).
 The secrets file is a mode-0600 env file containing only the variables named by
 the live config.
+
+Existing installations remain usable during migration: the `irc-bridge`
+executable is a compatibility alias, and Agentwire falls back to
+`~/.config/irc-bridge/config.toml` when the new config path does not exist.
 
 ## IRC workflow
 

@@ -1,9 +1,9 @@
-# Copy this to ~/.config/irc-bridge/config.toml and keep the live file private.
+# Copy this to ~/.config/agentwire/config.toml and keep the live file private.
 
 [bridge]
 owner_account = "your-account"
 allowed_roots = ["/home/you/Workspace"]
-state_file = "~/.local/state/irc-bridge/state.json"
+state_file = "~/.local/state/agentwire/state.json"
 queue_limit = 10
 summary_max_lines = 8
 summary_max_bytes = 1200
@@ -11,21 +11,21 @@ tool_milestone_limit = 12
 notify_owner_on_start = true
 
 [secrets]
-env_file = "~/.config/irc-bridge/secrets.env"
+env_file = "~/.config/agentwire/secrets.env"
 
 [irc]
 host = "127.0.0.1"
 port = 16698
 server_hostname = "irc.example.com"
-ca_file = "~/.config/irc-bridge/ergo-fullchain.pem"
-nickname = "ircbridge"
-username = "ircbridge"
-realname = "IRC agent bridge"
-password_env = "IRC_BRIDGE_IRC_PASSWORD"
+ca_file = "~/.config/agentwire/ergo-fullchain.pem"
+nickname = "agentwire"
+username = "agentwire"
+realname = "Agentwire agent bridge"
+password_env = "AGENTWIRE_IRC_PASSWORD"
 channels = { "#codex" = "codex", "#opencode" = "opencode" }
 
 [codex]
-socket_path = "$XDG_RUNTIME_DIR/irc-bridge/codex.sock"
+socket_path = "$XDG_RUNTIME_DIR/agentwire/codex.sock"
 binary = "codex"
 
 [opencode]

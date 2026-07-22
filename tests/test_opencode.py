@@ -4,9 +4,9 @@ from typing import Any
 
 import pytest
 
-from irc_bridge.backends.opencode import OpenCodeBackend
-from irc_bridge.config import OpenCodeConfig
-from irc_bridge.models import Question
+from agentwire.backends.opencode import OpenCodeBackend
+from agentwire.config import OpenCodeConfig
+from agentwire.models import Question
 
 
 class StubOpenCode(OpenCodeBackend):

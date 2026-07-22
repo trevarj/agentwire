@@ -3,7 +3,7 @@ from __future__ import annotations
 import abc
 from collections.abc import AsyncIterator, Sequence
 
-from irc_bridge.models import BackendEvent, Question, SessionSummary
+from agentwire.models import BackendEvent, Question, SessionSummary
 
 
 class BackendError(RuntimeError):

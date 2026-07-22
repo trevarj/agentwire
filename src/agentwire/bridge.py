@@ -7,13 +7,13 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from irc_bridge.backends.base import Backend, BackendError
-from irc_bridge.config import Config, ConfigError, resolve_workspace
-from irc_bridge.irc import IRCClient, IRCMessage
-from irc_bridge.models import BackendEvent, ChannelBinding, Question, SessionSummary
-from irc_bridge.paste import LitterboxClient, PasteError
-from irc_bridge.state import StateStore
-from irc_bridge.text import preview, safe_one_line
+from agentwire.backends.base import Backend, BackendError
+from agentwire.config import Config, ConfigError, resolve_workspace
+from agentwire.irc import IRCClient, IRCMessage
+from agentwire.models import BackendEvent, ChannelBinding, Question, SessionSummary
+from agentwire.paste import LitterboxClient, PasteError
+from agentwire.state import StateStore
+from agentwire.text import preview, safe_one_line
 
 
 @dataclass(slots=True)
@@ -130,7 +130,7 @@ class Bridge:
                 channels = " and ".join(self.channels)
                 await self.irc.send_privmsg(
                     self.config.bridge.owner_account,
-                    f"✅ IRC bridge is ready: {channels}. Send !help or !running.",
+                    f"✅ Agentwire is ready: {channels}. Send !help or !running.",
                 )
             await asyncio.gather(*self._tasks)
         finally:

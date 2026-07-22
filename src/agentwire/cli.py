@@ -6,8 +6,8 @@ import os
 import sys
 from pathlib import Path
 
-from irc_bridge.config import ConfigError, load_config
-from irc_bridge.stack import (
+from agentwire.config import ConfigError, load_config
+from agentwire.stack import (
     StackError,
     codex_tui,
     doctor,
@@ -19,12 +19,17 @@ from irc_bridge.stack import (
 
 
 def default_config_path() -> Path:
+    configured = os.environ.get("AGENTWIRE_CONFIG") or os.environ.get("IRC_BRIDGE_CONFIG")
+    if configured:
+        return Path(configured).expanduser()
     base = Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
-    return base / "irc-bridge" / "config.toml"
+    current = base / "agentwire" / "config.toml"
+    legacy = base / "irc-bridge" / "config.toml"
+    return legacy if not current.exists() and legacy.exists() else current
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="irc-bridge")
+    parser = argparse.ArgumentParser(prog="agentwire")
     parser.add_argument(
         "--config",
         type=Path,
@@ -64,7 +69,7 @@ def main() -> None:
     except KeyboardInterrupt:
         return
     except (ConfigError, StackError, RuntimeError) as exc:
-        print(f"irc-bridge: {exc}", file=sys.stderr)
+        print(f"agentwire: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
 
 

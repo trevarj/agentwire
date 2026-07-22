@@ -7,9 +7,9 @@ from types import MappingProxyType
 
 import pytest
 
-from irc_bridge.backends.base import Backend
-from irc_bridge.bridge import Bridge
-from irc_bridge.config import (
+from agentwire.backends.base import Backend
+from agentwire.bridge import Bridge
+from agentwire.config import (
     BridgeConfig,
     CodexConfig,
     Config,
@@ -19,8 +19,8 @@ from irc_bridge.config import (
     SecretsConfig,
     StackConfig,
 )
-from irc_bridge.irc import IRCMessage
-from irc_bridge.models import BackendEvent, ChannelBinding, Question, SessionSummary
+from agentwire.irc import IRCMessage
+from agentwire.models import BackendEvent, ChannelBinding, Question, SessionSummary
 
 
 class FakeIRC:

@@ -5,7 +5,32 @@ from pathlib import Path
 
 import pytest
 
-from irc_bridge.config import ConfigError, _path, load_secret_env, resolve_workspace
+from agentwire.cli import default_config_path
+from agentwire.config import ConfigError, _path, load_secret_env, resolve_workspace
+
+
+def test_default_config_path_prefers_agentwire_and_falls_back_to_legacy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv("AGENTWIRE_CONFIG", raising=False)
+    monkeypatch.delenv("IRC_BRIDGE_CONFIG", raising=False)
+    legacy = tmp_path / "irc-bridge" / "config.toml"
+    legacy.parent.mkdir()
+    legacy.touch()
+    assert default_config_path() == legacy
+    current = tmp_path / "agentwire" / "config.toml"
+    current.parent.mkdir()
+    current.touch()
+    assert default_config_path() == current
+
+
+def test_default_config_path_honors_agentwire_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured = tmp_path / "custom.toml"
+    monkeypatch.setenv("AGENTWIRE_CONFIG", str(configured))
+    assert default_config_path() == configured
 
 
 def test_workspace_accepts_path_relative_to_allowed_root(tmp_path: Path) -> None:

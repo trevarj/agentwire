@@ -6,8 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from irc_bridge.models import ChannelBinding
-from irc_bridge.state import StateStore
+from agentwire.models import ChannelBinding
+from agentwire.state import StateStore
 
 
 @pytest.mark.asyncio

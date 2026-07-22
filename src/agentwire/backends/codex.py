@@ -9,10 +9,10 @@ from typing import Any
 
 import aiohttp
 
-from irc_bridge.backends.base import Backend, BackendError
-from irc_bridge.config import CodexConfig
-from irc_bridge.models import BackendEvent, Question, SessionSummary
-from irc_bridge.text import safe_one_line
+from agentwire.backends.base import Backend, BackendError
+from agentwire.config import CodexConfig
+from agentwire.models import BackendEvent, Question, SessionSummary
+from agentwire.text import safe_one_line
 
 
 class CodexBackend(Backend):
@@ -53,7 +53,7 @@ class CodexBackend(Backend):
                     "initialize",
                     {
                         "clientInfo": {
-                            "name": "irc-agent-bridge",
+                            "name": "agentwire",
                             "title": "IRC agent bridge",
                             "version": "0.1.0",
                         },
@@ -521,7 +521,7 @@ class CodexBackend(Backend):
     async def create_session(self, cwd: str) -> SessionSummary:
         result = await self._request(
             "thread/start",
-            {"cwd": cwd, "serviceName": "irc-agent-bridge"},
+            {"cwd": cwd, "serviceName": "agentwire"},
         )
         thread = (result or {}).get("thread") or {}
         if not thread.get("id"):

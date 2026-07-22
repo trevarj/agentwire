@@ -7,7 +7,7 @@ import os
 import tempfile
 from pathlib import Path
 
-from irc_bridge.models import ChannelBinding
+from agentwire.models import ChannelBinding
 
 
 class StateStore:

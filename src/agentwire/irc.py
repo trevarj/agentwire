@@ -8,8 +8,8 @@ import secrets
 import ssl
 from dataclasses import dataclass, field
 
-from irc_bridge.config import IRCConfig
-from irc_bridge.text import clean_text, truncate_utf8
+from agentwire.config import IRCConfig
+from agentwire.text import clean_text, truncate_utf8
 
 
 class IRCError(RuntimeError):

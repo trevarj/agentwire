@@ -1,5 +1,5 @@
 {
-  description = "Owner-only IRC bridge for live Codex and OpenCode sessions";
+  description = "Agentwire: an owner-only IRC bridge for Codex and OpenCode sessions";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -8,7 +8,7 @@
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
       packageFor = pkgs: pkgs.python3Packages.buildPythonApplication {
-        pname = "irc-agent-bridge";
+        pname = "agentwire";
         version = "0.1.0";
         src = ./.;
         pyproject = true;
@@ -23,11 +23,17 @@
         '';
       };
       appFor = pkgs: package: command: pkgs.writeShellApplication {
-        name = "irc-bridge-${command}";
+        name = "agentwire-${command}";
         runtimeInputs = [ package ];
         text = ''
-          config_path="''${IRC_BRIDGE_CONFIG:-$HOME/.config/irc-bridge/config.toml}"
-          exec irc-bridge --config "$config_path" ${command} "$@"
+          if [ -n "''${AGENTWIRE_CONFIG:-}" ]; then
+            config_path="$AGENTWIRE_CONFIG"
+          elif [ -f "$HOME/.config/agentwire/config.toml" ]; then
+            config_path="$HOME/.config/agentwire/config.toml"
+          else
+            config_path="''${IRC_BRIDGE_CONFIG:-$HOME/.config/irc-bridge/config.toml}"
+          fi
+          exec agentwire --config "$config_path" ${command} "$@"
         '';
       };
     in {
@@ -47,8 +53,8 @@
           package = self.packages.${system}.default;
           mk = command: {
             type = "app";
-            program = "${appFor pkgs package command}/bin/irc-bridge-${command}";
-            meta.description = "Run the IRC agent bridge ${command} command";
+            program = "${appFor pkgs package command}/bin/agentwire-${command}";
+            meta.description = "Run the Agentwire ${command} command";
           };
         in {
           default = mk "stack";

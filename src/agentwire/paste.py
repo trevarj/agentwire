@@ -5,8 +5,8 @@ from dataclasses import dataclass
 
 import aiohttp
 
-from irc_bridge.config import PasteConfig
-from irc_bridge.text import clean_text
+from agentwire.config import PasteConfig
+from agentwire.text import clean_text
 
 
 class PasteError(RuntimeError):

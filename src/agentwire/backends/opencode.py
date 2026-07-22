@@ -10,10 +10,10 @@ from urllib.parse import quote
 
 import aiohttp
 
-from irc_bridge.backends.base import Backend, BackendError
-from irc_bridge.config import OpenCodeConfig
-from irc_bridge.models import BackendEvent, Question, SessionSummary
-from irc_bridge.text import safe_one_line
+from agentwire.backends.base import Backend, BackendError
+from agentwire.config import OpenCodeConfig
+from agentwire.models import BackendEvent, Question, SessionSummary
+from agentwire.text import safe_one_line
 
 
 class OpenCodeBackend(Backend):

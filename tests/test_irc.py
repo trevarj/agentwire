@@ -1,4 +1,4 @@
-from irc_bridge.irc import parse_irc_line
+from agentwire.irc import parse_irc_line
 
 
 def test_parse_ircv3_account_tag() -> None:
