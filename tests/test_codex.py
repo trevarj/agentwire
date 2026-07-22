@@ -1,11 +1,56 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
 
 from agentwire.backends.codex import CodexBackend
 from agentwire.config import CodexConfig
+
+
+def _fake_process(proc_root: Path, pid: int, cwd: Path, *arguments: str) -> None:
+    process = proc_root / str(pid)
+    process.mkdir()
+    (process / "cmdline").write_bytes(b"\0".join(item.encode() for item in arguments) + b"\0")
+    os.symlink(cwd, process / "cwd")
+
+
+def test_live_codex_processes_find_new_and_resumed_sessions(tmp_path: Path) -> None:
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    _fake_process(proc_root, 10, first, "/bin/codex")
+    _fake_process(proc_root, 11, first, "/bin/codex")
+    _fake_process(proc_root, 12, second, "/bin/codex", "resume", "thread-12")
+    _fake_process(proc_root, 13, second, "/bin/codex", "app-server")
+    _fake_process(proc_root, 14, second, "/bin/not-codex")
+
+    explicit, workspaces = CodexBackend._live_codex_processes(proc_root)
+
+    assert explicit == {"thread-12"}
+    assert workspaces == {str(first): 2}
+
+
+def test_rollout_busy_tracks_latest_task_boundary(tmp_path: Path) -> None:
+    session_id = "019f887c-9632-7e61-a50c-26d4125854ce"
+    rollout = tmp_path / f"rollout-{session_id}.jsonl"
+    rollout.write_text(
+        '{"type":"event_msg","payload":{"type":"task_complete"}}\n'
+        '{"type":"event_msg","payload":{"type":"task_started"}}\n',
+        encoding="utf-8",
+    )
+    assert CodexBackend._rollout_busy(session_id, tmp_path) is True
+    with rollout.open("a", encoding="utf-8") as handle:
+        handle.write('{"type":"event_msg","payload":{"type":"task_complete"}}\n')
+    assert CodexBackend._rollout_busy(session_id, tmp_path) is False
+
+
+def test_rollout_busy_rejects_unsafe_session_id(tmp_path: Path) -> None:
+    assert CodexBackend._rollout_busy("../thread", tmp_path) is None
 
 
 @pytest.mark.asyncio
@@ -204,3 +249,31 @@ async def test_running_sessions_paginates_and_filters_active_threads() -> None:
     sessions = await backend.list_running_sessions()
     assert [session.id for session in sessions] == ["active-1", "active-2"]
     assert calls[1]["cursor"] == "page-2"
+
+
+@pytest.mark.asyncio
+async def test_running_sessions_include_threads_with_live_codex_processes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
+
+    async def request(method: str, params: dict[str, object]) -> object:
+        assert method == "thread/list"
+        return {
+            "data": [
+                {"id": "newest", "cwd": "/workspace", "status": {"type": "idle"}},
+                {"id": "resumed", "cwd": "/other", "status": {"type": "idle"}},
+                {"id": "old", "cwd": "/workspace", "status": {"type": "idle"}},
+            ]
+        }
+
+    monkeypatch.setattr(
+        CodexBackend,
+        "_live_codex_processes",
+        staticmethod(lambda: ({"resumed"}, {"/workspace": 1})),
+    )
+    backend._request = request  # type: ignore[method-assign]
+
+    sessions = await backend.list_running_sessions()
+
+    assert [session.id for session in sessions] == ["newest", "resumed"]

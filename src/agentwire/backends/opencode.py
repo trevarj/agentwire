@@ -471,6 +471,12 @@ class OpenCodeBackend(Backend):
         self._session_cwds[summary.id] = summary.cwd
         return summary
 
+    async def session_busy(self, session_id: str) -> bool | None:
+        statuses = await self._json("GET", "/session/status")
+        if not isinstance(statuses, dict):
+            return None
+        return self._status_type(statuses, session_id) in {"busy", "retry", "active"}
+
     @staticmethod
     def _status_type(statuses: dict[str, Any], session_id: str) -> str:
         status = statuses.get(session_id) or {}

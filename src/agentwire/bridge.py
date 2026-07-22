@@ -442,6 +442,13 @@ class Bridge:
                 "Try !running or !new <workspace>.",
             )
             return
+        observed_busy = await self.backends[runtime.backend].session_busy(
+            runtime.binding.session_id
+        )
+        if observed_busy is not None:
+            runtime.busy = observed_busy
+            if observed_busy and runtime.last_activity is None:
+                runtime.last_activity = "working"
         state = "🟢 Working" if runtime.busy else "⚪ Idle"
         waiting = "none"
         if runtime.active_flags:
@@ -461,7 +468,7 @@ class Bridge:
             f"📂 {self._display_path(Path(runtime.binding.cwd))} · "
             f"{self._short(runtime.binding.session_id)}\n"
             f"💬 {runtime.last_activity or 'No activity observed'}\n"
-            f"📝 Held: {held} · 📬 Queue: {len(runtime.queue)} · ❓ Requests: {requests}",
+            f"📝 Held: {held} · 📬 IRC queue: {len(runtime.queue)} · ❓ Requests: {requests}",
         )
 
     async def _watch(self, channel: str, argument: str) -> None:

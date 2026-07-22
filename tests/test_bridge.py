@@ -276,7 +276,7 @@ async def test_status_is_multiline_dashboard(tmp_path: Path) -> None:
     await bridge._status("#codex")
     dashboard = irc.sent[-1][1]
     assert "🤖 Codex · 🟡 Waiting On Approval · 👁 concise" in dashboard
-    assert "📝 Held: 1 message(s) · 📬 Queue: 1" in dashboard
+    assert "📝 Held: 1 message(s) · 📬 IRC queue: 1" in dashboard
 
 
 @pytest.mark.asyncio

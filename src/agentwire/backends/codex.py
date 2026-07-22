@@ -3,8 +3,12 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
+import re
 import time
+from collections import Counter
 from collections.abc import AsyncIterator, Sequence
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -511,12 +515,95 @@ class CodexBackend(Backend):
             result = await self._request("thread/list", params)
             for item in (result or {}).get("data") or []:
                 if isinstance(item, dict):
-                    summary = self._summary(item)
-                    if summary.busy:
-                        sessions.append(summary)
+                    sessions.append(self._summary(item))
             cursor = str((result or {}).get("nextCursor") or "") or None
             if not cursor:
-                return sessions
+                break
+
+        explicit_ids, workspace_counts = self._live_codex_processes()
+        selected = {session.id for session in sessions if session.busy}
+        selected.update(explicit_ids)
+        for cwd, count in workspace_counts.items():
+            matches = (
+                session
+                for session in sessions
+                if session.cwd == cwd and session.id not in selected
+            )
+            for session in list(matches)[:count]:
+                selected.add(session.id)
+        return [session for session in sessions if session.id in selected]
+
+    async def session_busy(self, session_id: str) -> bool | None:
+        return self._rollout_busy(session_id)
+
+    @staticmethod
+    def _rollout_busy(
+        session_id: str,
+        sessions_root: Path | None = None,
+    ) -> bool | None:
+        if re.fullmatch(r"[0-9a-f-]+", session_id) is None:
+            return None
+        if sessions_root is None:
+            codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+            sessions_root = codex_home / "sessions"
+        try:
+            candidates = tuple(sessions_root.rglob(f"*{session_id}.jsonl"))
+            rollout = max(candidates, key=lambda path: path.stat().st_mtime)
+            with rollout.open("rb") as handle:
+                handle.seek(0, 2)
+                size = handle.tell()
+                handle.seek(max(0, size - 262_144))
+                data = handle.read()
+        except (OSError, ValueError):
+            return None
+        for raw in reversed(data.splitlines()):
+            try:
+                record = json.loads(raw)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if record.get("type") != "event_msg":
+                continue
+            payload = record.get("payload") or {}
+            event_type = payload.get("type") if isinstance(payload, dict) else None
+            if event_type == "task_started":
+                return True
+            if event_type in {"task_complete", "task_failed", "turn_aborted"}:
+                return False
+        return None
+
+    @staticmethod
+    def _live_codex_processes(
+        proc_root: Path = Path("/proc"),
+    ) -> tuple[set[str], Counter[str]]:
+        explicit_ids: set[str] = set()
+        workspace_counts: Counter[str] = Counter()
+        try:
+            processes = tuple(proc_root.iterdir())
+        except OSError:
+            return explicit_ids, workspace_counts
+        for process in processes:
+            if not process.name.isdigit():
+                continue
+            try:
+                arguments = [
+                    part.decode(errors="replace")
+                    for part in (process / "cmdline").read_bytes().split(b"\0")
+                    if part
+                ]
+                if not arguments or Path(arguments[0]).name != "codex":
+                    continue
+                if "app-server" in arguments[1:]:
+                    continue
+                if "resume" in arguments[1:]:
+                    position = arguments.index("resume")
+                    if position + 1 < len(arguments):
+                        explicit_ids.add(arguments[position + 1])
+                        continue
+                workspace = str((process / "cwd").resolve(strict=True))
+            except (OSError, ValueError):
+                continue
+            workspace_counts[workspace] += 1
+        return explicit_ids, workspace_counts
 
     async def create_session(self, cwd: str) -> SessionSummary:
         result = await self._request(

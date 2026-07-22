@@ -37,6 +37,9 @@ class Backend(abc.ABC):
     @abc.abstractmethod
     async def attach_session(self, session_id: str, cwd: str | None = None) -> SessionSummary: ...
 
+    async def session_busy(self, session_id: str) -> bool | None:
+        return None
+
     @abc.abstractmethod
     async def send_message(self, session_id: str, text: str) -> str | None: ...
 
