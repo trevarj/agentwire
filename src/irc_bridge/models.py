@@ -9,6 +9,8 @@ EventKind = Literal[
     "turn_started",
     "turn_done",
     "turn_failed",
+    "status_changed",
+    "progress",
     "assistant",
     "tool_started",
     "tool_finished",
@@ -24,6 +26,11 @@ class SessionSummary:
     cwd: str
     title: str
     updated_at: float = 0
+    busy: bool = False
+    active_flags: tuple[str, ...] = ()
+    active_turn_id: str | None = None
+    last_output: str | None = None
+    last_reply: str | None = None
 
 
 @dataclass(slots=True, frozen=True)

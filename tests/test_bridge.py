@@ -164,6 +164,71 @@ async def test_tool_relay_does_not_include_backend_payload(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_progress_is_relayed_without_replacing_last_reply(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    runtime = bridge.channels["#codex"]
+    runtime.last_reply = "previous final reply"
+    await bridge._handle_backend_event(
+        BackendEvent(
+            kind="progress",
+            backend="codex",
+            session_id="thread-1",
+            text="I found the cause and am checking the fix.",
+        )
+    )
+    assert irc.sent == [("#codex", "I found the cause and am checking the fix.")]
+    assert runtime.last_output == "I found the cause and am checking the fix."
+    assert runtime.last_reply == "previous final reply"
+
+
+@pytest.mark.asyncio
+async def test_last_repeats_latest_output_without_starting_turn(tmp_path: Path) -> None:
+    bridge, irc, backend = make_bridge(tmp_path)
+    bridge.channels["#codex"].last_output = "Most recent commentary"
+    await bridge._command("#codex", "!last", "")
+    assert irc.sent == [("#codex", "Most recent commentary")]
+    assert backend.sent == []
+
+
+@pytest.mark.asyncio
+async def test_backend_status_change_updates_irc_status(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_backend_event(
+        BackendEvent(
+            kind="status_changed",
+            backend="codex",
+            session_id="thread-1",
+            data={"busy": True, "active_flags": ("waitingOnApproval",)},
+        )
+    )
+    await bridge._status("#codex")
+    assert "codex busy (waiting on approval)" in irc.sent[-1][1]
+    assert "activity waiting on approval" in irc.sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_binding_restores_active_state_and_latest_output(tmp_path: Path) -> None:
+    bridge, irc, backend = make_bridge(tmp_path)
+    await bridge._bind(
+        "#codex",
+        SessionSummary(
+            "thread-2",
+            str(tmp_path),
+            "active session",
+            busy=True,
+            active_turn_id="turn-2",
+            last_output="Existing commentary",
+        ),
+    )
+    await bridge._status("#codex")
+    await bridge._command("#codex", "!last", "")
+    assert "codex busy" in irc.sent[-2][1]
+    assert "activity Existing commentary" in irc.sent[-2][1]
+    assert irc.sent[-1] == ("#codex", "Existing commentary")
+    assert backend.sent == []
+
+
+@pytest.mark.asyncio
 async def test_sensitive_question_is_tui_only(tmp_path: Path) -> None:
     bridge, irc, _backend = make_bridge(tmp_path)
     await bridge._handle_backend_event(

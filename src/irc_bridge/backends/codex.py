@@ -256,6 +256,44 @@ class CodexBackend(Backend):
 
     async def _handle_notification(self, method: str, params: dict[str, Any]) -> None:
         thread_id = str(params.get("threadId") or "") or None
+        if method == "thread/status/changed" and thread_id:
+            status = params.get("status") or {}
+            status_type = str(status.get("type") if isinstance(status, dict) else status)
+            active_flags = tuple(
+                str(flag) for flag in status.get("activeFlags") or ()
+            ) if isinstance(status, dict) else ()
+            await self._events.put(
+                BackendEvent(
+                    kind="status_changed",
+                    backend=self.name,
+                    session_id=thread_id,
+                    data={"busy": status_type == "active", "active_flags": active_flags},
+                )
+            )
+            return
+        if method == "turn/plan/updated" and thread_id:
+            plan = params.get("plan") or []
+            active_step = next(
+                (
+                    str(item.get("step") or "").strip()
+                    for item in plan
+                    if isinstance(item, dict) and item.get("status") == "inProgress"
+                ),
+                "",
+            )
+            explanation = str(params.get("explanation") or "").strip()
+            text = explanation or (f"plan: {active_step}" if active_step else "")
+            if text:
+                await self._events.put(
+                    BackendEvent(
+                        kind="progress",
+                        backend=self.name,
+                        session_id=thread_id,
+                        turn_id=str(params.get("turnId") or "") or None,
+                        text=text,
+                    )
+                )
+            return
         if method == "serverRequest/resolved":
             token = params.get("requestId")
             self._server_requests.pop(token, None)
@@ -290,6 +328,19 @@ class CodexBackend(Backend):
             item_type = item.get("type")
             if item_type == "agentMessage" and method == "item/completed" and turn_id:
                 self._turn_messages.setdefault((thread_id, turn_id), []).append(item)
+                if item.get("phase") == "commentary":
+                    text = str(item.get("text") or "").strip()
+                    if text:
+                        await self._events.put(
+                            BackendEvent(
+                                kind="progress",
+                                backend=self.name,
+                                session_id=thread_id,
+                                turn_id=turn_id,
+                                item_id=str(item.get("id") or "") or None,
+                                text=text,
+                            )
+                        )
                 return
             tool_kind = self._tool_kind(str(item_type))
             if tool_kind:
@@ -451,17 +502,69 @@ class CodexBackend(Backend):
         return self._summary(thread)
 
     async def attach_session(self, session_id: str, cwd: str | None = None) -> SessionSummary:
-        params: dict[str, Any] = {"threadId": session_id, "excludeTurns": True}
+        params: dict[str, Any] = {
+            "threadId": session_id,
+            "excludeTurns": True,
+            "initialTurnsPage": {
+                "limit": 1,
+                "sortDirection": "desc",
+                "itemsView": "full",
+            },
+        }
         if cwd:
             params["cwd"] = cwd
         result = await self._request("thread/resume", params)
         thread = (result or {}).get("thread") or {}
         if not thread.get("id"):
             raise BackendError("Codex thread/resume returned no thread")
-        return self._summary(thread)
+        summary = self._summary(thread)
+        turns = ((result or {}).get("initialTurnsPage") or {}).get("data") or []
+        active_turn_id = next(
+            (
+                str(turn.get("id") or "") or None
+                for turn in turns
+                if isinstance(turn, dict) and turn.get("status") == "inProgress"
+            ),
+            None,
+        )
+        if active_turn_id:
+            self._active_turns[session_id] = active_turn_id
+        latest_turn = next((turn for turn in turns if isinstance(turn, dict)), {})
+        messages = [
+            item
+            for item in latest_turn.get("items") or []
+            if isinstance(item, dict) and item.get("type") == "agentMessage"
+        ]
+        last_output = next(
+            (
+                str(item.get("text") or "").strip()
+                for item in reversed(messages)
+                if str(item.get("text") or "").strip()
+            ),
+            "",
+        ) or None
+        last_reply = self._select_final_message(messages) or None
+        if last_reply:
+            self._last_replies[session_id] = last_reply
+        return SessionSummary(
+            id=summary.id,
+            cwd=summary.cwd,
+            title=summary.title,
+            updated_at=summary.updated_at,
+            busy=summary.busy,
+            active_flags=summary.active_flags,
+            active_turn_id=active_turn_id,
+            last_output=last_output,
+            last_reply=last_reply,
+        )
 
     @staticmethod
     def _summary(thread: dict[str, Any]) -> SessionSummary:
+        status = thread.get("status") or {}
+        status_type = str(status.get("type") if isinstance(status, dict) else status)
+        active_flags = tuple(
+            str(flag) for flag in status.get("activeFlags") or ()
+        ) if isinstance(status, dict) else ()
         return SessionSummary(
             id=str(thread.get("id") or ""),
             cwd=str(thread.get("cwd") or ""),
@@ -469,6 +572,8 @@ class CodexBackend(Backend):
                 str(thread.get("name") or thread.get("preview") or "untitled"), 100
             ),
             updated_at=float(thread.get("updatedAt") or thread.get("createdAt") or time.time()),
+            busy=status_type == "active",
+            active_flags=active_flags,
         )
 
     @staticmethod

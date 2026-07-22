@@ -28,6 +28,7 @@ class ChannelRuntime:
     binding: ChannelBinding | None = None
     busy: bool = False
     active_turn: str | None = None
+    active_flags: tuple[str, ...] = ()
     queue: deque[str] = field(default_factory=deque)
     session_choices: list[SessionSummary] = field(default_factory=list)
     approvals: dict[str, PendingRequest] = field(default_factory=dict)
@@ -36,6 +37,8 @@ class ChannelRuntime:
     question_counter: int = 0
     tool_milestones: int = 0
     tool_events_suppressed: bool = False
+    last_activity: str | None = None
+    last_output: str | None = None
     last_reply: str | None = None
 
 
@@ -195,7 +198,7 @@ class Bridge:
         if command == "!help":
             await self._say(
                 channel,
-                "commands: !new PATH | !sessions [PATH] | !attach N | !detach | !status | "
+                "commands: !new PATH | !sessions [PATH] | !attach N | !detach | !status | !last | "
                 "!steer TEXT | !cancel | !approve [A1] | !deny [A1] | "
                 "!answer Q1 ANSWER [ | ANSWER] | !reject [Q1] | !queue | "
                 "!drop N|all | !paste | !paste-force",
@@ -217,6 +220,8 @@ class Bridge:
             await self._say(channel, "session detached")
         elif command == "!status":
             await self._status(channel)
+        elif command == "!last":
+            await self._last(channel)
         elif command == "!steer":
             if not argument:
                 raise ValueError("usage: !steer <text>")
@@ -320,12 +325,19 @@ class Bridge:
                 raise ValueError(f"that session is already attached to {other_channel}")
         binding = ChannelBinding(backend=runtime.backend, session_id=summary.id, cwd=summary.cwd)
         runtime.binding = binding
-        runtime.busy = False
-        runtime.active_turn = None
+        runtime.busy = summary.busy
+        runtime.active_turn = summary.active_turn_id
+        runtime.active_flags = summary.active_flags
         runtime.queue.clear()
         runtime.approvals.clear()
         runtime.questions.clear()
-        runtime.last_reply = None
+        runtime.last_activity = (
+            safe_one_line(summary.last_output, 180)
+            if summary.last_output
+            else ("working" if summary.busy else None)
+        )
+        runtime.last_output = summary.last_output
+        runtime.last_reply = summary.last_reply
         await self.state.set(channel, binding)
 
     async def _status(self, channel: str) -> None:
@@ -334,11 +346,19 @@ class Bridge:
             await self._say(channel, f"{runtime.backend}: detached; queue empty")
             return
         state = "busy" if runtime.busy else "idle"
+        flags = ""
+        if runtime.active_flags:
+            labels = {
+                "waitingOnApproval": "waiting on approval",
+                "waitingOnUserInput": "waiting on user input",
+            }
+            flags = " (" + ", ".join(labels.get(flag, flag) for flag in runtime.active_flags) + ")"
         await self._say(
             channel,
-            f"{runtime.backend} {state}; session {self._short(runtime.binding.session_id)}; "
+            f"{runtime.backend} {state}{flags}; session {self._short(runtime.binding.session_id)}; "
             f"workspace {runtime.binding.cwd}; queued {len(runtime.queue)}; "
-            f"approvals {len(runtime.approvals)}; questions {len(runtime.questions)}",
+            f"approvals {len(runtime.approvals)}; questions {len(runtime.questions)}; "
+            f"activity {runtime.last_activity or 'none observed'}",
         )
 
     async def _approval(self, channel: str, alias: str, allow: bool) -> None:
@@ -441,6 +461,21 @@ class Bridge:
         url = await self.paste.upload(text, force=force)
         await self._say(channel, f"1h public temporary paste: {url}")
 
+    async def _last(self, channel: str) -> None:
+        runtime = self.channels[channel]
+        binding = self._require_binding(runtime)
+        text = runtime.last_output or await self.backends[runtime.backend].get_last_reply(
+            binding.session_id
+        )
+        if not text:
+            raise ValueError("there is no assistant output in this session")
+        body, _truncated = preview(
+            text,
+            self.config.bridge.summary_max_lines,
+            self.config.bridge.summary_max_bytes,
+        )
+        await self._say(channel, body)
+
     async def _send_turn(self, channel: str, text: str) -> None:
         runtime = self.channels[channel]
         binding = self._require_binding(runtime)
@@ -467,13 +502,38 @@ class Bridge:
         if channel is None:
             return
         runtime = self.channels[channel]
+        if event.kind == "status_changed":
+            runtime.busy = bool(event.data.get("busy"))
+            runtime.active_flags = tuple(str(flag) for flag in event.data.get("active_flags", ()))
+            if runtime.active_flags:
+                runtime.last_activity = {
+                    "waitingOnApproval": "waiting on approval",
+                    "waitingOnUserInput": "waiting on user input",
+                }.get(runtime.active_flags[0], runtime.active_flags[0])
+            elif runtime.busy and runtime.last_activity is None:
+                runtime.last_activity = "working"
+            return
         if event.kind == "turn_started":
             runtime.busy = True
             runtime.active_turn = event.turn_id or runtime.active_turn
+            runtime.active_flags = ()
+            runtime.last_activity = "working"
             runtime.tool_milestones = 0
             runtime.tool_events_suppressed = False
             return
+        if event.kind == "progress":
+            runtime.last_activity = safe_one_line(event.text, 180)
+            runtime.last_output = event.text
+            body, _truncated = preview(
+                event.text,
+                self.config.bridge.summary_max_lines,
+                self.config.bridge.summary_max_bytes,
+            )
+            await self._say(channel, body)
+            return
         if event.kind == "assistant":
+            runtime.last_activity = safe_one_line(event.text, 180)
+            runtime.last_output = event.text
             runtime.last_reply = event.text
             body, _truncated = preview(
                 event.text,
@@ -483,16 +543,17 @@ class Bridge:
             await self._say(channel, body)
             return
         if event.kind in {"tool_started", "tool_finished"}:
+            if event.kind == "tool_started":
+                status = "started"
+            elif event.success is True:
+                status = "finished successfully"
+            elif event.success is False:
+                status = "failed"
+            else:
+                status = "finished"
+            runtime.last_activity = f"tool: {event.tool_kind} {status}"
             if runtime.tool_milestones < self.config.bridge.tool_milestone_limit:
                 runtime.tool_milestones += 1
-                if event.kind == "tool_started":
-                    status = "started"
-                elif event.success is True:
-                    status = "finished successfully"
-                elif event.success is False:
-                    status = "failed"
-                else:
-                    status = "finished"
                 await self._say(channel, f"tool: {event.tool_kind} {status}")
             elif not runtime.tool_events_suppressed:
                 runtime.tool_events_suppressed = True
@@ -504,6 +565,7 @@ class Bridge:
             runtime.approvals[alias] = PendingRequest(
                 alias=alias, backend=event.backend, token=event.request_token
             )
+            runtime.last_activity = "waiting on approval"
             await self._say(
                 channel,
                 f"{alias}: {event.text or 'approval needed'} — !approve {alias} or !deny {alias}",
@@ -524,6 +586,7 @@ class Bridge:
                 token=event.request_token,
                 questions=event.questions,
             )
+            runtime.last_activity = "waiting on user input"
             details: list[str] = []
             for index, question in enumerate(event.questions, 1):
                 options = ""
@@ -550,6 +613,7 @@ class Bridge:
         if event.kind in {"turn_done", "turn_failed"}:
             runtime.busy = False
             runtime.active_turn = None
+            runtime.active_flags = ()
             runtime.approvals.clear()
             runtime.questions.clear()
             if event.kind == "turn_failed":

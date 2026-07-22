@@ -1,0 +1,5 @@
+#!/bin/sh
+
+set -eu
+
+exec python -m irc_bridge stack "$@"
