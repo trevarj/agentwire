@@ -29,6 +29,9 @@ class Backend(abc.ABC):
     async def list_sessions(self, cwd: str) -> list[SessionSummary]: ...
 
     @abc.abstractmethod
+    async def list_running_sessions(self) -> list[SessionSummary]: ...
+
+    @abc.abstractmethod
     async def create_session(self, cwd: str) -> SessionSummary: ...
 
     @abc.abstractmethod

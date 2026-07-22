@@ -21,18 +21,33 @@ the live config.
 
 ## IRC workflow
 
-- `!new <path>` creates and binds a session in an allowlisted workspace.
-- `!sessions [path]` lists recent sessions; `!attach <number>` attaches one.
-- A normal message starts a turn, or queues when a turn is already active.
-- `!steer <text>` redirects the active turn; `!cancel` interrupts it.
-- `!approve [A1]` and `!deny [A1]` resolve one-shot approval requests.
-- `!answer Q1 <answer>` and `!reject Q1` resolve agent questions.
+- `!running` (or `!r`) lists active sessions across every allowed workspace;
+  `!use <number>` attaches one. `!sessions [workspace]` lists recent sessions.
+- `!new <workspace>` creates and binds a session. Workspace names may be
+  relative to an allowed root, while absolute paths continue to work.
+- A normal message starts a turn while idle. While busy, messages accumulate in
+  a held draft: `!next` queues it, `!steer` redirects the active turn with it,
+  and `!discard` removes it.
+- `!cancel` interrupts the active turn. `!queue` and `!drop <number>|all`
+  manage prompts already queued for later turns.
+- `!yes [A1]` and `!no [A1]` resolve one-shot approval requests.
+  `!answer [Q1] <answer>` and `!skip [Q1]` resolve agent questions.
 - `!paste` uploads the last full reply to one-hour Litterbox storage after a
   secret scan; `!paste-force` explicitly overrides a scanner block.
-- `!status`, `!queue`, `!drop`, and `!help` cover normal operation.
+- `!status` (`!s`) shows a compact dashboard and `!last` (`!l`) repeats the
+  latest output without invoking the agent.
+- `!watch quiet|concise|verbose` controls activity detail per channel. Concise
+  is the default after every bridge restart.
+- `!help` shows commands relevant to the current state; `!help all` lists the
+  complete interface.
+
+The older `!attach`, `!approve`, `!deny`, and `!reject` spellings remain as
+compatibility aliases.
 
 Replies are capped in IRC at eight lines or 1,200 UTF-8 bytes. Long replies stay
 available in the shared TUI and are uploaded only on the explicit paste command.
+Bridge dashboards use multiline Unicode formatting and restrained semantic
+emoji; traditional IRC color and bold control codes remain stripped.
 
 Attach local TUIs to the same running sessions with:
 

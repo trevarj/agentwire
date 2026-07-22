@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import difflib
 from collections import deque
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from irc_bridge.backends.base import Backend, BackendError
 from irc_bridge.config import Config, ConfigError, resolve_workspace
@@ -22,6 +24,45 @@ class PendingRequest:
     questions: tuple[Question, ...] = ()
 
 
+@dataclass(slots=True, frozen=True)
+class CommandSpec:
+    name: str
+    aliases: tuple[str, ...]
+    usage: str
+    category: str
+    summary: str
+
+
+COMMANDS = (
+    CommandSpec("help", ("h",), "!help [topic|all]", "general", "show contextual help"),
+    CommandSpec("status", ("s",), "!status", "general", "show the channel dashboard"),
+    CommandSpec("last", ("l",), "!last", "output", "repeat the latest agent output"),
+    CommandSpec("watch", (), "!watch [quiet|concise|verbose]", "output", "set activity detail"),
+    CommandSpec("running", ("r",), "!running", "sessions", "list active sessions"),
+    CommandSpec("sessions", (), "!sessions [workspace]", "sessions", "list recent sessions"),
+    CommandSpec("use", ("attach",), "!use [number]", "sessions", "attach a listed session"),
+    CommandSpec("new", (), "!new workspace", "sessions", "create and attach a session"),
+    CommandSpec("detach", (), "!detach", "sessions", "detach the current session"),
+    CommandSpec("next", (), "!next", "turn", "queue or send the held draft"),
+    CommandSpec("steer", (), "!steer [text]", "turn", "redirect the active turn"),
+    CommandSpec("discard", (), "!discard", "turn", "discard the held draft"),
+    CommandSpec("cancel", ("stop",), "!cancel", "turn", "interrupt the active turn"),
+    CommandSpec("queue", (), "!queue", "queue", "show queued turns"),
+    CommandSpec("drop", (), "!drop number|all", "queue", "remove queued turns"),
+    CommandSpec("yes", ("approve",), "!yes [A1]", "requests", "approve once"),
+    CommandSpec("no", ("deny",), "!no [A1]", "requests", "deny an approval"),
+    CommandSpec("answer", (), "!answer [Q1] answer", "requests", "answer a question"),
+    CommandSpec("skip", ("reject",), "!skip [Q1]", "requests", "reject a question"),
+    CommandSpec("paste", (), "!paste", "output", "upload the full final reply"),
+    CommandSpec("paste-force", (), "!paste-force", "output", "override a paste scan block"),
+)
+COMMAND_BY_NAME = {
+    alias: spec
+    for spec in COMMANDS
+    for alias in (spec.name, *spec.aliases)
+}
+
+
 @dataclass(slots=True)
 class ChannelRuntime:
     backend: str
@@ -29,6 +70,8 @@ class ChannelRuntime:
     busy: bool = False
     active_turn: str | None = None
     active_flags: tuple[str, ...] = ()
+    watch_mode: str = "concise"
+    held_lines: list[str] = field(default_factory=list)
     queue: deque[str] = field(default_factory=deque)
     session_choices: list[SessionSummary] = field(default_factory=list)
     approvals: dict[str, PendingRequest] = field(default_factory=dict)
@@ -87,7 +130,7 @@ class Bridge:
                 channels = " and ".join(self.channels)
                 await self.irc.send_privmsg(
                     self.config.bridge.owner_account,
-                    f"irc-bridge is ready: {channels}. Send !help or !new <absolute-path>.",
+                    f"✅ IRC bridge is ready: {channels}. Send !help or !running.",
                 )
             await asyncio.gather(*self._tasks)
         finally:
@@ -136,9 +179,7 @@ class Bridge:
                     (channel, f"saved session could not be restored and was detached: {exc}")
                 )
                 continue
-            runtime.binding = ChannelBinding(
-                backend=binding.backend, session_id=summary.id, cwd=str(workspace)
-            )
+            await self._bind(channel, summary)
             claimed.add(key)
             messages.append(
                 (
@@ -156,9 +197,9 @@ class Bridge:
             try:
                 await self._handle_owner_message(message)
             except (BackendError, ConfigError, PasteError, ValueError) as exc:
-                await self._say(message.channel, f"error: {safe_one_line(str(exc), 280)}")
+                await self._say(message.channel, f"⚠️ {safe_one_line(str(exc), 280)}")
             except Exception:
-                await self._say(message.channel, "error: unexpected bridge failure")
+                await self._say(message.channel, "❌ Unexpected bridge failure")
 
     async def _backend_loop(self, backend: Backend) -> None:
         async for event in backend.events():
@@ -167,7 +208,7 @@ class Bridge:
             except Exception:
                 channel = self._channel_for(event.backend, event.session_id)
                 if channel:
-                    await self._say(channel, "error: could not relay a backend event")
+                    await self._say(channel, "❌ Could not relay a backend event")
 
     async def _handle_owner_message(self, message: IRCMessage) -> None:
         text = message.text.strip()
@@ -175,103 +216,115 @@ class Bridge:
             return
         if text.startswith("!"):
             command, _, argument = text.partition(" ")
-            await self._command(message.channel, command.lower(), argument.strip())
+            await self._command(message.channel, command[1:].lower(), argument.strip())
             return
         runtime = self.channels[message.channel]
         if runtime.binding is None:
-            raise ValueError("no session is attached; use !new <absolute-path>")
-        if runtime.busy:
-            if len(runtime.queue) >= self.config.bridge.queue_limit:
-                raise ValueError(
-                    f"queue is full ({self.config.bridge.queue_limit}); use !steer or !drop"
-                )
-            runtime.queue.append(text)
+            raise ValueError("no session is attached — try !running or !new <workspace>")
+        if runtime.busy or runtime.held_lines:
+            if len(runtime.held_lines) >= self.config.bridge.queue_limit:
+                raise ValueError(f"held draft is full ({self.config.bridge.queue_limit} messages)")
+            runtime.held_lines.append(text)
             await self._say(
                 message.channel,
-                f"queued as #{len(runtime.queue)}; use !queue, !drop, or !steer",
+                f"🟡 Draft held · {len(runtime.held_lines)} message(s)\n"
+                "Use !next to queue it, !steer to redirect the turn, or !discard.",
             )
             return
         await self._send_turn(message.channel, text)
 
     async def _command(self, channel: str, command: str, argument: str) -> None:
         runtime = self.channels[channel]
-        if command == "!help":
-            await self._say(
-                channel,
-                "commands: !new PATH | !sessions [PATH] | !attach N | !detach | !status | !last | "
-                "!steer TEXT | !cancel | !approve [A1] | !deny [A1] | "
-                "!answer Q1 ANSWER [ | ANSWER] | !reject [Q1] | !queue | "
-                "!drop N|all | !paste | !paste-force",
-            )
-        elif command == "!new":
+        command = command.removeprefix("!")
+        spec = COMMAND_BY_NAME.get(command)
+        if spec is None:
+            matches = difflib.get_close_matches(command, COMMAND_BY_NAME, n=1, cutoff=0.55)
+            hint = f" Did you mean !{matches[0]}?" if matches else " Try !help."
+            raise ValueError(f"unknown command !{command}.{hint}")
+        command = spec.name
+        if command == "help":
+            await self._help(channel, argument)
+        elif command == "new":
             await self._new_session(channel, argument)
-        elif command == "!sessions":
+        elif command == "sessions":
             await self._list_sessions(channel, argument)
-        elif command == "!attach":
-            await self._attach(channel, argument)
-        elif command == "!detach":
-            if runtime.busy:
-                raise ValueError("cancel the active turn before detaching")
+        elif command == "running":
+            await self._running_sessions(channel)
+        elif command == "use":
+            await self._use_session(channel, argument)
+        elif command == "detach":
+            self._require_safe_session_change(runtime)
             runtime.binding = None
             runtime.queue.clear()
             runtime.approvals.clear()
             runtime.questions.clear()
             await self.state.set(channel, None)
-            await self._say(channel, "session detached")
-        elif command == "!status":
+            await self._say(channel, "⚪ Session detached")
+        elif command == "status":
             await self._status(channel)
-        elif command == "!last":
+        elif command == "last":
             await self._last(channel)
-        elif command == "!steer":
-            if not argument:
-                raise ValueError("usage: !steer <text>")
+        elif command == "watch":
+            await self._watch(channel, argument)
+        elif command == "next":
+            await self._next(channel)
+        elif command == "steer":
             binding = self._require_binding(runtime)
             if not runtime.busy:
-                raise ValueError("there is no active turn to steer")
+                raise ValueError("there is no active turn — use !next to send the held draft")
+            if argument and runtime.held_lines:
+                raise ValueError("a draft is already held — use !steer without text or !discard")
+            text = argument or self._held_text(runtime)
             await self.backends[runtime.backend].steer(
-                binding.session_id, runtime.active_turn, argument
+                binding.session_id, runtime.active_turn, text
             )
-            await self._say(channel, "steer delivered")
-        elif command == "!cancel":
+            if not argument:
+                runtime.held_lines.clear()
+            await self._say(channel, "🧭 Steering update delivered")
+        elif command == "discard":
+            if not runtime.held_lines:
+                raise ValueError("there is no held draft")
+            count = len(runtime.held_lines)
+            runtime.held_lines.clear()
+            await self._say(channel, f"🗑️ Discarded held draft · {count} message(s)")
+        elif command == "cancel":
             binding = self._require_binding(runtime)
             if not runtime.busy:
                 raise ValueError("there is no active turn to cancel")
             await self.backends[runtime.backend].cancel(binding.session_id, runtime.active_turn)
-            await self._say(channel, "cancel requested")
-        elif command in {"!approve", "!deny"}:
-            await self._approval(channel, argument, command == "!approve")
-        elif command == "!answer":
+            await self._say(channel, "⏹️ Cancellation requested")
+        elif command in {"yes", "no"}:
+            await self._approval(channel, argument, command == "yes")
+        elif command == "answer":
             await self._answer(channel, argument)
-        elif command == "!reject":
+        elif command == "skip":
             await self._reject(channel, argument)
-        elif command == "!queue":
+        elif command == "queue":
             if not runtime.queue:
-                await self._say(channel, "queue is empty")
+                await self._say(channel, "📬 Queue is empty")
             else:
-                entries = " | ".join(
-                    f"{index}: {safe_one_line(item, 80)}"
+                entries = "\n".join(
+                    f"{index}. {safe_one_line(item, 100)}"
                     for index, item in enumerate(runtime.queue, 1)
                 )
-                await self._say(channel, f"queue ({len(runtime.queue)}): {entries}")
-        elif command == "!drop":
+                await self._say(channel, f"📬 Queue · {len(runtime.queue)} turn(s)\n{entries}")
+        elif command == "drop":
             await self._drop(channel, argument)
-        elif command in {"!paste", "!paste-force"}:
-            await self._paste(channel, force=command == "!paste-force")
-        else:
-            raise ValueError("unknown command; use !help")
+        elif command in {"paste", "paste-force"}:
+            await self._paste(channel, force=command == "paste-force")
 
     async def _new_session(self, channel: str, raw_path: str) -> None:
         runtime = self.channels[channel]
         if not raw_path:
-            raise ValueError("usage: !new <absolute-path>")
-        if runtime.busy:
-            raise ValueError("cancel the active turn before changing sessions")
+            raise ValueError("usage: !new <workspace>")
+        self._require_safe_session_change(runtime)
         workspace = resolve_workspace(raw_path, self.config.bridge.allowed_roots)
         summary = await self.backends[runtime.backend].create_session(str(workspace))
         await self._bind(channel, summary)
         await self._say(
             channel,
-            f"created {runtime.backend} session {self._short(summary.id)} in {workspace}",
+            f"✅ Created {runtime.backend.title()} session\n"
+            f"📂 {self._display_path(workspace)} · {self._short(summary.id)}",
         )
 
     async def _list_sessions(self, channel: str, raw_path: str) -> None:
@@ -281,36 +334,75 @@ class Bridge:
         elif runtime.binding:
             workspace = resolve_workspace(runtime.binding.cwd, self.config.bridge.allowed_roots)
         else:
-            raise ValueError("provide an absolute path: !sessions /path/to/workspace")
+            raise ValueError("provide a workspace: !sessions <workspace>")
         runtime.session_choices = await self.backends[runtime.backend].list_sessions(str(workspace))
         if not runtime.session_choices:
-            await self._say(channel, f"no {runtime.backend} sessions found in {workspace}")
+            await self._say(
+                channel,
+                f"⚪ No {runtime.backend.title()} sessions in {self._display_path(workspace)}",
+            )
             return
-        lines = [
-            f"{index}. {self._short(item.id)} — {item.title}"
-            for index, item in enumerate(runtime.session_choices, 1)
-        ]
-        await self._say(channel, "recent sessions:\n" + "\n".join(lines))
+        await self._say(
+            channel,
+            self._format_session_list("Recent sessions", runtime.session_choices),
+        )
 
-    async def _attach(self, channel: str, argument: str) -> None:
+    async def _running_sessions(self, channel: str) -> None:
         runtime = self.channels[channel]
-        if runtime.busy:
-            raise ValueError("cancel the active turn before changing sessions")
+        discovered = await self.backends[runtime.backend].list_running_sessions()
+        allowed: dict[str, SessionSummary] = {}
+        for summary in discovered:
+            try:
+                workspace = resolve_workspace(summary.cwd, self.config.bridge.allowed_roots)
+            except ConfigError:
+                continue
+            allowed[summary.id] = SessionSummary(
+                id=summary.id,
+                cwd=str(workspace),
+                title=summary.title,
+                updated_at=summary.updated_at,
+                busy=summary.busy,
+                active_flags=summary.active_flags,
+                active_turn_id=summary.active_turn_id,
+                last_output=summary.last_output,
+                last_reply=summary.last_reply,
+            )
+        runtime.session_choices = sorted(
+            allowed.values(), key=lambda item: item.updated_at, reverse=True
+        )[:20]
+        if not runtime.session_choices:
+            await self._say(channel, f"⚪ No running {runtime.backend.title()} sessions")
+            return
+        await self._say(
+            channel,
+            self._format_session_list("Running sessions", runtime.session_choices),
+        )
+
+    async def _use_session(self, channel: str, argument: str) -> None:
+        runtime = self.channels[channel]
+        self._require_safe_session_change(runtime)
         if not argument:
-            raise ValueError("usage: !attach <number from !sessions>")
+            if len(runtime.session_choices) != 1:
+                raise ValueError("usage: !use <number from !sessions or !running>")
+            index = 1
+        else:
+            try:
+                index = int(argument)
+            except ValueError as exc:
+                raise ValueError("!use takes the number shown by !sessions or !running") from exc
+        if index < 1:
+            raise ValueError("session number must be positive")
         try:
-            index = int(argument)
-        except ValueError as exc:
-            raise ValueError("!attach takes the number shown by !sessions") from exc
-        if index < 1 or index > len(runtime.session_choices):
-            raise ValueError("that session number is not in the latest !sessions list")
-        choice = runtime.session_choices[index - 1]
+            choice = runtime.session_choices[index - 1]
+        except IndexError as exc:
+            raise ValueError("that number is not in the latest !sessions or !running list") from exc
         workspace = resolve_workspace(choice.cwd, self.config.bridge.allowed_roots)
         summary = await self.backends[runtime.backend].attach_session(choice.id, str(workspace))
         await self._bind(channel, summary)
         await self._say(
             channel,
-            f"attached {runtime.backend} session {self._short(summary.id)} in {workspace}",
+            f"✅ Attached {runtime.backend.title()} session\n"
+            f"📂 {self._display_path(workspace)} · {self._short(summary.id)}",
         )
 
     async def _bind(self, channel: str, summary: SessionSummary) -> None:
@@ -328,6 +420,7 @@ class Bridge:
         runtime.busy = summary.busy
         runtime.active_turn = summary.active_turn_id
         runtime.active_flags = summary.active_flags
+        runtime.held_lines.clear()
         runtime.queue.clear()
         runtime.approvals.clear()
         runtime.questions.clear()
@@ -343,39 +436,101 @@ class Bridge:
     async def _status(self, channel: str) -> None:
         runtime = self.channels[channel]
         if runtime.binding is None:
-            await self._say(channel, f"{runtime.backend}: detached; queue empty")
+            await self._say(
+                channel,
+                f"🤖 {runtime.backend.title()} · ⚪ Detached · 👁 {runtime.watch_mode}\n"
+                "Try !running or !new <workspace>.",
+            )
             return
-        state = "busy" if runtime.busy else "idle"
-        flags = ""
+        state = "🟢 Working" if runtime.busy else "⚪ Idle"
+        waiting = "none"
         if runtime.active_flags:
             labels = {
                 "waitingOnApproval": "waiting on approval",
                 "waitingOnUserInput": "waiting on user input",
+                "retry": "retrying",
             }
-            flags = " (" + ", ".join(labels.get(flag, flag) for flag in runtime.active_flags) + ")"
+            waiting = ", ".join(labels.get(flag, flag) for flag in runtime.active_flags)
+            state = f"🟡 {waiting.title()}"
+        request_ids = [*runtime.approvals, *runtime.questions]
+        held = f"{len(runtime.held_lines)} message(s)" if runtime.held_lines else "none"
+        requests = ", ".join(request_ids) if request_ids else "none"
         await self._say(
             channel,
-            f"{runtime.backend} {state}{flags}; session {self._short(runtime.binding.session_id)}; "
-            f"workspace {runtime.binding.cwd}; queued {len(runtime.queue)}; "
-            f"approvals {len(runtime.approvals)}; questions {len(runtime.questions)}; "
-            f"activity {runtime.last_activity or 'none observed'}",
+            f"🤖 {runtime.backend.title()} · {state} · 👁 {runtime.watch_mode}\n"
+            f"📂 {self._display_path(Path(runtime.binding.cwd))} · "
+            f"{self._short(runtime.binding.session_id)}\n"
+            f"💬 {runtime.last_activity or 'No activity observed'}\n"
+            f"📝 Held: {held} · 📬 Queue: {len(runtime.queue)} · ❓ Requests: {requests}",
         )
+
+    async def _watch(self, channel: str, argument: str) -> None:
+        runtime = self.channels[channel]
+        if not argument:
+            await self._say(channel, f"👁 Watch mode: {runtime.watch_mode}")
+            return
+        mode = argument.lower()
+        if mode not in {"quiet", "concise", "verbose"}:
+            raise ValueError("usage: !watch quiet|concise|verbose")
+        runtime.watch_mode = mode
+        await self._say(channel, f"👁 Watch mode set to {mode}")
+
+    async def _help(self, channel: str, topic: str) -> None:
+        runtime = self.channels[channel]
+        topic = topic.lower() or "context"
+        if topic == "context":
+            if runtime.binding is None:
+                lines = ["!running (!r) — active sessions", "!new WORKSPACE — create session"]
+            elif runtime.held_lines:
+                lines = [
+                    "!next — queue draft",
+                    "!steer — redirect turn",
+                    "!discard — discard draft",
+                ]
+            elif runtime.approvals:
+                lines = ["!yes [A1] — approve once", "!no [A1] — deny"]
+            elif runtime.questions:
+                lines = ["!answer [Q1] TEXT — answer", "!skip [Q1] — reject"]
+            else:
+                lines = [
+                    "!status (!s) — dashboard",
+                    "!last (!l) — latest output",
+                    "!running (!r) — active sessions",
+                    "!help all — every command",
+                ]
+            await self._say(channel, "🧭 Commands\n" + "\n".join(lines))
+            return
+        categories = {spec.category for spec in COMMANDS}
+        if topic != "all" and topic not in categories:
+            choices = ", ".join(sorted(categories))
+            raise ValueError(f"unknown help topic {topic!r}; choose {choices}, or all")
+        specs = COMMANDS if topic == "all" else tuple(
+            spec for spec in COMMANDS if spec.category == topic
+        )
+        lines = [f"{spec.usage} — {spec.summary}" for spec in specs]
+        await self._say(channel, f"🧭 {topic.title()} commands\n" + "\n".join(lines))
 
     async def _approval(self, channel: str, alias: str, allow: bool) -> None:
         runtime = self.channels[channel]
         request = self._select_request(runtime.approvals, alias, "approval")
         await self.backends[request.backend].resolve_approval(request.token, allow)
         runtime.approvals.pop(request.alias, None)
-        await self._say(channel, f"{request.alias} {'approved once' if allow else 'denied'}")
+        icon = "✅" if allow else "❌"
+        await self._say(channel, f"{icon} {request.alias} {'approved once' if allow else 'denied'}")
 
     async def _answer(self, channel: str, argument: str) -> None:
         runtime = self.channels[channel]
-        alias, separator, raw_answers = argument.partition(" ")
-        if not separator:
-            if len(runtime.questions) != 1:
-                raise ValueError("usage: !answer Q1 <answer> [ | <answer>]")
-            raw_answers = alias
+        first, separator, remainder = argument.partition(" ")
+        if first.upper() in runtime.questions:
+            if not separator or not remainder.strip():
+                raise ValueError("usage: !answer [Q1] <answer> [ | <answer>]")
+            alias = first
+            raw_answers = remainder
+        elif len(runtime.questions) == 1:
             alias = ""
+            raw_answers = argument
+        else:
+            raise ValueError("usage: !answer Q1 <answer> [ | <answer>]")
         request = self._select_request(runtime.questions, alias, "question")
         if any(question.secret for question in request.questions):
             raise ValueError("sensitive questions must be answered in the attached TUI")
@@ -392,7 +547,7 @@ class Bridge:
             request.token, request.questions, answers
         )
         runtime.questions.pop(request.alias, None)
-        await self._say(channel, f"{request.alias} answered")
+        await self._say(channel, f"✅ {request.alias} answered")
 
     async def _reject(self, channel: str, alias: str) -> None:
         runtime = self.channels[channel]
@@ -401,7 +556,7 @@ class Bridge:
             request.token, request.questions, None
         )
         runtime.questions.pop(request.alias, None)
-        await self._say(channel, f"{request.alias} rejected")
+        await self._say(channel, f"⏭️ {request.alias} skipped")
 
     @staticmethod
     def _parse_question_answer(question: Question, raw: str) -> list[str]:
@@ -437,7 +592,7 @@ class Bridge:
         if argument.lower() == "all":
             count = len(runtime.queue)
             runtime.queue.clear()
-            await self._say(channel, f"dropped all {count} queued messages")
+            await self._say(channel, f"🗑️ Dropped all {count} queued turns")
             return
         try:
             index = int(argument)
@@ -448,7 +603,21 @@ class Bridge:
         items = list(runtime.queue)
         removed = items.pop(index - 1)
         runtime.queue = deque(items)
-        await self._say(channel, f"dropped #{index}: {safe_one_line(removed, 100)}")
+        await self._say(channel, f"🗑️ Dropped #{index}: {safe_one_line(removed, 100)}")
+
+    async def _next(self, channel: str) -> None:
+        runtime = self.channels[channel]
+        self._require_binding(runtime)
+        text = self._held_text(runtime)
+        if runtime.busy:
+            if len(runtime.queue) >= self.config.bridge.queue_limit:
+                raise ValueError(f"queue is full ({self.config.bridge.queue_limit})")
+            runtime.queue.append(text)
+            runtime.held_lines.clear()
+            await self._say(channel, f"📬 Draft queued as #{len(runtime.queue)}")
+            return
+        await self._send_turn(channel, text)
+        runtime.held_lines.clear()
 
     async def _paste(self, channel: str, force: bool) -> None:
         runtime = self.channels[channel]
@@ -459,7 +628,7 @@ class Bridge:
         if not text:
             raise ValueError("there is no assistant reply to paste")
         url = await self.paste.upload(text, force=force)
-        await self._say(channel, f"1h public temporary paste: {url}")
+        await self._say(channel, f"🔗 {self.config.paste.expiry} public paste: {url}")
 
     async def _last(self, channel: str) -> None:
         runtime = self.channels[channel]
@@ -469,12 +638,7 @@ class Bridge:
         )
         if not text:
             raise ValueError("there is no assistant output in this session")
-        body, _truncated = preview(
-            text,
-            self.config.bridge.summary_max_lines,
-            self.config.bridge.summary_max_bytes,
-        )
-        await self._say(channel, body)
+        await self._say(channel, self._formatted_preview("💬", text))
 
     async def _send_turn(self, channel: str, text: str) -> None:
         runtime = self.channels[channel]
@@ -490,13 +654,13 @@ class Bridge:
             runtime.busy = False
             runtime.active_turn = None
             raise
-        await self._say(channel, "turn started")
+        await self._say(channel, "▶️ Turn started")
 
     async def _handle_backend_event(self, event: BackendEvent) -> None:
         if event.kind == "disconnected":
             for channel, runtime in self.channels.items():
                 if runtime.backend == event.backend:
-                    await self._say(channel, event.text or f"{event.backend} disconnected")
+                    await self._say(channel, f"❌ {event.text or f'{event.backend} disconnected'}")
             return
         channel = self._channel_for(event.backend, event.session_id)
         if channel is None:
@@ -514,33 +678,28 @@ class Bridge:
                 runtime.last_activity = "working"
             return
         if event.kind == "turn_started":
+            already_announced = runtime.active_turn == event.turn_id and runtime.busy
             runtime.busy = True
             runtime.active_turn = event.turn_id or runtime.active_turn
             runtime.active_flags = ()
             runtime.last_activity = "working"
             runtime.tool_milestones = 0
             runtime.tool_events_suppressed = False
+            if not already_announced and self._allows(runtime, "concise"):
+                await self._say(channel, "▶️ Turn started")
             return
         if event.kind == "progress":
             runtime.last_activity = safe_one_line(event.text, 180)
             runtime.last_output = event.text
-            body, _truncated = preview(
-                event.text,
-                self.config.bridge.summary_max_lines,
-                self.config.bridge.summary_max_bytes,
-            )
-            await self._say(channel, body)
+            if self._allows(runtime, "concise"):
+                icon = "🧭" if event.text.startswith("plan:") else "💬"
+                await self._say(channel, self._formatted_preview(icon, event.text))
             return
         if event.kind == "assistant":
             runtime.last_activity = safe_one_line(event.text, 180)
             runtime.last_output = event.text
             runtime.last_reply = event.text
-            body, _truncated = preview(
-                event.text,
-                self.config.bridge.summary_max_lines,
-                self.config.bridge.summary_max_bytes,
-            )
-            await self._say(channel, body)
+            await self._say(channel, self._formatted_preview("💬", event.text))
             return
         if event.kind in {"tool_started", "tool_finished"}:
             if event.kind == "tool_started":
@@ -552,12 +711,14 @@ class Bridge:
             else:
                 status = "finished"
             runtime.last_activity = f"tool: {event.tool_kind} {status}"
-            if runtime.tool_milestones < self.config.bridge.tool_milestone_limit:
+            if self._allows(runtime, "verbose") and (
+                runtime.tool_milestones < self.config.bridge.tool_milestone_limit
+            ):
                 runtime.tool_milestones += 1
-                await self._say(channel, f"tool: {event.tool_kind} {status}")
-            elif not runtime.tool_events_suppressed:
+                await self._say(channel, f"🔧 {event.tool_kind}: {status}")
+            elif self._allows(runtime, "verbose") and not runtime.tool_events_suppressed:
                 runtime.tool_events_suppressed = True
-                await self._say(channel, "additional tool milestones suppressed for this turn")
+                await self._say(channel, "🔧 Additional tool milestones suppressed")
             return
         if event.kind == "approval" and event.request_token is not None:
             runtime.approval_counter += 1
@@ -568,14 +729,15 @@ class Bridge:
             runtime.last_activity = "waiting on approval"
             await self._say(
                 channel,
-                f"{alias}: {event.text or 'approval needed'} — !approve {alias} or !deny {alias}",
+                f"🔐 {alias}: {event.text or 'approval needed'}\n"
+                f"Use !yes {alias} or !no {alias}.",
             )
             return
         if event.kind == "question" and event.request_token is not None:
             if any(question.secret for question in event.questions):
                 await self._say(
                     channel,
-                    "sensitive input requested; answer it in the attached TUI (not IRC)",
+                    "🔐 Sensitive input requested — answer it in the attached TUI, not IRC.",
                 )
                 return
             runtime.question_counter += 1
@@ -602,13 +764,15 @@ class Bridge:
                 details.append(f"{index}. {safe_one_line(question.prompt, 220)}{options}{multiple}")
             await self._say(
                 channel,
-                f"{alias}: " + " | ".join(details) + f" — !answer {alias} ... or !reject {alias}",
+                f"❓ {alias}: "
+                + " | ".join(details)
+                + f"\nUse !answer {alias} ... or !skip {alias}.",
             )
             return
         if event.kind == "request_resolved" and event.request_token is not None:
             removed = self._remove_token(runtime, event.request_token)
             if removed:
-                await self._say(channel, f"{removed} was resolved in another client")
+                await self._say(channel, f"✅ {removed} was resolved in another client")
             return
         if event.kind in {"turn_done", "turn_failed"}:
             runtime.busy = False
@@ -617,13 +781,19 @@ class Bridge:
             runtime.approvals.clear()
             runtime.questions.clear()
             if event.kind == "turn_failed":
-                await self._say(channel, f"turn failed: {event.text or 'backend error'}")
-            else:
-                await self._say(channel, f"done ({runtime.tool_milestones} tool milestones)")
+                runtime.last_activity = f"failed: {event.text or 'backend error'}"
+                await self._say(channel, f"❌ Turn failed: {event.text or 'backend error'}")
+            elif self._allows(runtime, "concise"):
+                await self._say(channel, "✅ Turn complete")
             if runtime.queue:
                 next_message = runtime.queue.popleft()
-                await self._say(channel, f"starting queued message ({len(runtime.queue)} remain)")
+                await self._say(channel, f"📬 Starting queued turn · {len(runtime.queue)} remain")
                 await self._send_turn(channel, next_message)
+            elif runtime.held_lines:
+                await self._say(
+                    channel,
+                    "🟡 Turn finished; a draft is still held. Use !next or !discard.",
+                )
 
     @staticmethod
     def _remove_token(runtime: ChannelRuntime, token: str | int) -> str | None:
@@ -646,13 +816,62 @@ class Bridge:
                 return channel
         return None
 
+    @staticmethod
+    def _allows(runtime: ChannelRuntime, level: str) -> bool:
+        ranks = {"quiet": 0, "concise": 1, "verbose": 2}
+        return ranks[runtime.watch_mode] >= ranks[level]
+
+    @staticmethod
+    def _held_text(runtime: ChannelRuntime) -> str:
+        if not runtime.held_lines:
+            raise ValueError("there is no held draft")
+        return "\n".join(runtime.held_lines)
+
+    @staticmethod
+    def _require_safe_session_change(runtime: ChannelRuntime) -> None:
+        if runtime.busy:
+            raise ValueError("cancel the active turn before changing sessions")
+        if runtime.held_lines:
+            raise ValueError("resolve the held draft with !next or !discard first")
+        if runtime.queue:
+            raise ValueError("clear the queue with !drop all before changing sessions")
+
+    def _format_session_list(self, title: str, sessions: list[SessionSummary]) -> str:
+        lines = [f"🟢 {title}"]
+        for index, item in enumerate(sessions, 1):
+            state = "🟢" if item.busy else "⚪"
+            lines.append(f"{index}. {state} {item.title}")
+            lines.append(
+                f"   📂 {self._display_path(Path(item.cwd))} · {self._short(item.id)}"
+            )
+        lines.append("Use !use <number>.")
+        return "\n".join(lines)
+
+    def _formatted_preview(self, icon: str, text: str) -> str:
+        prefix = f"{icon} "
+        budget = max(1, self.config.bridge.summary_max_bytes - len(prefix.encode("utf-8")))
+        body, _truncated = preview(
+            text,
+            self.config.bridge.summary_max_lines,
+            budget,
+        )
+        return prefix + body
+
+    @staticmethod
+    def _display_path(path: Path) -> str:
+        home = Path.home()
+        try:
+            return f"~/{path.relative_to(home)}"
+        except ValueError:
+            return str(path)
+
     async def _say(self, channel: str, text: str) -> None:
         await self.irc.send_privmsg(channel, text)
 
     @staticmethod
     def _require_binding(runtime: ChannelRuntime) -> ChannelBinding:
         if runtime.binding is None:
-            raise ValueError("no session is attached; use !new <absolute-path>")
+            raise ValueError("no session is attached — try !running or !new <workspace>")
         return runtime.binding
 
     @staticmethod

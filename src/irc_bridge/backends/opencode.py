@@ -416,8 +416,35 @@ class OpenCodeBackend(Backend):
 
     async def list_sessions(self, cwd: str) -> list[SessionSummary]:
         raw = await self._json("GET", "/session", params={"directory": cwd, "limit": 20})
-        sessions = [self._summary(item) for item in raw or [] if isinstance(item, dict)]
+        statuses = await self._json("GET", "/session/status")
+        if not isinstance(statuses, dict):
+            raise BackendError("OpenCode session/status returned an invalid response")
+        sessions = [
+            self._summary(item, self._status_type(statuses, str(item.get("id") or "")))
+            for item in raw or []
+            if isinstance(item, dict)
+        ]
         for summary in sessions:
+            self._session_cwds[summary.id] = summary.cwd
+        return sessions
+
+    async def list_running_sessions(self) -> list[SessionSummary]:
+        statuses = await self._json("GET", "/session/status")
+        if not isinstance(statuses, dict):
+            raise BackendError("OpenCode session/status returned an invalid response")
+        raw = await self._json("GET", "/session", params={"limit": 100})
+        sessions: list[SessionSummary] = []
+        for item in raw or []:
+            if not isinstance(item, dict):
+                continue
+            session_id = str(item.get("id") or "")
+            status = statuses.get(session_id) or {}
+            status_type = str(status.get("type") if isinstance(status, dict) else status)
+            if status_type not in {"busy", "retry", "active"}:
+                continue
+            summary = self._summary(item, status_type)
+            sessions.append(summary)
+            self._busy.add(summary.id)
             self._session_cwds[summary.id] = summary.cwd
         return sessions
 
@@ -434,21 +461,35 @@ class OpenCodeBackend(Backend):
         raw = await self._json("GET", f"/session/{quote(session_id)}", params=params)
         if not isinstance(raw, dict) or not raw.get("id"):
             raise BackendError("OpenCode session/get returned no session")
-        summary = self._summary(raw)
+        statuses = await self._json("GET", "/session/status")
+        if not isinstance(statuses, dict):
+            raise BackendError("OpenCode session/status returned an invalid response")
+        status_type = self._status_type(statuses, session_id)
+        summary = self._summary(raw, status_type)
+        if summary.busy:
+            self._busy.add(summary.id)
         self._session_cwds[summary.id] = summary.cwd
         return summary
 
     @staticmethod
-    def _summary(raw: dict[str, Any]) -> SessionSummary:
+    def _status_type(statuses: dict[str, Any], session_id: str) -> str:
+        status = statuses.get(session_id) or {}
+        return str(status.get("type") if isinstance(status, dict) else status)
+
+    @staticmethod
+    def _summary(raw: dict[str, Any], status_type: str = "") -> SessionSummary:
         times = raw.get("time") or {}
         updated = float(times.get("updated") or times.get("created") or time.time())
         if updated > 10_000_000_000:
             updated /= 1000
+        busy = status_type in {"busy", "retry", "active"}
         return SessionSummary(
             id=str(raw.get("id") or ""),
             cwd=str(raw.get("directory") or raw.get("path") or ""),
             title=safe_one_line(str(raw.get("title") or "untitled"), 100),
             updated_at=updated,
+            busy=busy,
+            active_flags=("retry",) if status_type == "retry" else (),
         )
 
     async def send_message(self, session_id: str, text: str) -> str | None:

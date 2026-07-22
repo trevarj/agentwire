@@ -40,7 +40,10 @@ class FakeBackend(Backend):
 
     def __init__(self) -> None:
         self.sent: list[tuple[str, str]] = []
+        self.steered: list[tuple[str, str]] = []
         self.resolved: list[tuple[str | int, bool]] = []
+        self.sessions: list[SessionSummary] = []
+        self.running: list[SessionSummary] = []
         self._events: asyncio.Queue[BackendEvent] = asyncio.Queue()
 
     async def start(self) -> None:
@@ -60,7 +63,10 @@ class FakeBackend(Backend):
         return iterator()
 
     async def list_sessions(self, cwd: str) -> list[SessionSummary]:
-        return []
+        return self.sessions
+
+    async def list_running_sessions(self) -> list[SessionSummary]:
+        return self.running
 
     async def create_session(self, cwd: str) -> SessionSummary:
         return SessionSummary("thread-1", cwd, "new")
@@ -73,7 +79,7 @@ class FakeBackend(Backend):
         return f"turn-{len(self.sent)}"
 
     async def steer(self, session_id: str, turn_id: str | None, text: str) -> None:
-        pass
+        self.steered.append((session_id, text))
 
     async def cancel(self, session_id: str, turn_id: str | None) -> None:
         pass
@@ -133,99 +139,208 @@ def make_bridge(tmp_path: Path) -> tuple[Bridge, FakeIRC, FakeBackend]:
 
 
 @pytest.mark.asyncio
-async def test_busy_messages_queue_and_advance_on_completion(tmp_path: Path) -> None:
-    bridge, irc, backend = make_bridge(tmp_path)
+async def test_busy_chat_builds_held_draft_then_next_queues_it(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
     runtime = bridge.channels["#codex"]
     runtime.busy = True
+    await bridge._handle_owner_message(IRCMessage("#codex", "trev", "trev", "first"))
     await bridge._handle_owner_message(IRCMessage("#codex", "trev", "trev", "second"))
-    assert list(runtime.queue) == ["second"]
-    await bridge._handle_backend_event(
-        BackendEvent(kind="turn_done", backend="codex", session_id="thread-1")
-    )
-    assert backend.sent == [("thread-1", "second")]
-    assert runtime.busy
-    assert ("#codex", "starting queued message (0 remain)") in irc.sent
+    assert runtime.held_lines == ["first", "second"]
+    assert list(runtime.queue) == []
+    await bridge._command("#codex", "next", "")
+    assert list(runtime.queue) == ["first\nsecond"]
+    assert runtime.held_lines == []
+    assert "📬 Draft queued" in irc.sent[-1][1]
 
 
 @pytest.mark.asyncio
-async def test_tool_relay_does_not_include_backend_payload(tmp_path: Path) -> None:
+async def test_held_draft_can_steer_or_send_after_turn_finishes(tmp_path: Path) -> None:
+    bridge, _irc, backend = make_bridge(tmp_path)
+    runtime = bridge.channels["#codex"]
+    runtime.busy = True
+    runtime.active_turn = "turn-1"
+    runtime.held_lines = ["change direction"]
+    await bridge._command("#codex", "steer", "")
+    assert backend.steered == [("thread-1", "change direction")]
+    assert runtime.held_lines == []
+
+    runtime.busy = False
+    runtime.held_lines = ["follow up"]
+    await bridge._command("#codex", "next", "")
+    assert backend.sent == [("thread-1", "follow up")]
+    assert runtime.held_lines == []
+
+
+@pytest.mark.asyncio
+async def test_session_change_refuses_to_lose_draft(tmp_path: Path) -> None:
+    bridge, _irc, _backend = make_bridge(tmp_path)
+    bridge.channels["#codex"].held_lines = ["keep me"]
+    with pytest.raises(ValueError, match="held draft"):
+        await bridge._command("#codex", "detach", "")
+
+
+@pytest.mark.asyncio
+async def test_running_alias_filters_outside_roots_and_feeds_use(tmp_path: Path) -> None:
+    bridge, irc, backend = make_bridge(tmp_path)
+    outside = tmp_path.parent / "outside-running"
+    outside.mkdir(exist_ok=True)
+    backend.running = [
+        SessionSummary("run-1", str(tmp_path), "active", updated_at=2, busy=True),
+        SessionSummary("run-2", str(outside), "outside", updated_at=3, busy=True),
+    ]
+    await bridge._command("#codex", "r", "")
+    assert [item.id for item in bridge.channels["#codex"].session_choices] == ["run-1"]
+    assert "🟢 Running sessions" in irc.sent[-1][1]
+    await bridge._command("#codex", "use", "")
+    assert bridge.channels["#codex"].binding == ChannelBinding(
+        "codex", "run-1", str(tmp_path)
+    )
+
+
+@pytest.mark.asyncio
+async def test_core_aliases_and_compatibility_aliases(tmp_path: Path) -> None:
     bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._command("#codex", "s", "")
+    assert "🤖 Codex" in irc.sent[-1][1]
+    bridge.channels["#codex"].session_choices = [
+        SessionSummary("thread-2", str(tmp_path), "choice")
+    ]
+    await bridge._command("#codex", "attach", "1")
+    assert bridge.channels["#codex"].binding is not None
+    assert bridge.channels["#codex"].binding.session_id == "thread-2"
+
+
+@pytest.mark.asyncio
+async def test_unknown_command_suggests_close_match(tmp_path: Path) -> None:
+    bridge, _irc, _backend = make_bridge(tmp_path)
+    with pytest.raises(ValueError, match="Did you mean !status"):
+        await bridge._command("#codex", "statsu", "")
+
+
+@pytest.mark.asyncio
+async def test_contextual_help_changes_with_held_draft(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    bridge.channels["#codex"].held_lines = ["draft"]
+    await bridge._command("#codex", "help", "")
+    assert "!next" in irc.sent[-1][1]
+    assert "!discard" in irc.sent[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_watch_modes_gate_progress_and_tools_but_not_finals(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    runtime = bridge.channels["#codex"]
+    runtime.watch_mode = "quiet"
+    await bridge._handle_backend_event(
+        BackendEvent(kind="progress", backend="codex", session_id="thread-1", text="update")
+    )
+    await bridge._handle_backend_event(
+        BackendEvent(kind="assistant", backend="codex", session_id="thread-1", text="final")
+    )
+    assert irc.sent == [("#codex", "💬 final")]
+
+    runtime.watch_mode = "concise"
     await bridge._handle_backend_event(
         BackendEvent(
             kind="tool_started",
             backend="codex",
             session_id="thread-1",
             tool_kind="shell",
-            text="cat /secret",
             data={"command": "cat /secret"},
         )
     )
-    assert irc.sent == [("#codex", "tool: shell started")]
+    assert "cat /secret" not in " ".join(text for _channel, text in irc.sent)
+    assert runtime.last_activity == "tool: shell started"
+
+    runtime.watch_mode = "verbose"
+    await bridge._handle_backend_event(
+        BackendEvent(
+            kind="tool_finished",
+            backend="codex",
+            session_id="thread-1",
+            tool_kind="shell",
+            success=True,
+        )
+    )
+    assert irc.sent[-1] == ("#codex", "🔧 shell: finished successfully")
 
 
 @pytest.mark.asyncio
-async def test_progress_is_relayed_without_replacing_last_reply(tmp_path: Path) -> None:
+async def test_status_is_multiline_dashboard(tmp_path: Path) -> None:
     bridge, irc, _backend = make_bridge(tmp_path)
     runtime = bridge.channels["#codex"]
-    runtime.last_reply = "previous final reply"
-    await bridge._handle_backend_event(
-        BackendEvent(
-            kind="progress",
-            backend="codex",
-            session_id="thread-1",
-            text="I found the cause and am checking the fix.",
-        )
-    )
-    assert irc.sent == [("#codex", "I found the cause and am checking the fix.")]
-    assert runtime.last_output == "I found the cause and am checking the fix."
-    assert runtime.last_reply == "previous final reply"
+    runtime.busy = True
+    runtime.active_flags = ("waitingOnApproval",)
+    runtime.held_lines = ["draft"]
+    runtime.queue.append("later")
+    await bridge._status("#codex")
+    dashboard = irc.sent[-1][1]
+    assert "🤖 Codex · 🟡 Waiting On Approval · 👁 concise" in dashboard
+    assert "📝 Held: 1 message(s) · 📬 Queue: 1" in dashboard
 
 
 @pytest.mark.asyncio
-async def test_last_repeats_latest_output_without_starting_turn(tmp_path: Path) -> None:
+async def test_last_is_read_only_and_formatted(tmp_path: Path) -> None:
     bridge, irc, backend = make_bridge(tmp_path)
     bridge.channels["#codex"].last_output = "Most recent commentary"
-    await bridge._command("#codex", "!last", "")
-    assert irc.sent == [("#codex", "Most recent commentary")]
+    await bridge._command("#codex", "l", "")
+    assert irc.sent == [("#codex", "💬 Most recent commentary")]
     assert backend.sent == []
 
 
+def test_formatted_preview_keeps_total_utf8_budget(tmp_path: Path) -> None:
+    bridge, _irc, _backend = make_bridge(tmp_path)
+    rendered = bridge._formatted_preview("💬", "🙂" * 200)
+    assert len(rendered.encode("utf-8")) <= bridge.config.bridge.summary_max_bytes
+
+
 @pytest.mark.asyncio
-async def test_backend_status_change_updates_irc_status(tmp_path: Path) -> None:
-    bridge, irc, _backend = make_bridge(tmp_path)
+async def test_request_shortcuts_are_one_shot(tmp_path: Path) -> None:
+    bridge, irc, backend = make_bridge(tmp_path)
+    runtime = bridge.channels["#codex"]
     await bridge._handle_backend_event(
         BackendEvent(
-            kind="status_changed",
+            kind="approval",
             backend="codex",
             session_id="thread-1",
-            data={"busy": True, "active_flags": ("waitingOnApproval",)},
+            request_token=7,
+            text="shell approval needed",
         )
     )
-    await bridge._status("#codex")
-    assert "codex busy (waiting on approval)" in irc.sent[-1][1]
-    assert "activity waiting on approval" in irc.sent[-1][1]
+    await bridge._command("#codex", "yes", "")
+    assert backend.resolved == [(7, True)]
+    assert runtime.approvals == {}
+    assert irc.sent[-1] == ("#codex", "✅ A1 approved once")
 
 
 @pytest.mark.asyncio
-async def test_binding_restores_active_state_and_latest_output(tmp_path: Path) -> None:
+async def test_single_question_accepts_multiword_answer_without_id(tmp_path: Path) -> None:
     bridge, irc, backend = make_bridge(tmp_path)
-    await bridge._bind(
-        "#codex",
-        SessionSummary(
-            "thread-2",
-            str(tmp_path),
-            "active session",
-            busy=True,
-            active_turn_id="turn-2",
-            last_output="Existing commentary",
-        ),
+    question = Question(id="choice", header="Choice", prompt="What next?")
+    await bridge._handle_backend_event(
+        BackendEvent(
+            kind="question",
+            backend="codex",
+            session_id="thread-1",
+            request_token=8,
+            questions=(question,),
+        )
     )
-    await bridge._status("#codex")
-    await bridge._command("#codex", "!last", "")
-    assert "codex busy" in irc.sent[-2][1]
-    assert "activity Existing commentary" in irc.sent[-2][1]
-    assert irc.sent[-1] == ("#codex", "Existing commentary")
-    assert backend.sent == []
+    answers: list[Sequence[Sequence[str]] | None] = []
+
+    async def resolve(
+        request_token: str | int,
+        questions: Sequence[Question],
+        values: Sequence[Sequence[str]] | None,
+    ) -> None:
+        assert request_token == 8
+        assert questions == (question,)
+        answers.append(values)
+
+    backend.resolve_question = resolve  # type: ignore[method-assign]
+    await bridge._command("#codex", "answer", "a multi word answer")
+    assert answers[0] == [["a multi word answer"]]
+    assert irc.sent[-1] == ("#codex", "✅ Q1 answered")
 
 
 @pytest.mark.asyncio

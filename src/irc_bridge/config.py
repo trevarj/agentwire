@@ -267,15 +267,33 @@ def install_secret_env(config: Config) -> None:
 
 def resolve_workspace(raw: str, allowed_roots: tuple[Path, ...]) -> Path:
     expanded = Path(os.path.expandvars(os.path.expanduser(raw)))
-    if not expanded.is_absolute():
-        raise ConfigError("workspace path must be absolute")
-    candidate = expanded.resolve(strict=False)
-    try:
-        resolved = candidate.resolve(strict=True)
-    except OSError as exc:
-        raise ConfigError(f"workspace does not exist: {candidate}") from exc
-    if not resolved.is_dir():
-        raise ConfigError(f"workspace is not a directory: {resolved}")
-    if not any(resolved == root or resolved.is_relative_to(root) for root in allowed_roots):
-        raise ConfigError("workspace is outside the configured allowlisted roots")
-    return resolved
+    if "$" in str(expanded):
+        raise ConfigError(f"workspace contains an unresolved environment variable: {raw}")
+    candidates = (
+        [expanded] if expanded.is_absolute() else [root / expanded for root in allowed_roots]
+    )
+    resolved_candidates: list[Path] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if not resolved.is_dir():
+            continue
+        if any(
+            resolved == root or resolved.is_relative_to(root) for root in allowed_roots
+        ) and resolved not in resolved_candidates:
+            resolved_candidates.append(resolved)
+    if not resolved_candidates:
+        if expanded.is_absolute():
+            candidate = expanded.resolve(strict=False)
+            if candidate.exists() and not candidate.is_dir():
+                raise ConfigError(f"workspace is not a directory: {candidate}")
+            if candidate.exists():
+                raise ConfigError("workspace is outside the configured allowlisted roots")
+            raise ConfigError(f"workspace does not exist: {candidate}")
+        raise ConfigError(f"workspace does not exist under an allowed root: {raw}")
+    if len(resolved_candidates) > 1:
+        choices = ", ".join(str(path) for path in resolved_candidates)
+        raise ConfigError(f"workspace is ambiguous; use an absolute path: {choices}")
+    return resolved_candidates[0]

@@ -22,12 +22,13 @@ class StubOpenCode(OpenCodeBackend):
         )
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
         self.messages: list[dict[str, Any]] = []
+        self.responses: dict[str, Any] = {}
 
     async def _json(self, method: str, path: str, **kwargs: Any) -> Any:
         self.calls.append((method, path, kwargs))
         if path.endswith("/message"):
             return self.messages
-        return None
+        return self.responses.get(path)
 
 
 @pytest.mark.asyncio
@@ -98,3 +99,40 @@ async def test_question_reject_uses_session_owned_v2_route() -> None:
     method, path, _kwargs = backend.calls[-1]
     assert method == "POST"
     assert path == "/api/session/ses_1/question/que_1/reject"
+
+
+@pytest.mark.asyncio
+async def test_running_sessions_joins_status_and_session_metadata() -> None:
+    backend = StubOpenCode()
+    backend.responses = {
+        "/session/status": {
+            "ses_busy": {"type": "busy"},
+            "ses_retry": {"type": "retry", "attempt": 2},
+            "ses_idle": {"type": "idle"},
+        },
+        "/session": [
+            {"id": "ses_busy", "directory": "/one", "title": "Busy"},
+            {"id": "ses_retry", "directory": "/two", "title": "Retry"},
+            {"id": "ses_idle", "directory": "/three", "title": "Idle"},
+        ],
+    }
+    sessions = await backend.list_running_sessions()
+    assert [session.id for session in sessions] == ["ses_busy", "ses_retry"]
+    assert sessions[0].busy
+    assert sessions[1].active_flags == ("retry",)
+
+
+@pytest.mark.asyncio
+async def test_attach_reads_authoritative_running_status() -> None:
+    backend = StubOpenCode()
+    backend.responses = {
+        "/session/ses_busy": {
+            "id": "ses_busy",
+            "directory": "/workspace",
+            "title": "Busy",
+        },
+        "/session/status": {"ses_busy": {"type": "busy"}},
+    }
+    summary = await backend.attach_session("ses_busy", "/workspace")
+    assert summary.busy
+    assert "ses_busy" in backend._busy

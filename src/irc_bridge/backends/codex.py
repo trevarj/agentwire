@@ -32,6 +32,7 @@ class CodexBackend(Backend):
         self._active_turns: dict[str, str] = {}
         self._turn_messages: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self._last_replies: dict[str, str] = {}
+        self._last_plan_updates: dict[tuple[str, str], str] = {}
 
     async def start(self) -> None:
         if self._reader_task is not None:
@@ -283,13 +284,16 @@ class CodexBackend(Backend):
             )
             explanation = str(params.get("explanation") or "").strip()
             text = explanation or (f"plan: {active_step}" if active_step else "")
-            if text:
+            turn_id = str(params.get("turnId") or "")
+            key = (thread_id, turn_id)
+            if text and self._last_plan_updates.get(key) != text:
+                self._last_plan_updates[key] = text
                 await self._events.put(
                     BackendEvent(
                         kind="progress",
                         backend=self.name,
                         session_id=thread_id,
-                        turn_id=str(params.get("turnId") or "") or None,
+                        turn_id=turn_id or None,
                         text=text,
                     )
                 )
@@ -386,6 +390,8 @@ class CodexBackend(Backend):
                 safe_one_line(str(error.get("message") or status)) if kind == "turn_failed" else ""
             )
             self._active_turns.pop(thread_id, None)
+            if turn_id:
+                self._last_plan_updates.pop((thread_id, turn_id), None)
             await self._events.put(
                 BackendEvent(
                     kind=kind,
@@ -490,6 +496,27 @@ class CodexBackend(Backend):
                 continue
             sessions.append(self._summary(item))
         return sessions
+
+    async def list_running_sessions(self) -> list[SessionSummary]:
+        sessions: list[SessionSummary] = []
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {
+                "limit": 100,
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+            }
+            if cursor:
+                params["cursor"] = cursor
+            result = await self._request("thread/list", params)
+            for item in (result or {}).get("data") or []:
+                if isinstance(item, dict):
+                    summary = self._summary(item)
+                    if summary.busy:
+                        sessions.append(summary)
+            cursor = str((result or {}).get("nextCursor") or "") or None
+            if not cursor:
+                return sessions
 
     async def create_session(self, cwd: str) -> SessionSummary:
         result = await self._request(

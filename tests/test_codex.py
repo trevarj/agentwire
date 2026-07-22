@@ -96,6 +96,15 @@ async def test_plan_update_relays_current_step() -> None:
     event = await backend._events.get()
     assert event.kind == "progress"
     assert event.text == "plan: Fix status tracking"
+    await backend._handle_notification(
+        "turn/plan/updated",
+        {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "plan": [{"step": "Fix status tracking", "status": "inProgress"}],
+        },
+    )
+    assert backend._events.empty()
 
 
 @pytest.mark.asyncio
@@ -155,3 +164,43 @@ def test_session_summary_includes_current_thread_status() -> None:
         }
     )
     assert summary.busy
+
+
+@pytest.mark.asyncio
+async def test_running_sessions_paginates_and_filters_active_threads() -> None:
+    backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
+    calls: list[dict[str, object]] = []
+
+    async def request(method: str, params: dict[str, object]) -> object:
+        assert method == "thread/list"
+        calls.append(params)
+        if "cursor" not in params:
+            return {
+                "data": [
+                    {
+                        "id": "active-1",
+                        "cwd": "/workspace/one",
+                        "status": {"type": "active", "activeFlags": []},
+                    },
+                    {
+                        "id": "idle-1",
+                        "cwd": "/workspace/one",
+                        "status": {"type": "idle"},
+                    },
+                ],
+                "nextCursor": "page-2",
+            }
+        return {
+            "data": [
+                {
+                    "id": "active-2",
+                    "cwd": "/workspace/two",
+                    "status": {"type": "active", "activeFlags": []},
+                }
+            ]
+        }
+
+    backend._request = request  # type: ignore[method-assign]
+    sessions = await backend.list_running_sessions()
+    assert [session.id for session in sessions] == ["active-1", "active-2"]
+    assert calls[1]["cursor"] == "page-2"

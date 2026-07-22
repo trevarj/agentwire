@@ -8,9 +8,19 @@ import pytest
 from irc_bridge.config import ConfigError, _path, load_secret_env, resolve_workspace
 
 
-def test_workspace_requires_absolute_path(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="absolute"):
-        resolve_workspace("relative/path", (tmp_path,))
+def test_workspace_accepts_path_relative_to_allowed_root(tmp_path: Path) -> None:
+    workspace = tmp_path / "relative" / "path"
+    workspace.mkdir(parents=True)
+    assert resolve_workspace("relative/path", (tmp_path,)) == workspace
+
+
+def test_relative_workspace_rejects_ambiguous_roots(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    (first / "project").mkdir(parents=True)
+    (second / "project").mkdir(parents=True)
+    with pytest.raises(ConfigError, match="ambiguous"):
+        resolve_workspace("project", (first, second))
 
 
 def test_path_rejects_unresolved_environment_variable(

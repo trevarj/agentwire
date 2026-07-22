@@ -51,20 +51,27 @@ IRC client -> Ergo <-TLS/SASL over SSH tunnel-> IRC bridge
 
 ## IRC behavior
 
-Each channel has one of three useful states: detached, idle with a binding, or
-busy. A fresh channel requires `!new <absolute-path>`. Only the channel-to-
-session/workspace binding persists across restarts; queues and request aliases
-do not.
+Each channel has one of four useful states: detached, idle with a binding, busy,
+or holding a draft that has not been dispatched. A fresh channel can use
+`!running` to find active work or `!new <workspace>` to create a session. Only
+the channel-to-session/workspace binding persists across restarts; queues,
+drafts, request aliases, and watch mode do not.
 
-- Normal text starts a turn while idle. While busy it enters a bounded FIFO
-  queue. `!steer` explicitly redirects the active turn; `!cancel` interrupts it.
-- `!sessions [path]` produces a numbered, channel-local list and `!attach N`
-  consumes that list. A backend session cannot be attached to two channels.
+- Normal text starts a turn while idle. While busy it accumulates in a bounded
+  held draft. `!next` commits the draft to the FIFO queue, `!steer` redirects
+  the active turn with it, and `!discard` removes it. No draft is dispatched
+  implicitly.
+- `!running`/`!r` produces a numbered list of active sessions across allowed
+  roots. `!sessions [workspace]` lists recent sessions, and `!use N` consumes
+  either list. A backend session cannot be attached to two channels.
+- Relative workspace names resolve under the configured allowed roots. Missing,
+  ambiguous, non-directory, outside-root, and symlink-escape paths are rejected.
 - Replies are posted only when complete and previewed at eight lines / 1,200
   UTF-8 bytes. The full reply stays available in the native TUI or via explicit
   `!paste`.
-- External TUI turns are mirrored. Tool activity is capped per turn to avoid
-  IRC flooding. A completion/failure line advances the queued prompt.
+- External TUI turns are mirrored. `!watch quiet|concise|verbose` controls push
+  detail; verbose tool activity is capped per turn to avoid IRC flooding. A
+  completion/failure line advances the queued prompt.
 - Approval and question IDs are short channel-local aliases (`A1`, `Q1`). If a
   TUI resolves one, IRC removes the alias and reports that it was handled in
   another client.
@@ -74,19 +81,23 @@ do not.
 Commands:
 
 ```text
-!help
-!new ABSOLUTE_PATH
-!sessions [ABSOLUTE_PATH]
-!attach N
+!help [TOPIC|all]
+!running / !r
+!new WORKSPACE
+!sessions [WORKSPACE]
+!use [N] / !attach N
 !detach
-!status
-!steer TEXT
-!cancel
-!approve [A1] / !deny [A1]
-!answer Q1 ANSWER [ | ANSWER] / !reject [Q1]
+!status / !s
+!last / !l
+!watch [quiet|concise|verbose]
+!next / !steer [TEXT] / !discard / !cancel
+!yes [A1] / !no [A1]
+!answer [Q1] ANSWER [ | ANSWER] / !skip [Q1]
 !queue / !drop N|all
 !paste / !paste-force
 ```
+
+Compatibility aliases remain available: `!approve`, `!deny`, and `!reject`.
 
 Question answers use `|` between separate questions, comma-separated values for
 multi-select questions, and either option numbers or labels.
