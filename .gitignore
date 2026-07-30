@@ -4,6 +4,7 @@
 .ruff_cache/
 __pycache__/
 *.egg-info/
+dist/
 result
 
 # Live configuration and identity material never belong in this repository.
@@ -12,3 +13,6 @@ secrets.env
 *.pem
 *.key
 state.json
+state.json.legacy-json
+*.sqlite3
+*.sqlite3-journal

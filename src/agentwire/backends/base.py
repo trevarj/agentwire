@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import abc
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
+from typing import Any
 
 from agentwire.models import BackendEvent, Question, SessionSummary
 
@@ -39,6 +40,17 @@ class Backend(abc.ABC):
 
     async def session_busy(self, session_id: str) -> bool | None:
         return None
+
+    async def configure_session(self, session_id: str, settings: Mapping[str, Any]) -> None:
+        unsupported = {
+            key
+            for key, value in settings.items()
+            if key != "delivery" and not (key == "approvalReviewer" and value == "manual")
+        }
+        if unsupported:
+            raise BackendError(
+                f"{self.name} does not support settings: {', '.join(sorted(unsupported))}"
+            )
 
     @abc.abstractmethod
     async def send_message(self, session_id: str, text: str) -> str | None: ...

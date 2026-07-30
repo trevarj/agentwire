@@ -6,9 +6,12 @@ import contextlib
 import random
 import secrets
 import ssl
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 
 from agentwire.config import IRCConfig
+from agentwire.protocol import PROTOCOL_TAG, Envelope, fragment_envelope
 from agentwire.text import clean_text, truncate_utf8
 
 
@@ -22,6 +25,8 @@ class IRCMessage:
     account: str
     nick: str
     text: str
+    tags: Mapping[str, str | None] = field(default_factory=lambda: MappingProxyType({}))
+    command: str = "PRIVMSG"
 
 
 @dataclass(slots=True, frozen=True)
@@ -40,6 +45,14 @@ class _IncomingBatch:
     lines: list[str] = field(default_factory=list)
 
 
+@dataclass(slots=True, frozen=True)
+class _OutgoingMessage:
+    target: str
+    text: str = ""
+    tags: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
+    command: str = "PRIVMSG"
+
+
 def _unescape_tag(value: str) -> str:
     result: list[str] = []
     escaped = False
@@ -55,6 +68,15 @@ def _unescape_tag(value: str) -> str:
     if escaped:
         result.append("\\")
     return "".join(result)
+
+
+def _escape_tag(value: str) -> str:
+    replacements = {";": r"\:", " ": r"\s", "\\": r"\\", "\r": r"\r", "\n": r"\n"}
+    return "".join(replacements.get(char, char) for char in value)
+
+
+def _format_tags(tags: Mapping[str, str]) -> str:
+    return "@" + ";".join(f"{key}={_escape_tag(value)}" for key, value in tags.items()) + " "
 
 
 def parse_irc_line(raw: str) -> IRCLine:
@@ -83,7 +105,7 @@ class IRCClient:
         self.config = config
         self.password = password
         self._messages: asyncio.Queue[IRCMessage] = asyncio.Queue()
-        self._outgoing: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
+        self._outgoing: asyncio.Queue[_OutgoingMessage] = asyncio.Queue()
         self._ready = asyncio.Event()
         self._closed = False
         self._runner: asyncio.Task[None] | None = None
@@ -121,7 +143,22 @@ class IRCClient:
         cleaned = clean_text(text)
         if not cleaned:
             return
-        await self._outgoing.put((target, cleaned))
+        await self._outgoing.put(_OutgoingMessage(target, cleaned))
+
+    async def send_tagmsg(self, target: str, tags: Mapping[str, str]) -> None:
+        await self._outgoing.put(_OutgoingMessage(target, tags=tags, command="TAGMSG"))
+
+    async def send_protocol(
+        self, target: str, envelope: Envelope, preview: str | None = None
+    ) -> None:
+        fragments = fragment_envelope(envelope)
+        first_tags = MappingProxyType({PROTOCOL_TAG: fragments[0]})
+        if preview:
+            await self._outgoing.put(_OutgoingMessage(target, clean_text(preview), first_tags))
+        else:
+            await self.send_tagmsg(target, first_tags)
+        for fragment in fragments[1:]:
+            await self.send_tagmsg(target, MappingProxyType({PROTOCOL_TAG: fragment}))
 
     async def _run(self) -> None:
         delay = 0.5
@@ -169,8 +206,7 @@ class IRCClient:
         sasl_started = False
         sasl_complete = False
         welcome = False
-        required = {"sasl", "account-tag"}
-        wanted = {
+        required = {
             "sasl",
             "account-tag",
             "message-tags",
@@ -178,8 +214,12 @@ class IRCClient:
             "batch",
             "draft/multiline",
             "labeled-response",
-            "extended-join",
+            "echo-message",
+            "standard-replies",
+            "draft/chathistory",
+            "draft/event-playback",
         }
+        wanted = required | {"extended-join"}
         while not (welcome and cap_finished):
             raw = await reader.readline()
             if not raw:
@@ -277,6 +317,19 @@ class IRCClient:
             return
         if line.command == "BATCH" and line.params:
             batch_id = line.params[0]
+            if PROTOCOL_TAG in line.tags and len(line.params) >= 3 and batch_id.startswith("+"):
+                channel = line.params[2].lower()
+                if channel in self.config.channels:
+                    await self._messages.put(
+                        IRCMessage(
+                            channel=channel,
+                            account=str(line.tags.get("account") or "").lower(),
+                            nick=nick,
+                            text="",
+                            tags=MappingProxyType(dict(line.tags)),
+                            command="BATCH",
+                        )
+                    )
             if (
                 batch_id.startswith("+")
                 and len(line.params) >= 2
@@ -295,13 +348,46 @@ class IRCClient:
                         )
                     )
             return
-        if line.command != "PRIVMSG" or len(line.params) < 2:
+        if line.command in {"TOPIC", "331", "332"}:
+            if line.command == "332" and len(line.params) >= 3:
+                channel, text = line.params[-2].lower(), line.params[-1]
+            elif line.command == "331" and len(line.params) >= 2:
+                channel = next(
+                    (param.lower() for param in line.params if param.startswith("#")), ""
+                )
+                text = ""
+            elif len(line.params) >= 2:
+                channel, text = line.params[0].lower(), line.params[1]
+            else:
+                return
+            if channel in self.config.channels:
+                await self._messages.put(
+                    IRCMessage(
+                        channel,
+                        str(line.tags.get("account") or "").lower(),
+                        nick,
+                        text,
+                        MappingProxyType(dict(line.tags)),
+                        line.command,
+                    )
+                )
+            return
+        if line.command not in {"PRIVMSG", "TAGMSG"}:
+            return
+        if len(line.params) < (2 if line.command == "PRIVMSG" else 1):
             return
         channel = line.params[0].lower()
         if channel not in self.config.channels:
             return
         account = str(line.tags.get("account") or "").lower()
-        message = IRCMessage(channel=channel, account=account, nick=nick, text=line.params[1])
+        message = IRCMessage(
+            channel=channel,
+            account=account,
+            nick=nick,
+            text=line.params[1] if line.command == "PRIVMSG" else "",
+            tags=MappingProxyType(dict(line.tags)),
+            command=line.command,
+        )
         batch_id = line.tags.get("batch")
         if isinstance(batch_id, str) and batch_id in self._batches:
             batch = self._batches[batch_id]
@@ -314,7 +400,11 @@ class IRCClient:
 
     async def _write_messages(self) -> None:
         while not self._closed:
-            target, text = await self._outgoing.get()
+            message = await self._outgoing.get()
+            target, text = message.target, message.text
+            if message.command == "TAGMSG":
+                await self._write_line(f"{_format_tags(message.tags)}TAGMSG {target}")
+                continue
             lines: list[str] = []
             for logical in text.splitlines() or [text]:
                 remaining = logical
@@ -325,14 +415,16 @@ class IRCClient:
                 lines.append(remaining or " ")
             if len(lines) > 1 and {"batch", "draft/multiline"} <= self._caps:
                 batch_id = f"bridge-{secrets.token_hex(4)}"
-                await self._write_line(f"BATCH +{batch_id} draft/multiline {target}")
+                tag_prefix = _format_tags(message.tags) if message.tags else ""
+                await self._write_line(f"{tag_prefix}BATCH +{batch_id} draft/multiline {target}")
                 for item in lines:
                     await self._write_line(f"@batch={batch_id} PRIVMSG {target} :{item}")
                     await asyncio.sleep(0.15)
                 await self._write_line(f"BATCH -{batch_id}")
             else:
                 for item in lines:
-                    await self._write_line(f"PRIVMSG {target} :{item}")
+                    tag_prefix = _format_tags(message.tags) if message.tags else ""
+                    await self._write_line(f"{tag_prefix}PRIVMSG {target} :{item}")
                     await asyncio.sleep(0.15)
 
     async def _write_line(self, line: str) -> None:

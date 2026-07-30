@@ -2,87 +2,54 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import difflib
-from collections import deque
-from dataclasses import dataclass, field
-from pathlib import Path
+import secrets
+import uuid
+from dataclasses import dataclass, field, replace
+from typing import Any
 
 from agentwire.backends.base import Backend, BackendError
 from agentwire.config import Config, ConfigError, resolve_workspace
-from agentwire.irc import IRCClient, IRCMessage
+from agentwire.irc import IRCClient
 from agentwire.models import BackendEvent, ChannelBinding, Question, SessionSummary
-from agentwire.paste import LitterboxClient, PasteError
-from agentwire.state import StateStore
-from agentwire.text import preview, safe_one_line
+from agentwire.protocol import (
+    PROTOCOL_TAG,
+    Envelope,
+    ProtocolError,
+    Reassembler,
+    TopicActivation,
+    decode_envelope,
+    new_envelope,
+    parse_topic,
+)
+from agentwire.redaction import scan_secrets
+from agentwire.state import QueuedPrompt, StateStore
+from agentwire.text import clean_text, safe_one_line, truncate_utf8
+
+MAX_CONTENT_BYTES = 64 * 1024
+MAX_PREVIEW_BYTES = 4 * 1024
 
 
 @dataclass(slots=True)
 class PendingRequest:
-    alias: str
-    backend: str
     token: str | int
+    kind: str
+    session_id: str | None = None
     questions: tuple[Question, ...] = ()
-
-
-@dataclass(slots=True, frozen=True)
-class CommandSpec:
-    name: str
-    aliases: tuple[str, ...]
-    usage: str
-    category: str
-    summary: str
-
-
-COMMANDS = (
-    CommandSpec("help", ("h",), "!help [topic|all]", "general", "show contextual help"),
-    CommandSpec("status", ("s",), "!status", "general", "show the channel dashboard"),
-    CommandSpec("last", ("l",), "!last", "output", "repeat the latest agent output"),
-    CommandSpec("watch", (), "!watch [quiet|concise|verbose]", "output", "set activity detail"),
-    CommandSpec("running", ("r",), "!running", "sessions", "list active sessions"),
-    CommandSpec("sessions", (), "!sessions [workspace]", "sessions", "list recent sessions"),
-    CommandSpec("use", ("attach",), "!use [number]", "sessions", "attach a listed session"),
-    CommandSpec("new", (), "!new workspace", "sessions", "create and attach a session"),
-    CommandSpec("detach", (), "!detach", "sessions", "detach the current session"),
-    CommandSpec("next", (), "!next", "turn", "queue or send the held draft"),
-    CommandSpec("steer", (), "!steer [text]", "turn", "redirect the active turn"),
-    CommandSpec("discard", (), "!discard", "turn", "discard the held draft"),
-    CommandSpec("cancel", ("stop",), "!cancel", "turn", "interrupt the active turn"),
-    CommandSpec("queue", (), "!queue", "queue", "show queued turns"),
-    CommandSpec("drop", (), "!drop number|all", "queue", "remove queued turns"),
-    CommandSpec("yes", ("approve",), "!yes [A1]", "requests", "approve once"),
-    CommandSpec("no", ("deny",), "!no [A1]", "requests", "deny an approval"),
-    CommandSpec("answer", (), "!answer [Q1] answer", "requests", "answer a question"),
-    CommandSpec("skip", ("reject",), "!skip [Q1]", "requests", "reject a question"),
-    CommandSpec("paste", (), "!paste", "output", "upload the full final reply"),
-    CommandSpec("paste-force", (), "!paste-force", "output", "override a paste scan block"),
-)
-COMMAND_BY_NAME = {
-    alias: spec
-    for spec in COMMANDS
-    for alias in (spec.name, *spec.aliases)
-}
+    redacted: bool = False
 
 
 @dataclass(slots=True)
 class ChannelRuntime:
     backend: str
+    activation: TopicActivation | None = None
     binding: ChannelBinding | None = None
     busy: bool = False
     active_turn: str | None = None
-    active_flags: tuple[str, ...] = ()
-    watch_mode: str = "concise"
-    held_lines: list[str] = field(default_factory=list)
-    queue: deque[str] = field(default_factory=deque)
-    session_choices: list[SessionSummary] = field(default_factory=list)
-    approvals: dict[str, PendingRequest] = field(default_factory=dict)
-    questions: dict[str, PendingRequest] = field(default_factory=dict)
-    approval_counter: int = 0
-    question_counter: int = 0
-    tool_milestones: int = 0
-    tool_events_suppressed: bool = False
-    last_activity: str | None = None
-    last_output: str | None = None
-    last_reply: str | None = None
+    settings: dict[str, Any] = field(
+        default_factory=lambda: {"delivery": "queue", "approvalReviewer": "manual"}
+    )
+    requests: dict[str, PendingRequest] = field(default_factory=dict)
+    observed_sessions: set[str] = field(default_factory=set)
 
 
 class Bridge:
@@ -96,16 +63,19 @@ class Bridge:
         self.irc = irc
         self.backends = backends
         self.state = StateStore(config.bridge.state_file)
-        self.paste = LitterboxClient(config.paste)
         self.channels = {
             channel: ChannelRuntime(backend=backend)
             for channel, backend in config.irc.channels.items()
         }
+        self.instance = str(uuid.uuid4())
+        self.epoch = secrets.token_urlsafe(24)
+        self._reassemblers = {channel: Reassembler() for channel in self.channels}
         self._tasks: list[asyncio.Task[None]] = []
         self._closed = False
 
     async def run(self) -> None:
         try:
+            await self.state.initialize()
             await asyncio.gather(
                 self.irc.start(), *(backend.start() for backend in self.backends.values())
             )
@@ -116,7 +86,7 @@ class Bridge:
                     for backend in self.backends.values()
                 ),
             )
-            restore_messages = await self._restore_bindings()
+            await self._restore_bindings()
             self._tasks = [
                 asyncio.create_task(self._irc_loop(), name="bridge-irc"),
                 *(
@@ -124,14 +94,6 @@ class Bridge:
                     for name, backend in self.backends.items()
                 ),
             ]
-            for channel, message in restore_messages:
-                await self._say(channel, message)
-            if self.config.bridge.notify_owner_on_start:
-                channels = " and ".join(self.channels)
-                await self.irc.send_privmsg(
-                    self.config.bridge.owner_account,
-                    f"✅ Agentwire is ready: {channels}. Send !help or !running.",
-                )
             await asyncio.gather(*self._tasks)
         finally:
             await self.close()
@@ -154,733 +116,780 @@ class Bridge:
             return_exceptions=True,
         )
 
-    async def _restore_bindings(self) -> list[tuple[str, str]]:
-        messages: list[tuple[str, str]] = []
-        bindings = await self.state.load()
-        claimed: set[tuple[str, str]] = set()
-        for channel, binding in bindings.items():
+    async def _restore_bindings(self) -> None:
+        for channel, binding in (await self.state.load()).items():
             runtime = self.channels.get(channel)
             if runtime is None or binding.backend != runtime.backend:
                 await self.state.set(channel, None)
-                continue
-            key = (binding.backend, binding.session_id)
-            if key in claimed:
-                await self.state.set(channel, None)
-                messages.append((channel, "duplicate saved binding was detached"))
                 continue
             try:
                 workspace = resolve_workspace(binding.cwd, self.config.bridge.allowed_roots)
                 summary = await self.backends[binding.backend].attach_session(
                     binding.session_id, str(workspace)
                 )
-            except (ConfigError, BackendError) as exc:
+            except (ConfigError, BackendError):
                 await self.state.set(channel, None)
-                messages.append(
-                    (channel, f"saved session could not be restored and was detached: {exc}")
-                )
                 continue
-            await self._bind(channel, summary)
-            claimed.add(key)
-            messages.append(
-                (
-                    channel,
-                    f"restored {binding.backend} session {self._short(summary.id)} in {workspace}",
-                )
-            )
-        return messages
+            runtime.binding = ChannelBinding(binding.backend, summary.id, summary.cwd)
+            runtime.observed_sessions.add(summary.id)
+            runtime.busy = summary.busy
+            runtime.active_turn = summary.active_turn_id
 
     async def _irc_loop(self) -> None:
         while True:
             message = await self.irc.recv()
-            if message.account != self.config.bridge.owner_account:
-                continue
             try:
-                await self._handle_owner_message(message)
-            except (BackendError, ConfigError, PasteError, ValueError) as exc:
-                await self._say(message.channel, f"⚠️ {safe_one_line(str(exc), 280)}")
+                if message.command in {"TOPIC", "332"}:
+                    await self._handle_topic(message.channel, message.text)
+                    continue
+                runtime = self.channels[message.channel]
+                if runtime.activation is None:
+                    continue
+                if message.account != runtime.activation.account:
+                    continue
+                value = message.tags.get(PROTOCOL_TAG)
+                if not isinstance(value, str):
+                    continue
+                if "draft/playback" in message.tags or "znc.in/playback" in message.tags:
+                    continue
+                envelope = self._reassemblers[message.channel].add(value)
+                if envelope is not None:
+                    await self._handle_action(message.channel, envelope)
+            except (BackendError, ConfigError, ProtocolError, ValueError) as exc:
+                await self._emit_failure(message.channel, None, str(exc))
             except Exception:
-                await self._say(message.channel, "❌ Unexpected bridge failure")
+                await self._emit_failure(message.channel, None, "unexpected bridge failure")
+
+    async def _handle_topic(self, channel: str, topic: str) -> None:
+        runtime = self.channels[channel]
+        # A topic change suspends the channel until the complete new marker validates.
+        runtime.activation = None
+        activation = parse_topic(topic)
+        if activation is None:
+            return
+        if activation.account != self.config.bridge.owner_account:
+            raise ProtocolError("topic account does not match the configured owner account")
+        if activation.backend != runtime.backend:
+            raise ProtocolError("topic backend does not match the configured channel backend")
+        runtime.activation = activation
+        await self._emit(
+            channel,
+            "agent.hello",
+            data={
+                "protocol": "agentwire-irc-v1",
+                "backend": runtime.backend,
+                "epoch": self.epoch,
+                "capabilities": sorted(
+                    {
+                        "sync",
+                        "workspaces",
+                        "sessions",
+                        "history",
+                        "settings",
+                        "turns",
+                        "steering",
+                        "queues",
+                        "requests",
+                    }
+                ),
+                "actions": sorted(
+                    {
+                        "sync.request",
+                        "workspace.list.request",
+                        "session.list.request",
+                        "history.request",
+                        "session.create",
+                        "session.attach",
+                        "session.detach",
+                        "settings.update",
+                        "turn.prompt",
+                        "turn.steer",
+                        "turn.cancel",
+                        "queue.edit",
+                        "queue.move",
+                        "queue.delete",
+                        "queue.clear",
+                        "request.respond",
+                        "request.skip",
+                    }
+                ),
+                "limits": {
+                    "contentBytes": MAX_CONTENT_BYTES,
+                    "queueItems": self.config.bridge.queue_limit,
+                    "historyEvents": 200,
+                    "historyBytes": 512 * 1024,
+                    "historyDays": 30,
+                },
+                "settings": (
+                    ["model", "effort", "collaboration", "delivery", "approvalReviewer"]
+                    if runtime.backend == "codex"
+                    else ["delivery"]
+                ),
+            },
+        )
+        await self._emit_snapshot(channel)
+
+    async def _handle_action(self, channel: str, action: Envelope) -> None:
+        if action.message_type != "action":
+            return
+        if action.history:
+            return
+        if not action.device:
+            raise ProtocolError("actions require device")
+        if action.kind != "sync.request" and action.epoch != self.epoch:
+            raise ProtocolError("stale or missing live epoch")
+        duplicate = await self.state.claim_action(action)
+        if duplicate is not None:
+            await self._emit(
+                channel,
+                f"action.{duplicate}" if duplicate != "accepted" else "action.accepted",
+                reply=action.id,
+                data={"duplicate": True},
+            )
+            return
+        await self._emit(channel, "action.accepted", reply=action.id)
+        try:
+            await self._dispatch_action(channel, action)
+        except (BackendError, ConfigError, ProtocolError, ValueError) as exc:
+            detail = safe_one_line(str(exc), 1000)
+            await self.state.finish_action(action.id, "failed", detail)
+            await self._emit(channel, "action.failed", reply=action.id, data={"message": detail})
+            return
+        except Exception:
+            detail = "backend outcome is unknown"
+            await self.state.finish_action(action.id, "uncertain", detail)
+            await self._emit(channel, "action.uncertain", reply=action.id, data={"message": detail})
+            return
+        await self.state.finish_action(action.id, "succeeded")
+        await self._emit(channel, "action.succeeded", reply=action.id)
+
+    async def _dispatch_action(self, channel: str, action: Envelope) -> None:
+        handlers = {
+            "sync.request": self._action_sync,
+            "workspace.list.request": self._action_workspaces,
+            "session.list.request": self._action_sessions,
+            "history.request": self._action_history,
+            "session.create": self._action_create,
+            "session.attach": self._action_attach,
+            "session.detach": self._action_detach,
+            "settings.update": self._action_settings,
+            "turn.prompt": self._action_prompt,
+            "turn.steer": self._action_steer,
+            "turn.cancel": self._action_cancel,
+            "queue.edit": self._action_queue_edit,
+            "queue.move": self._action_queue_move,
+            "queue.delete": self._action_queue_delete,
+            "queue.clear": self._action_queue_clear,
+            "request.respond": self._action_request_respond,
+            "request.skip": self._action_request_skip,
+        }
+        handler = handlers.get(action.kind)
+        if handler is None:
+            raise ProtocolError(f"action is not advertised by this Agentwire: {action.kind}")
+        await handler(channel, action)
+
+    async def _action_sync(self, channel: str, action: Envelope) -> None:
+        await self._emit_snapshot(channel, reply=action.id)
+
+    async def _action_workspaces(self, channel: str, action: Envelope) -> None:
+        items = [
+            {"path": str(root), "name": root.name} for root in self.config.bridge.allowed_roots
+        ]
+        await self._emit(
+            channel,
+            "workspace.page",
+            reply=action.id,
+            data={"items": items, "next": None},
+        )
+
+    async def _action_sessions(self, channel: str, action: Envelope) -> None:
+        cwd_value = action.data.get("cwd")
+        backend = self.backends[self.channels[channel].backend]
+        if cwd_value:
+            cwd = str(resolve_workspace(str(cwd_value), self.config.bridge.allowed_roots))
+            sessions = await backend.list_sessions(cwd)
+        else:
+            sessions = await backend.list_running_sessions()
+        allowed = [item for item in sessions if self._workspace_allowed(item.cwd)]
+        await self._emit(
+            channel,
+            "session.page",
+            reply=action.id,
+            data={"items": [self._session_data(item) for item in allowed[:100]], "next": None},
+        )
+
+    async def _action_history(self, channel: str, action: Envelope) -> None:
+        before = action.data.get("beforeAt")
+        if before is not None and not isinstance(before, int):
+            raise ProtocolError("beforeAt must be an integer")
+        limit = action.data.get("limit", 200)
+        if not isinstance(limit, int):
+            raise ProtocolError("limit must be an integer")
+        payloads = await self.state.history(channel, before, limit)
+        page_id = str(uuid.uuid4())
+        await self._emit(
+            channel,
+            "history.begin",
+            reply=action.id,
+            data={"page": page_id, "count": len(payloads)},
+            journal=False,
+        )
+        for payload in payloads:
+            historic = replace(decode_envelope(payload), history=True, reply=action.id)
+            await self.irc.send_protocol(channel, historic)
+        await self._emit(
+            channel,
+            "history.end",
+            reply=action.id,
+            data={"page": page_id, "count": len(payloads)},
+            journal=False,
+        )
+
+    async def _action_create(self, channel: str, action: Envelope) -> None:
+        cwd = str(
+            resolve_workspace(self._data_string(action, "cwd"), self.config.bridge.allowed_roots)
+        )
+        runtime = self.channels[channel]
+        summary = await self.backends[runtime.backend].create_session(cwd)
+        await self._set_binding(channel, summary)
+
+    async def _action_attach(self, channel: str, action: Envelope) -> None:
+        runtime = self.channels[channel]
+        session_id = action.session_id or self._data_string(action, "sid")
+        cwd_value = action.data.get("cwd")
+        cwd = (
+            str(resolve_workspace(str(cwd_value), self.config.bridge.allowed_roots))
+            if cwd_value
+            else None
+        )
+        summary = await self.backends[runtime.backend].attach_session(session_id, cwd)
+        if not self._workspace_allowed(summary.cwd):
+            raise ConfigError("session workspace is outside allowed roots")
+        await self._set_binding(channel, summary)
+
+    async def _action_detach(self, channel: str, action: Envelope) -> None:
+        runtime = self.channels[channel]
+        previous = runtime.binding
+        runtime.binding = None
+        runtime.busy = False
+        runtime.active_turn = None
+        await self.state.set(channel, None)
+        await self._emit(
+            channel,
+            "binding.changed",
+            data={"previousSid": previous.session_id if previous else None, "sid": None},
+            preview="Agent session detached",
+        )
+
+    async def _action_settings(self, channel: str, action: Envelope) -> None:
+        runtime = self.channels[channel]
+        allowed = {"model", "effort", "collaboration", "delivery", "approvalReviewer"}
+        unknown = set(action.data) - allowed
+        if unknown:
+            raise ProtocolError(f"unsupported settings: {', '.join(sorted(unknown))}")
+        if "delivery" in action.data and action.data["delivery"] not in {"queue", "steer"}:
+            raise ProtocolError("delivery must be queue or steer")
+        if "approvalReviewer" in action.data and action.data["approvalReviewer"] not in {
+            "manual",
+            "auto_review",
+        }:
+            raise ProtocolError("approvalReviewer must be manual or auto_review")
+        if "collaboration" in action.data and action.data["collaboration"] not in {
+            "default",
+            "plan",
+        }:
+            raise ProtocolError("collaboration must be default or plan")
+        for key in {"model", "effort"} & action.data.keys():
+            if not isinstance(action.data[key], str) or not action.data[key]:
+                raise ProtocolError(f"{key} must be a non-empty string")
+        binding = self._require_binding(runtime)
+        candidate = {**runtime.settings, **action.data}
+        await self.backends[runtime.backend].configure_session(binding.session_id, candidate)
+        runtime.settings = candidate
+        await self._emit(
+            channel,
+            "session.snapshot",
+            session_id=binding.session_id,
+            data={"settings": runtime.settings},
+        )
+
+    async def _action_prompt(self, channel: str, action: Envelope) -> None:
+        runtime = self.channels[channel]
+        binding = self._require_binding(runtime)
+        text = self._content(action)
+        if runtime.busy:
+            if runtime.settings.get("delivery") == "steer":
+                await self.backends[runtime.backend].steer(
+                    binding.session_id, runtime.active_turn, text
+                )
+                return
+            item = await self.state.enqueue(
+                action.item_id or str(uuid.uuid4()),
+                channel,
+                binding.session_id,
+                text,
+                self.config.bridge.queue_limit,
+            )
+            await self._emit_queue_item(channel, "queue.item.added", item)
+            return
+        runtime.active_turn = await self.backends[runtime.backend].send_message(
+            binding.session_id, text
+        )
+        runtime.busy = True
+
+    async def _action_steer(self, channel: str, action: Envelope) -> None:
+        runtime = self.channels[channel]
+        binding = self._require_binding(runtime)
+        if not runtime.busy:
+            raise ValueError("session has no active turn")
+        await self.backends[runtime.backend].steer(
+            binding.session_id, runtime.active_turn, self._content(action)
+        )
+
+    async def _action_cancel(self, channel: str, action: Envelope) -> None:
+        runtime = self.channels[channel]
+        binding = self._require_binding(runtime)
+        await self.backends[runtime.backend].cancel(binding.session_id, runtime.active_turn)
+
+    async def _action_queue_edit(self, channel: str, action: Envelope) -> None:
+        item_id = self._item_id(action)
+        await self._require_queue_item(channel, item_id)
+        item = await self.state.edit_queue(item_id, self._content(action))
+        if not item:
+            raise ValueError("unknown queue item")
+        await self._emit_queue_item(channel, "queue.item.updated", item, visible=True)
+
+    async def _action_queue_move(self, channel: str, action: Envelope) -> None:
+        position = action.data.get("position")
+        if not isinstance(position, int) or position < 0:
+            raise ProtocolError("position must be a non-negative integer")
+        item_id = self._item_id(action)
+        await self._require_queue_item(channel, item_id)
+        items = await self.state.move_queue(item_id, position)
+        for item in items:
+            await self._emit_queue_item(channel, "queue.item.moved", item)
+
+    async def _action_queue_delete(self, channel: str, action: Envelope) -> None:
+        item_id = self._item_id(action)
+        await self._require_queue_item(channel, item_id)
+        item = await self.state.delete_queue(item_id)
+        if not item:
+            raise ValueError("unknown queue item")
+        await self._emit_queue_item(channel, "queue.item.removed", item, visible=True)
+
+    async def _action_queue_clear(self, channel: str, action: Envelope) -> None:
+        runtime = self.channels[channel]
+        binding = self._require_binding(runtime)
+        count = await self.state.clear_queue(channel, binding.session_id)
+        await self._emit(
+            channel,
+            "queue.snapshot",
+            session_id=binding.session_id,
+            data={"items": [], "removed": count},
+        )
+
+    async def _action_request_respond(self, channel: str, action: Envelope) -> None:
+        request_id = action.request_id or self._data_string(action, "rid")
+        pending = self.channels[channel].requests.get(request_id)
+        if not pending:
+            raise ValueError("unknown or resolved request")
+        runtime = self.channels[channel]
+        if pending.session_id and (
+            runtime.binding is None or runtime.binding.session_id != pending.session_id
+        ):
+            raise ValueError("reattach the request's session before responding")
+        backend = self.backends[self.channels[channel].backend]
+        if pending.kind == "approval":
+            allow = action.data.get("allow")
+            if not isinstance(allow, bool):
+                raise ProtocolError("approval response requires boolean allow")
+            await backend.resolve_approval(pending.token, allow)
+        else:
+            answers = action.data.get("answers")
+            if not isinstance(answers, list) or not all(isinstance(item, list) for item in answers):
+                raise ProtocolError("question response requires an answers array")
+            await backend.resolve_question(pending.token, pending.questions, answers)
+        self.channels[channel].requests.pop(request_id, None)
+        await self._emit(channel, "request.resolved", request_id=request_id)
+
+    async def _action_request_skip(self, channel: str, action: Envelope) -> None:
+        request_id = action.request_id or self._data_string(action, "rid")
+        pending = self.channels[channel].requests.get(request_id)
+        if not pending:
+            raise ValueError("unknown or resolved request")
+        runtime = self.channels[channel]
+        if pending.session_id and (
+            runtime.binding is None or runtime.binding.session_id != pending.session_id
+        ):
+            raise ValueError("reattach the request's session before skipping")
+        backend = self.backends[self.channels[channel].backend]
+        if pending.kind == "approval":
+            await backend.resolve_approval(pending.token, False)
+        else:
+            await backend.resolve_question(pending.token, pending.questions, None)
+        self.channels[channel].requests.pop(request_id, None)
+        await self._emit(channel, "request.resolved", request_id=request_id)
 
     async def _backend_loop(self, backend: Backend) -> None:
         async for event in backend.events():
-            try:
-                await self._handle_backend_event(event)
-            except Exception:
-                channel = self._channel_for(event.backend, event.session_id)
-                if channel:
-                    await self._say(channel, "❌ Could not relay a backend event")
+            channel = self._channel_for(event.backend, event.session_id)
+            if channel:
+                with contextlib.suppress(Exception):
+                    await self._handle_backend_event(channel, event)
 
-    async def _handle_owner_message(self, message: IRCMessage) -> None:
-        text = message.text.strip()
-        if not text:
+    async def _handle_backend_event(self, channel: str, event: BackendEvent) -> None:
+        runtime = self.channels[channel]
+        if runtime.activation is None:
             return
-        if text.startswith("!"):
-            command, _, argument = text.partition(" ")
-            await self._command(message.channel, command[1:].lower(), argument.strip())
+        selected = runtime.binding is not None and runtime.binding.session_id == event.session_id
+        if not selected:
+            if event.kind in {"approval", "question"}:
+                await self._open_request(channel, event, inactive=True)
             return
-        runtime = self.channels[message.channel]
-        if runtime.binding is None:
-            raise ValueError("no session is attached — try !running or !new <workspace>")
-        if runtime.busy or runtime.held_lines:
-            if len(runtime.held_lines) >= self.config.bridge.queue_limit:
-                raise ValueError(f"held draft is full ({self.config.bridge.queue_limit} messages)")
-            runtime.held_lines.append(text)
-            await self._say(
-                message.channel,
-                f"🟡 Draft held · {len(runtime.held_lines)} message(s)\n"
-                "Use !next to queue it, !steer to redirect the turn, or !discard.",
+        if event.kind == "turn_started":
+            runtime.busy = True
+            runtime.active_turn = event.turn_id
+            await self._emit(
+                channel, "turn.started", session_id=event.session_id, turn_id=event.turn_id
             )
-            return
-        await self._send_turn(message.channel, text)
-
-    async def _command(self, channel: str, command: str, argument: str) -> None:
-        runtime = self.channels[channel]
-        command = command.removeprefix("!")
-        spec = COMMAND_BY_NAME.get(command)
-        if spec is None:
-            matches = difflib.get_close_matches(command, COMMAND_BY_NAME, n=1, cutoff=0.55)
-            hint = f" Did you mean !{matches[0]}?" if matches else " Try !help."
-            raise ValueError(f"unknown command !{command}.{hint}")
-        command = spec.name
-        if command == "help":
-            await self._help(channel, argument)
-        elif command == "new":
-            await self._new_session(channel, argument)
-        elif command == "sessions":
-            await self._list_sessions(channel, argument)
-        elif command == "running":
-            await self._running_sessions(channel)
-        elif command == "use":
-            await self._use_session(channel, argument)
-        elif command == "detach":
-            self._require_safe_session_change(runtime)
-            runtime.binding = None
-            runtime.queue.clear()
-            runtime.approvals.clear()
-            runtime.questions.clear()
-            await self.state.set(channel, None)
-            await self._say(channel, "⚪ Session detached")
-        elif command == "status":
-            await self._status(channel)
-        elif command == "last":
-            await self._last(channel)
-        elif command == "watch":
-            await self._watch(channel, argument)
-        elif command == "next":
-            await self._next(channel)
-        elif command == "steer":
-            binding = self._require_binding(runtime)
-            if not runtime.busy:
-                raise ValueError("there is no active turn — use !next to send the held draft")
-            if argument and runtime.held_lines:
-                raise ValueError("a draft is already held — use !steer without text or !discard")
-            text = argument or self._held_text(runtime)
-            await self.backends[runtime.backend].steer(
-                binding.session_id, runtime.active_turn, text
-            )
-            if not argument:
-                runtime.held_lines.clear()
-            await self._say(channel, "🧭 Steering update delivered")
-        elif command == "discard":
-            if not runtime.held_lines:
-                raise ValueError("there is no held draft")
-            count = len(runtime.held_lines)
-            runtime.held_lines.clear()
-            await self._say(channel, f"🗑️ Discarded held draft · {count} message(s)")
-        elif command == "cancel":
-            binding = self._require_binding(runtime)
-            if not runtime.busy:
-                raise ValueError("there is no active turn to cancel")
-            await self.backends[runtime.backend].cancel(binding.session_id, runtime.active_turn)
-            await self._say(channel, "⏹️ Cancellation requested")
-        elif command in {"yes", "no"}:
-            await self._approval(channel, argument, command == "yes")
-        elif command == "answer":
-            await self._answer(channel, argument)
-        elif command == "skip":
-            await self._reject(channel, argument)
-        elif command == "queue":
-            if not runtime.queue:
-                await self._say(channel, "📬 Queue is empty")
-            else:
-                entries = "\n".join(
-                    f"{index}. {safe_one_line(item, 100)}"
-                    for index, item in enumerate(runtime.queue, 1)
-                )
-                await self._say(channel, f"📬 Queue · {len(runtime.queue)} turn(s)\n{entries}")
-        elif command == "drop":
-            await self._drop(channel, argument)
-        elif command in {"paste", "paste-force"}:
-            await self._paste(channel, force=command == "paste-force")
-
-    async def _new_session(self, channel: str, raw_path: str) -> None:
-        runtime = self.channels[channel]
-        if not raw_path:
-            raise ValueError("usage: !new <workspace>")
-        self._require_safe_session_change(runtime)
-        workspace = resolve_workspace(raw_path, self.config.bridge.allowed_roots)
-        summary = await self.backends[runtime.backend].create_session(str(workspace))
-        await self._bind(channel, summary)
-        await self._say(
-            channel,
-            f"✅ Created {runtime.backend.title()} session\n"
-            f"📂 {self._display_path(workspace)} · {self._short(summary.id)}",
-        )
-
-    async def _list_sessions(self, channel: str, raw_path: str) -> None:
-        runtime = self.channels[channel]
-        if raw_path:
-            workspace = resolve_workspace(raw_path, self.config.bridge.allowed_roots)
-        elif runtime.binding:
-            workspace = resolve_workspace(runtime.binding.cwd, self.config.bridge.allowed_roots)
-        else:
-            raise ValueError("provide a workspace: !sessions <workspace>")
-        runtime.session_choices = await self.backends[runtime.backend].list_sessions(str(workspace))
-        if not runtime.session_choices:
-            await self._say(
+        elif event.kind in {"turn_done", "turn_failed"}:
+            runtime.busy = False
+            runtime.active_turn = None
+            kind = "turn.completed" if event.kind == "turn_done" else "turn.failed"
+            await self._emit(
                 channel,
-                f"⚪ No {runtime.backend.title()} sessions in {self._display_path(workspace)}",
+                kind,
+                session_id=event.session_id,
+                turn_id=event.turn_id,
+                data={"message": event.text} if event.text else {},
+                preview=f"Agent turn failed: {event.text}" if event.kind == "turn_failed" else None,
             )
-            return
-        await self._say(
-            channel,
-            self._format_session_list("Recent sessions", runtime.session_choices),
-        )
-
-    async def _running_sessions(self, channel: str) -> None:
-        runtime = self.channels[channel]
-        discovered = await self.backends[runtime.backend].list_running_sessions()
-        allowed: dict[str, SessionSummary] = {}
-        for summary in discovered:
-            try:
-                workspace = resolve_workspace(summary.cwd, self.config.bridge.allowed_roots)
-            except ConfigError:
-                continue
-            allowed[summary.id] = SessionSummary(
-                id=summary.id,
-                cwd=str(workspace),
-                title=summary.title,
-                updated_at=summary.updated_at,
-                busy=summary.busy,
-                active_flags=summary.active_flags,
-                active_turn_id=summary.active_turn_id,
-                last_output=summary.last_output,
-                last_reply=summary.last_reply,
+            await self._drain_queue(channel)
+        elif event.kind == "status_changed":
+            runtime.busy = bool(event.data.get("busy"))
+            await self._emit(
+                channel,
+                "session.status",
+                session_id=event.session_id,
+                data={
+                    "busy": runtime.busy,
+                    "flags": list(event.data.get("active_flags") or ()),
+                },
             )
-        runtime.session_choices = sorted(
-            allowed.values(), key=lambda item: item.updated_at, reverse=True
-        )[:20]
-        if not runtime.session_choices:
-            await self._say(channel, f"⚪ No running {runtime.backend.title()} sessions")
-            return
-        await self._say(
-            channel,
-            self._format_session_list("Running sessions", runtime.session_choices),
-        )
+        elif event.kind == "progress":
+            await self._emit(
+                channel,
+                "plan.updated",
+                session_id=event.session_id,
+                turn_id=event.turn_id,
+                data={"summary": self._safe_content(event.text, 32 * 1024)},
+            )
+        elif event.kind == "assistant":
+            findings = scan_secrets(event.text)
+            if findings:
+                data = {"omitted": True, "reason": "high-confidence secret detected"}
+                preview = "Agent reply omitted from IRC because it may contain a secret"
+            else:
+                content = self._safe_content(event.text, MAX_CONTENT_BYTES)
+                data = {"content": content}
+                preview = self._preview(content)
+            await self._emit(
+                channel,
+                "assistant.completed",
+                session_id=event.session_id,
+                turn_id=event.turn_id,
+                item_id=event.item_id,
+                data=data,
+                preview=preview,
+            )
+        elif event.kind in {"tool_started", "tool_finished"}:
+            await self._emit(
+                channel,
+                "tool.started" if event.kind == "tool_started" else "tool.completed",
+                session_id=event.session_id,
+                turn_id=event.turn_id,
+                item_id=event.item_id,
+                data={"kind": event.tool_kind, "success": event.success},
+            )
+        elif event.kind in {"approval", "question"}:
+            await self._open_request(channel, event)
+        elif event.kind == "request_resolved":
+            match = next(
+                (
+                    request_id
+                    for request_id, pending in runtime.requests.items()
+                    if pending.token == event.request_token
+                ),
+                None,
+            )
+            if match:
+                runtime.requests.pop(match, None)
+                await self._emit(channel, "request.resolved", request_id=match)
 
-    async def _use_session(self, channel: str, argument: str) -> None:
+    async def _open_request(
+        self, channel: str, event: BackendEvent, inactive: bool = False
+    ) -> None:
         runtime = self.channels[channel]
-        self._require_safe_session_change(runtime)
-        if not argument:
-            if len(runtime.session_choices) != 1:
-                raise ValueError("usage: !use <number from !sessions or !running>")
-            index = 1
+        request_id = str(uuid.uuid4())
+        secret_question = event.kind == "question" and any(q.secret for q in event.questions)
+        pending = PendingRequest(
+            token=event.request_token or request_id,
+            kind=event.kind,
+            session_id=event.session_id,
+            questions=event.questions,
+            redacted=secret_question,
+        )
+        runtime.requests[request_id] = pending
+        if secret_question:
+            data = {"type": "question", "redacted": True, "canSkip": True}
+            preview = "Sensitive agent question requires the attached TUI; it may be skipped here"
+        elif event.kind == "approval":
+            data = {
+                "type": "approval",
+                "summary": event.text or "approval required",
+                "redacted": not bool(event.text),
+                "choices": ["allow_once", "deny"],
+            }
+            preview = f"Agent approval required: {event.text or 'details redacted'}"
         else:
-            try:
-                index = int(argument)
-            except ValueError as exc:
-                raise ValueError("!use takes the number shown by !sessions or !running") from exc
-        if index < 1:
-            raise ValueError("session number must be positive")
-        try:
-            choice = runtime.session_choices[index - 1]
-        except IndexError as exc:
-            raise ValueError("that number is not in the latest !sessions or !running list") from exc
-        workspace = resolve_workspace(choice.cwd, self.config.bridge.allowed_roots)
-        summary = await self.backends[runtime.backend].attach_session(choice.id, str(workspace))
-        await self._bind(channel, summary)
-        await self._say(
+            data = {
+                "type": "question",
+                "questions": [
+                    {
+                        "id": question.id,
+                        "header": question.header,
+                        "prompt": question.prompt,
+                        "options": list(question.options),
+                        "multiple": question.multiple,
+                        "custom": question.custom,
+                    }
+                    for question in event.questions
+                ],
+                "canSkip": True,
+            }
+            preview = "Agent input required"
+        data["inactive"] = inactive
+        if inactive:
+            data["sid"] = event.session_id
+            preview = "Agent request waiting in an inactive session; reattach to respond"
+        await self._emit(
             channel,
-            f"✅ Attached {runtime.backend.title()} session\n"
-            f"📂 {self._display_path(workspace)} · {self._short(summary.id)}",
+            "request.opened",
+            session_id=event.session_id,
+            turn_id=event.turn_id,
+            item_id=event.item_id,
+            request_id=request_id,
+            data=data,
+            preview=preview,
         )
 
-    async def _bind(self, channel: str, summary: SessionSummary) -> None:
+    async def _drain_queue(self, channel: str) -> None:
         runtime = self.channels[channel]
-        for other_channel, other in self.channels.items():
-            if (
-                other_channel != channel
-                and other.binding
-                and other.binding.backend == runtime.backend
-                and other.binding.session_id == summary.id
-            ):
-                raise ValueError(f"that session is already attached to {other_channel}")
-        binding = ChannelBinding(backend=runtime.backend, session_id=summary.id, cwd=summary.cwd)
+        if runtime.activation is None or runtime.binding is None or runtime.busy:
+            return
+        items = await self.state.list_queue(channel, runtime.binding.session_id)
+        if not items:
+            return
+        item = items[0]
+        await self.state.delete_queue(item.id)
+        await self._emit_queue_item(channel, "queue.item.removed", item)
+        runtime.active_turn = await self.backends[runtime.backend].send_message(
+            runtime.binding.session_id, item.text
+        )
+        runtime.busy = True
+
+    async def _set_binding(self, channel: str, summary: SessionSummary) -> None:
+        runtime = self.channels[channel]
+        previous = runtime.binding
+        binding = ChannelBinding(runtime.backend, summary.id, summary.cwd)
+        if previous:
+            runtime.observed_sessions.add(previous.session_id)
+        runtime.observed_sessions.add(summary.id)
         runtime.binding = binding
         runtime.busy = summary.busy
         runtime.active_turn = summary.active_turn_id
-        runtime.active_flags = summary.active_flags
-        runtime.held_lines.clear()
-        runtime.queue.clear()
-        runtime.approvals.clear()
-        runtime.questions.clear()
-        runtime.last_activity = (
-            safe_one_line(summary.last_output, 180)
-            if summary.last_output
-            else ("working" if summary.busy else None)
-        )
-        runtime.last_output = summary.last_output
-        runtime.last_reply = summary.last_reply
         await self.state.set(channel, binding)
-
-    async def _status(self, channel: str) -> None:
-        runtime = self.channels[channel]
-        if runtime.binding is None:
-            await self._say(
-                channel,
-                f"🤖 {runtime.backend.title()} · ⚪ Detached · 👁 {runtime.watch_mode}\n"
-                "Try !running or !new <workspace>.",
-            )
-            return
-        observed_busy = await self.backends[runtime.backend].session_busy(
-            runtime.binding.session_id
-        )
-        if observed_busy is not None:
-            runtime.busy = observed_busy
-            if observed_busy and runtime.last_activity is None:
-                runtime.last_activity = "working"
-        state = "🟢 Working" if runtime.busy else "⚪ Idle"
-        waiting = "none"
-        if runtime.active_flags:
-            labels = {
-                "waitingOnApproval": "waiting on approval",
-                "waitingOnUserInput": "waiting on user input",
-                "retry": "retrying",
-            }
-            waiting = ", ".join(labels.get(flag, flag) for flag in runtime.active_flags)
-            state = f"🟡 {waiting.title()}"
-        request_ids = [*runtime.approvals, *runtime.questions]
-        held = f"{len(runtime.held_lines)} message(s)" if runtime.held_lines else "none"
-        requests = ", ".join(request_ids) if request_ids else "none"
-        await self._say(
+        await self._emit(
             channel,
-            f"🤖 {runtime.backend.title()} · {state} · 👁 {runtime.watch_mode}\n"
-            f"📂 {self._display_path(Path(runtime.binding.cwd))} · "
-            f"{self._short(runtime.binding.session_id)}\n"
-            f"💬 {runtime.last_activity or 'No activity observed'}\n"
-            f"📝 Held: {held} · 📬 IRC queue: {len(runtime.queue)} · ❓ Requests: {requests}",
+            "binding.changed",
+            session_id=summary.id,
+            data={
+                "previousSid": previous.session_id if previous else None,
+                "session": self._session_data(summary),
+            },
+            preview=f"Agent session switched to {summary.title or summary.id}",
+        )
+        await self._emit_snapshot(channel)
+
+    async def _emit_snapshot(self, channel: str, reply: str | None = None) -> None:
+        runtime = self.channels[channel]
+        binding = runtime.binding
+        queue = await self.state.list_queue(channel, binding.session_id) if binding else []
+        await self._emit(
+            channel,
+            "channel.snapshot",
+            reply=reply,
+            session_id=binding.session_id if binding else None,
+            data={
+                "active": runtime.activation is not None,
+                "backend": runtime.backend,
+                "binding": ({"sid": binding.session_id, "cwd": binding.cwd} if binding else None),
+                "busy": runtime.busy,
+                "tid": runtime.active_turn,
+                "settings": runtime.settings,
+                "requests": list(runtime.requests),
+                "queue": [self._queue_data(item) for item in queue],
+            },
         )
 
-    async def _watch(self, channel: str, argument: str) -> None:
-        runtime = self.channels[channel]
-        if not argument:
-            await self._say(channel, f"👁 Watch mode: {runtime.watch_mode}")
-            return
-        mode = argument.lower()
-        if mode not in {"quiet", "concise", "verbose"}:
-            raise ValueError("usage: !watch quiet|concise|verbose")
-        runtime.watch_mode = mode
-        await self._say(channel, f"👁 Watch mode set to {mode}")
-
-    async def _help(self, channel: str, topic: str) -> None:
-        runtime = self.channels[channel]
-        topic = topic.lower() or "context"
-        if topic == "context":
-            if runtime.binding is None:
-                lines = ["!running (!r) — active sessions", "!new WORKSPACE — create session"]
-            elif runtime.held_lines:
-                lines = [
-                    "!next — queue draft",
-                    "!steer — redirect turn",
-                    "!discard — discard draft",
-                ]
-            elif runtime.approvals:
-                lines = ["!yes [A1] — approve once", "!no [A1] — deny"]
-            elif runtime.questions:
-                lines = ["!answer [Q1] TEXT — answer", "!skip [Q1] — reject"]
-            else:
-                lines = [
-                    "!status (!s) — dashboard",
-                    "!last (!l) — latest output",
-                    "!running (!r) — active sessions",
-                    "!help all — every command",
-                ]
-            await self._say(channel, "🧭 Commands\n" + "\n".join(lines))
-            return
-        categories = {spec.category for spec in COMMANDS}
-        if topic != "all" and topic not in categories:
-            choices = ", ".join(sorted(categories))
-            raise ValueError(f"unknown help topic {topic!r}; choose {choices}, or all")
-        specs = COMMANDS if topic == "all" else tuple(
-            spec for spec in COMMANDS if spec.category == topic
+    async def _emit_queue_item(
+        self, channel: str, kind: str, item: QueuedPrompt, visible: bool = False
+    ) -> None:
+        await self._emit(
+            channel,
+            kind,
+            session_id=item.session_id,
+            item_id=item.id,
+            data=self._queue_data(item),
+            preview=(
+                f"Queued prompt {'updated' if kind == 'queue.item.updated' else 'deleted'}"
+                if visible
+                else None
+            ),
         )
-        lines = [f"{spec.usage} — {spec.summary}" for spec in specs]
-        await self._say(channel, f"🧭 {topic.title()} commands\n" + "\n".join(lines))
 
-    async def _approval(self, channel: str, alias: str, allow: bool) -> None:
-        runtime = self.channels[channel]
-        request = self._select_request(runtime.approvals, alias, "approval")
-        await self.backends[request.backend].resolve_approval(request.token, allow)
-        runtime.approvals.pop(request.alias, None)
-        icon = "✅" if allow else "❌"
-        await self._say(channel, f"{icon} {request.alias} {'approved once' if allow else 'denied'}")
-
-    async def _answer(self, channel: str, argument: str) -> None:
-        runtime = self.channels[channel]
-        first, separator, remainder = argument.partition(" ")
-        if first.upper() in runtime.questions:
-            if not separator or not remainder.strip():
-                raise ValueError("usage: !answer [Q1] <answer> [ | <answer>]")
-            alias = first
-            raw_answers = remainder
-        elif len(runtime.questions) == 1:
-            alias = ""
-            raw_answers = argument
-        else:
-            raise ValueError("usage: !answer Q1 <answer> [ | <answer>]")
-        request = self._select_request(runtime.questions, alias, "question")
-        if any(question.secret for question in request.questions):
-            raise ValueError("sensitive questions must be answered in the attached TUI")
-        segments = [segment.strip() for segment in raw_answers.split("|")]
-        if len(segments) != len(request.questions) or any(not item for item in segments):
-            raise ValueError(
-                f"provide {len(request.questions)} answer segment(s), separated with |"
-            )
-        answers = [
-            self._parse_question_answer(question, segment)
-            for question, segment in zip(request.questions, segments, strict=True)
-        ]
-        await self.backends[request.backend].resolve_question(
-            request.token, request.questions, answers
+    async def _emit_failure(self, channel: str, reply: str | None, message: str) -> None:
+        runtime = self.channels.get(channel)
+        if runtime is None or runtime.activation is None:
+            return
+        detail = safe_one_line(message, 1000)
+        await self._emit(
+            channel,
+            "action.failed",
+            reply=reply,
+            data={"message": detail},
+            preview=f"Agentwire action failed: {detail}",
         )
-        runtime.questions.pop(request.alias, None)
-        await self._say(channel, f"✅ {request.alias} answered")
 
-    async def _reject(self, channel: str, alias: str) -> None:
-        runtime = self.channels[channel]
-        request = self._select_request(runtime.questions, alias, "question")
-        await self.backends[request.backend].resolve_question(
-            request.token, request.questions, None
+    async def _emit(
+        self,
+        channel: str,
+        kind: str,
+        *,
+        session_id: str | None = None,
+        turn_id: str | None = None,
+        item_id: str | None = None,
+        request_id: str | None = None,
+        reply: str | None = None,
+        data: dict[str, Any] | None = None,
+        preview: str | None = None,
+        journal: bool = True,
+    ) -> Envelope:
+        envelope = new_envelope(
+            kind,
+            "event",
+            self.instance,
+            epoch=self.epoch,
+            session_id=session_id,
+            turn_id=turn_id,
+            item_id=item_id,
+            request_id=request_id,
+            reply=reply,
+            data=data or {},
         )
-        runtime.questions.pop(request.alias, None)
-        await self._say(channel, f"⏭️ {request.alias} skipped")
-
-    @staticmethod
-    def _parse_question_answer(question: Question, raw: str) -> list[str]:
-        values = [item.strip() for item in raw.split(",")] if question.multiple else [raw.strip()]
-        resolved: list[str] = []
-        for value in values:
-            if value.isdigit() and 1 <= int(value) <= len(question.options):
-                resolved.append(question.options[int(value) - 1])
-            elif value in question.options or question.custom:
-                resolved.append(value)
-            else:
-                raise ValueError(f"{value!r} is not an available answer")
-        return resolved
-
-    @staticmethod
-    def _select_request(
-        requests: dict[str, PendingRequest], alias: str, kind: str
-    ) -> PendingRequest:
-        key = alias.upper()
-        if not key:
-            if len(requests) != 1:
-                raise ValueError(f"specify a {kind} id")
-            return next(iter(requests.values()))
-        try:
-            return requests[key]
-        except KeyError as exc:
-            raise ValueError(f"unknown or already resolved {kind} id {key}") from exc
-
-    async def _drop(self, channel: str, argument: str) -> None:
-        runtime = self.channels[channel]
-        if not runtime.queue:
-            raise ValueError("queue is empty")
-        if argument.lower() == "all":
-            count = len(runtime.queue)
-            runtime.queue.clear()
-            await self._say(channel, f"🗑️ Dropped all {count} queued turns")
-            return
-        try:
-            index = int(argument)
-        except ValueError as exc:
-            raise ValueError("usage: !drop <queue-number>|all") from exc
-        if index < 1 or index > len(runtime.queue):
-            raise ValueError("queue number is out of range")
-        items = list(runtime.queue)
-        removed = items.pop(index - 1)
-        runtime.queue = deque(items)
-        await self._say(channel, f"🗑️ Dropped #{index}: {safe_one_line(removed, 100)}")
-
-    async def _next(self, channel: str) -> None:
-        runtime = self.channels[channel]
-        self._require_binding(runtime)
-        text = self._held_text(runtime)
-        if runtime.busy:
-            if len(runtime.queue) >= self.config.bridge.queue_limit:
-                raise ValueError(f"queue is full ({self.config.bridge.queue_limit})")
-            runtime.queue.append(text)
-            runtime.held_lines.clear()
-            await self._say(channel, f"📬 Draft queued as #{len(runtime.queue)}")
-            return
-        await self._send_turn(channel, text)
-        runtime.held_lines.clear()
-
-    async def _paste(self, channel: str, force: bool) -> None:
-        runtime = self.channels[channel]
-        binding = self._require_binding(runtime)
-        text = runtime.last_reply or await self.backends[runtime.backend].get_last_reply(
-            binding.session_id
-        )
-        if not text:
-            raise ValueError("there is no assistant reply to paste")
-        url = await self.paste.upload(text, force=force)
-        await self._say(channel, f"🔗 {self.config.paste.expiry} public paste: {url}")
-
-    async def _last(self, channel: str) -> None:
-        runtime = self.channels[channel]
-        binding = self._require_binding(runtime)
-        text = runtime.last_output or await self.backends[runtime.backend].get_last_reply(
-            binding.session_id
-        )
-        if not text:
-            raise ValueError("there is no assistant output in this session")
-        await self._say(channel, self._formatted_preview("💬", text))
-
-    async def _send_turn(self, channel: str, text: str) -> None:
-        runtime = self.channels[channel]
-        binding = self._require_binding(runtime)
-        runtime.busy = True
-        runtime.tool_milestones = 0
-        runtime.tool_events_suppressed = False
-        try:
-            runtime.active_turn = await self.backends[runtime.backend].send_message(
-                binding.session_id, text
-            )
-        except Exception:
-            runtime.busy = False
-            runtime.active_turn = None
-            raise
-        await self._say(channel, "▶️ Turn started")
-
-    async def _handle_backend_event(self, event: BackendEvent) -> None:
-        if event.kind == "disconnected":
-            for channel, runtime in self.channels.items():
-                if runtime.backend == event.backend:
-                    await self._say(channel, f"❌ {event.text or f'{event.backend} disconnected'}")
-            return
-        channel = self._channel_for(event.backend, event.session_id)
-        if channel is None:
-            return
-        runtime = self.channels[channel]
-        if event.kind == "status_changed":
-            runtime.busy = bool(event.data.get("busy"))
-            runtime.active_flags = tuple(str(flag) for flag in event.data.get("active_flags", ()))
-            if runtime.active_flags:
-                runtime.last_activity = {
-                    "waitingOnApproval": "waiting on approval",
-                    "waitingOnUserInput": "waiting on user input",
-                }.get(runtime.active_flags[0], runtime.active_flags[0])
-            elif runtime.busy and runtime.last_activity is None:
-                runtime.last_activity = "working"
-            return
-        if event.kind == "turn_started":
-            already_announced = runtime.active_turn == event.turn_id and runtime.busy
-            runtime.busy = True
-            runtime.active_turn = event.turn_id or runtime.active_turn
-            runtime.active_flags = ()
-            runtime.last_activity = "working"
-            runtime.tool_milestones = 0
-            runtime.tool_events_suppressed = False
-            if not already_announced and self._allows(runtime, "concise"):
-                await self._say(channel, "▶️ Turn started")
-            return
-        if event.kind == "progress":
-            runtime.last_activity = safe_one_line(event.text, 180)
-            runtime.last_output = event.text
-            if self._allows(runtime, "concise"):
-                icon = "🧭" if event.text.startswith("plan:") else "💬"
-                await self._say(channel, self._formatted_preview(icon, event.text))
-            return
-        if event.kind == "assistant":
-            runtime.last_activity = safe_one_line(event.text, 180)
-            runtime.last_output = event.text
-            runtime.last_reply = event.text
-            await self._say(channel, self._formatted_preview("💬", event.text))
-            return
-        if event.kind in {"tool_started", "tool_finished"}:
-            if event.kind == "tool_started":
-                status = "started"
-            elif event.success is True:
-                status = "finished successfully"
-            elif event.success is False:
-                status = "failed"
-            else:
-                status = "finished"
-            runtime.last_activity = f"tool: {event.tool_kind} {status}"
-            if self._allows(runtime, "verbose") and (
-                runtime.tool_milestones < self.config.bridge.tool_milestone_limit
-            ):
-                runtime.tool_milestones += 1
-                await self._say(channel, f"🔧 {event.tool_kind}: {status}")
-            elif self._allows(runtime, "verbose") and not runtime.tool_events_suppressed:
-                runtime.tool_events_suppressed = True
-                await self._say(channel, "🔧 Additional tool milestones suppressed")
-            return
-        if event.kind == "approval" and event.request_token is not None:
-            runtime.approval_counter += 1
-            alias = f"A{runtime.approval_counter}"
-            runtime.approvals[alias] = PendingRequest(
-                alias=alias, backend=event.backend, token=event.request_token
-            )
-            runtime.last_activity = "waiting on approval"
-            await self._say(
-                channel,
-                f"🔐 {alias}: {event.text or 'approval needed'}\n"
-                f"Use !yes {alias} or !no {alias}.",
-            )
-            return
-        if event.kind == "question" and event.request_token is not None:
-            if any(question.secret for question in event.questions):
-                await self._say(
-                    channel,
-                    "🔐 Sensitive input requested — answer it in the attached TUI, not IRC.",
-                )
-                return
-            runtime.question_counter += 1
-            alias = f"Q{runtime.question_counter}"
-            runtime.questions[alias] = PendingRequest(
-                alias=alias,
-                backend=event.backend,
-                token=event.request_token,
-                questions=event.questions,
-            )
-            runtime.last_activity = "waiting on user input"
-            details: list[str] = []
-            for index, question in enumerate(event.questions, 1):
-                options = ""
-                if question.options:
-                    options = (
-                        " ["
-                        + ", ".join(
-                            f"{number}={label}" for number, label in enumerate(question.options, 1)
-                        )
-                        + "]"
-                    )
-                multiple = " (comma-select)" if question.multiple else ""
-                details.append(f"{index}. {safe_one_line(question.prompt, 220)}{options}{multiple}")
-            await self._say(
-                channel,
-                f"❓ {alias}: "
-                + " | ".join(details)
-                + f"\nUse !answer {alias} ... or !skip {alias}.",
-            )
-            return
-        if event.kind == "request_resolved" and event.request_token is not None:
-            removed = self._remove_token(runtime, event.request_token)
-            if removed:
-                await self._say(channel, f"✅ {removed} was resolved in another client")
-            return
-        if event.kind in {"turn_done", "turn_failed"}:
-            runtime.busy = False
-            runtime.active_turn = None
-            runtime.active_flags = ()
-            runtime.approvals.clear()
-            runtime.questions.clear()
-            if event.kind == "turn_failed":
-                runtime.last_activity = f"failed: {event.text or 'backend error'}"
-                await self._say(channel, f"❌ Turn failed: {event.text or 'backend error'}")
-            elif self._allows(runtime, "concise"):
-                await self._say(channel, "✅ Turn complete")
-            if runtime.queue:
-                next_message = runtime.queue.popleft()
-                await self._say(channel, f"📬 Starting queued turn · {len(runtime.queue)} remain")
-                await self._send_turn(channel, next_message)
-            elif runtime.held_lines:
-                await self._say(
-                    channel,
-                    "🟡 Turn finished; a draft is still held. Use !next or !discard.",
-                )
-
-    @staticmethod
-    def _remove_token(runtime: ChannelRuntime, token: str | int) -> str | None:
-        for requests in (runtime.approvals, runtime.questions):
-            for alias, request in list(requests.items()):
-                if str(request.token) == str(token):
-                    del requests[alias]
-                    return alias
-        return None
+        if journal:
+            await self.state.append_event(channel, envelope)
+        await self.irc.send_protocol(channel, envelope, preview)
+        return envelope
 
     def _channel_for(self, backend: str, session_id: str | None) -> str | None:
         if not session_id:
             return None
-        for channel, runtime in self.channels.items():
-            if (
-                runtime.binding
-                and runtime.binding.backend == backend
-                and runtime.binding.session_id == session_id
-            ):
-                return channel
-        return None
-
-    @staticmethod
-    def _allows(runtime: ChannelRuntime, level: str) -> bool:
-        ranks = {"quiet": 0, "concise": 1, "verbose": 2}
-        return ranks[runtime.watch_mode] >= ranks[level]
-
-    @staticmethod
-    def _held_text(runtime: ChannelRuntime) -> str:
-        if not runtime.held_lines:
-            raise ValueError("there is no held draft")
-        return "\n".join(runtime.held_lines)
-
-    @staticmethod
-    def _require_safe_session_change(runtime: ChannelRuntime) -> None:
-        if runtime.busy:
-            raise ValueError("cancel the active turn before changing sessions")
-        if runtime.held_lines:
-            raise ValueError("resolve the held draft with !next or !discard first")
-        if runtime.queue:
-            raise ValueError("clear the queue with !drop all before changing sessions")
-
-    def _format_session_list(self, title: str, sessions: list[SessionSummary]) -> str:
-        lines = [f"🟢 {title}"]
-        for index, item in enumerate(sessions, 1):
-            state = "🟢" if item.busy else "⚪"
-            lines.append(f"{index}. {state} {item.title}")
-            lines.append(
-                f"   📂 {self._display_path(Path(item.cwd))} · {self._short(item.id)}"
-            )
-        lines.append("Use !use <number>.")
-        return "\n".join(lines)
-
-    def _formatted_preview(self, icon: str, text: str) -> str:
-        prefix = f"{icon} "
-        budget = max(1, self.config.bridge.summary_max_bytes - len(prefix.encode("utf-8")))
-        body, _truncated = preview(
-            text,
-            self.config.bridge.summary_max_lines,
-            budget,
+        return next(
+            (
+                channel
+                for channel, runtime in self.channels.items()
+                if runtime.backend == backend
+                and (
+                    (runtime.binding is not None and runtime.binding.session_id == session_id)
+                    or session_id in runtime.observed_sessions
+                )
+            ),
+            None,
         )
-        return prefix + body
 
-    @staticmethod
-    def _display_path(path: Path) -> str:
-        home = Path.home()
+    def _workspace_allowed(self, cwd: str) -> bool:
         try:
-            return f"~/{path.relative_to(home)}"
-        except ValueError:
-            return str(path)
-
-    async def _say(self, channel: str, text: str) -> None:
-        await self.irc.send_privmsg(channel, text)
+            resolve_workspace(cwd, self.config.bridge.allowed_roots)
+        except ConfigError:
+            return False
+        return True
 
     @staticmethod
     def _require_binding(runtime: ChannelRuntime) -> ChannelBinding:
         if runtime.binding is None:
-            raise ValueError("no session is attached — try !running or !new <workspace>")
+            raise ValueError("no agent session is attached")
         return runtime.binding
 
     @staticmethod
-    def _short(session_id: str) -> str:
-        return session_id if len(session_id) <= 16 else f"{session_id[:12]}…"
+    def _data_string(action: Envelope, key: str) -> str:
+        value = action.data.get(key)
+        if not isinstance(value, str) or not value:
+            raise ProtocolError(f"data.{key} must be a non-empty string")
+        return value
+
+    @staticmethod
+    def _item_id(action: Envelope) -> str:
+        if not action.item_id:
+            raise ProtocolError("action requires iid")
+        return action.item_id
+
+    @staticmethod
+    def _safe_content(text: str, limit: int) -> str:
+        cleaned = clean_text(text)
+        if len(cleaned.encode("utf-8")) > limit:
+            raise ProtocolError(f"content exceeds {limit} bytes")
+        return cleaned
+
+    def _content(self, action: Envelope) -> str:
+        return self._safe_content(self._data_string(action, "content"), MAX_CONTENT_BYTES)
+
+    async def _require_queue_item(self, channel: str, item_id: str) -> QueuedPrompt:
+        runtime = self.channels[channel]
+        binding = self._require_binding(runtime)
+        item = next(
+            (
+                queued
+                for queued in await self.state.list_queue(channel, binding.session_id)
+                if queued.id == item_id
+            ),
+            None,
+        )
+        if item is None:
+            raise ValueError("unknown queue item for the attached session")
+        return item
+
+    @staticmethod
+    def _preview(text: str) -> str:
+        return truncate_utf8(text, MAX_PREVIEW_BYTES)
+
+    @staticmethod
+    def _session_data(session: SessionSummary) -> dict[str, Any]:
+        return {
+            "sid": session.id,
+            "cwd": session.cwd,
+            "title": session.title,
+            "updatedAt": session.updated_at,
+            "busy": session.busy,
+            "flags": list(session.active_flags),
+        }
+
+    @staticmethod
+    def _queue_data(item: QueuedPrompt) -> dict[str, Any]:
+        return {
+            "iid": item.id,
+            "sid": item.session_id,
+            "position": item.position,
+            "content": item.text,
+            "createdAt": item.created_at,
+        }

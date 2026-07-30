@@ -7,7 +7,7 @@ import os
 import re
 import time
 from collections import Counter
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,7 @@ class CodexBackend(Backend):
         self._turn_messages: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self._last_replies: dict[str, str] = {}
         self._last_plan_updates: dict[tuple[str, str], str] = {}
+        self._session_settings: dict[str, dict[str, Any]] = {}
 
     async def start(self) -> None:
         if self._reader_task is not None:
@@ -264,9 +265,11 @@ class CodexBackend(Backend):
         if method == "thread/status/changed" and thread_id:
             status = params.get("status") or {}
             status_type = str(status.get("type") if isinstance(status, dict) else status)
-            active_flags = tuple(
-                str(flag) for flag in status.get("activeFlags") or ()
-            ) if isinstance(status, dict) else ()
+            active_flags = (
+                tuple(str(flag) for flag in status.get("activeFlags") or ())
+                if isinstance(status, dict)
+                else ()
+            )
             await self._events.put(
                 BackendEvent(
                     kind="status_changed",
@@ -525,9 +528,7 @@ class CodexBackend(Backend):
         selected.update(explicit_ids)
         for cwd, count in workspace_counts.items():
             matches = (
-                session
-                for session in sessions
-                if session.cwd == cwd and session.id not in selected
+                session for session in sessions if session.cwd == cwd and session.id not in selected
             )
             for session in list(matches)[:count]:
                 selected.add(session.id)
@@ -649,14 +650,17 @@ class CodexBackend(Backend):
             for item in latest_turn.get("items") or []
             if isinstance(item, dict) and item.get("type") == "agentMessage"
         ]
-        last_output = next(
-            (
-                str(item.get("text") or "").strip()
-                for item in reversed(messages)
-                if str(item.get("text") or "").strip()
-            ),
-            "",
-        ) or None
+        last_output = (
+            next(
+                (
+                    str(item.get("text") or "").strip()
+                    for item in reversed(messages)
+                    if str(item.get("text") or "").strip()
+                ),
+                "",
+            )
+            or None
+        )
         last_reply = self._select_final_message(messages) or None
         if last_reply:
             self._last_replies[session_id] = last_reply
@@ -676,9 +680,11 @@ class CodexBackend(Backend):
     def _summary(thread: dict[str, Any]) -> SessionSummary:
         status = thread.get("status") or {}
         status_type = str(status.get("type") if isinstance(status, dict) else status)
-        active_flags = tuple(
-            str(flag) for flag in status.get("activeFlags") or ()
-        ) if isinstance(status, dict) else ()
+        active_flags = (
+            tuple(str(flag) for flag in status.get("activeFlags") or ())
+            if isinstance(status, dict)
+            else ()
+        )
         return SessionSummary(
             id=str(thread.get("id") or ""),
             cwd=str(thread.get("cwd") or ""),
@@ -695,14 +701,42 @@ class CodexBackend(Backend):
         return [{"type": "text", "text": text, "text_elements": []}]
 
     async def send_message(self, session_id: str, text: str) -> str | None:
-        result = await self._request(
-            "turn/start", {"threadId": session_id, "input": self._input(text)}
-        )
+        params: dict[str, Any] = {"threadId": session_id, "input": self._input(text)}
+        settings = self._session_settings.get(session_id, {})
+        params.update(self._codex_settings(settings))
+        result = await self._request("turn/start", params)
         turn = (result or {}).get("turn") or {}
         turn_id = str(turn.get("id") or "") or None
         if turn_id:
             self._active_turns[session_id] = turn_id
         return turn_id
+
+    async def configure_session(self, session_id: str, settings: Mapping[str, Any]) -> None:
+        allowed = {"model", "effort", "collaboration", "delivery", "approvalReviewer"}
+        unsupported = set(settings) - allowed
+        if unsupported:
+            raise BackendError(f"unsupported Codex settings: {', '.join(sorted(unsupported))}")
+        if settings.get("collaboration") and not settings.get("model"):
+            raise BackendError("Codex collaboration mode requires an explicit model")
+        params = {"threadId": session_id, **self._codex_settings(settings)}
+        await self._request("thread/settings/update", params)
+        self._session_settings[session_id] = dict(settings)
+
+    @staticmethod
+    def _codex_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
+        params = {key: settings[key] for key in ("model", "effort") if key in settings}
+        if collaboration := settings.get("collaboration"):
+            params["collaborationMode"] = {
+                "mode": collaboration,
+                "settings": {
+                    "model": settings["model"],
+                    "reasoning_effort": settings.get("effort"),
+                    "developer_instructions": None,
+                },
+            }
+        if reviewer := settings.get("approvalReviewer"):
+            params["approvalsReviewer"] = "auto_review" if reviewer == "auto_review" else "user"
+        return params
 
     async def steer(self, session_id: str, turn_id: str | None, text: str) -> None:
         expected = turn_id or self._active_turns.get(session_id)

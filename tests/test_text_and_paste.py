@@ -1,5 +1,5 @@
-from agentwire.paste import scan_secrets
-from agentwire.text import clean_text, preview, truncate_utf8
+from agentwire.redaction import scan_secrets
+from agentwire.text import clean_text, truncate_utf8
 
 
 def test_utf8_truncation_never_splits_character() -> None:
@@ -9,13 +9,6 @@ def test_utf8_truncation_never_splits_character() -> None:
 
 def test_unicode_icons_survive_while_irc_control_codes_are_removed() -> None:
     assert clean_text("\x02bold\x02 🟢") == "bold 🟢"
-
-
-def test_preview_marks_truncated_reply() -> None:
-    value, truncated = preview("one\ntwo\nthree", max_lines=2, max_bytes=200)
-    assert truncated
-    assert value.startswith("one\ntwo")
-    assert "!paste" in value
 
 
 def test_secret_scanner_detects_credential_assignments() -> None:

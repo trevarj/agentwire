@@ -48,10 +48,6 @@ class BridgeConfig:
     allowed_roots: tuple[Path, ...]
     state_file: Path
     queue_limit: int
-    summary_max_lines: int
-    summary_max_bytes: int
-    tool_milestone_limit: int
-    notify_owner_on_start: bool
 
 
 @dataclass(slots=True, frozen=True)
@@ -87,13 +83,6 @@ class OpenCodeConfig:
 
 
 @dataclass(slots=True, frozen=True)
-class PasteConfig:
-    url: str
-    expiry: str
-    max_bytes: int
-
-
-@dataclass(slots=True, frozen=True)
 class StackConfig:
     ssh_binary: str
     ssh_host: str
@@ -113,7 +102,6 @@ class Config:
     irc: IRCConfig
     codex: CodexConfig
     opencode: OpenCodeConfig
-    paste: PasteConfig
     stack: StackConfig
 
 
@@ -152,11 +140,7 @@ def load_config(path: str | Path) -> Config:
 
     codex = _table(raw, "codex")
     opencode = _table(raw, "opencode")
-    paste = _table(raw, "paste")
     stack = _table(raw, "stack")
-    expiry = _required_str(paste, "expiry", "paste")
-    if expiry not in {"1h", "12h", "24h", "72h"}:
-        raise ConfigError("[paste].expiry must be one of 1h, 12h, 24h, or 72h")
 
     result = Config(
         path=config_path,
@@ -165,10 +149,6 @@ def load_config(path: str | Path) -> Config:
             allowed_roots=roots,
             state_file=_path(_required_str(bridge, "state_file", "bridge")),
             queue_limit=_positive_int(bridge, "queue_limit", 10, "bridge"),
-            summary_max_lines=_positive_int(bridge, "summary_max_lines", 8, "bridge"),
-            summary_max_bytes=_positive_int(bridge, "summary_max_bytes", 1200, "bridge"),
-            tool_milestone_limit=_positive_int(bridge, "tool_milestone_limit", 12, "bridge"),
-            notify_owner_on_start=bool(bridge.get("notify_owner_on_start", True)),
         ),
         secrets=SecretsConfig(
             env_file=_path(_required_str(secrets, "env_file", "secrets")),
@@ -193,11 +173,6 @@ def load_config(path: str | Path) -> Config:
             username=_required_str(opencode, "username", "opencode"),
             password_env=_required_str(opencode, "password_env", "opencode"),
             binary=_required_str(opencode, "binary", "opencode"),
-        ),
-        paste=PasteConfig(
-            url=_required_str(paste, "url", "paste"),
-            expiry=expiry,
-            max_bytes=_positive_int(paste, "max_bytes", 1_048_576, "paste"),
         ),
         stack=StackConfig(
             ssh_binary=_required_str(stack, "ssh_binary", "stack"),
@@ -280,9 +255,10 @@ def resolve_workspace(raw: str, allowed_roots: tuple[Path, ...]) -> Path:
             continue
         if not resolved.is_dir():
             continue
-        if any(
-            resolved == root or resolved.is_relative_to(root) for root in allowed_roots
-        ) and resolved not in resolved_candidates:
+        if (
+            any(resolved == root or resolved.is_relative_to(root) for root in allowed_roots)
+            and resolved not in resolved_candidates
+        ):
             resolved_candidates.append(resolved)
     if not resolved_candidates:
         if expanded.is_absolute():

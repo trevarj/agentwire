@@ -9,6 +9,43 @@ from agentwire.backends.codex import CodexBackend
 from agentwire.config import CodexConfig
 
 
+@pytest.mark.asyncio
+async def test_protocol_settings_map_auto_review_without_disabling_approvals() -> None:
+    backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def request(method: str, params: dict[str, object]) -> dict[str, object]:
+        calls.append((method, params))
+        return {"turn": {"id": "turn-1"}}
+
+    backend._request = request  # type: ignore[method-assign]
+    await backend.configure_session(
+        "thread-1",
+        {
+            "model": "gpt-5.6",
+            "effort": "high",
+            "collaboration": "default",
+            "approvalReviewer": "auto_review",
+            "delivery": "queue",
+        },
+    )
+    await backend.send_message("thread-1", "hello")
+    assert calls[0][0] == "thread/settings/update"
+    assert calls[1][0] == "turn/start"
+    params = calls[1][1]
+    assert params["approvalsReviewer"] == "auto_review"
+    assert params["effort"] == "high"
+    assert params["collaborationMode"] == {
+        "mode": "default",
+        "settings": {
+            "model": "gpt-5.6",
+            "reasoning_effort": "high",
+            "developer_instructions": None,
+        },
+    }
+    assert "approvalPolicy" not in params
+
+
 def _fake_process(proc_root: Path, pid: int, cwd: Path, *arguments: str) -> None:
     process = proc_root / str(pid)
     process.mkdir()
