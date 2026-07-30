@@ -198,7 +198,7 @@ async def test_completed_file_change_includes_diff_metadata() -> None:
                 "changes": [
                     {
                         "path": "src/agentwire/bridge.py",
-                        "kind": "update",
+                        "kind": {"type": "update"},
                         "diff": "@@ -1 +1 @@\n-old\n+new",
                     }
                 ],
@@ -231,6 +231,46 @@ def test_file_change_does_not_duplicate_existing_unified_headers() -> None:
 
     assert diff.count("--- a/changed.py") == 1
     assert diff.startswith("diff --git a/changed.py b/changed.py\n")
+
+
+def test_added_file_content_becomes_a_unified_diff() -> None:
+    diff = CodexBackend._git_diff(
+        {
+            "path": "/tmp/hello-world.sh",
+            "kind": {"type": "add"},
+            "diff": '#!/bin/sh\n\necho "hello world"\n',
+        }
+    )
+
+    assert diff == (
+        "diff --git a/tmp/hello-world.sh b/tmp/hello-world.sh\n"
+        "--- /dev/null\n"
+        "+++ b/tmp/hello-world.sh\n"
+        "@@ -0,0 +1,3 @@\n"
+        "+#!/bin/sh\n"
+        "+\n"
+        '+echo "hello world"'
+    )
+
+
+def test_deleted_file_content_becomes_a_unified_diff() -> None:
+    diff = CodexBackend._git_diff(
+        {
+            "path": "obsolete.txt",
+            "kind": {"type": "delete"},
+            "diff": "first\nsecond",
+        }
+    )
+
+    assert diff == (
+        "diff --git a/obsolete.txt b/obsolete.txt\n"
+        "--- a/obsolete.txt\n"
+        "+++ /dev/null\n"
+        "@@ -1,2 +0,0 @@\n"
+        "-first\n"
+        "-second\n"
+        "\\ No newline at end of file"
+    )
 
 
 @pytest.mark.asyncio

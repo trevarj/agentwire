@@ -527,20 +527,50 @@ class CodexBackend(Backend):
     @staticmethod
     def _git_diff(change: dict[str, Any]) -> str:
         path = str(change.get("path") or "").strip()
-        diff = str(change.get("diff") or "").strip("\r\n")
+        raw_diff = str(change.get("diff") or "").replace("\r\n", "\n").replace("\r", "\n")
+        has_final_newline = raw_diff.endswith("\n")
+        diff = raw_diff.strip("\n")
         if not path:
             return diff
         if diff.startswith("diff --git "):
             return diff
-        kind = str(change.get("kind") or "update").lower()
+        display_path = path.lstrip("/") or path
+        kind_value = change.get("kind")
+        kind = (
+            str(kind_value.get("type") or "update")
+            if isinstance(kind_value, Mapping)
+            else str(kind_value or "update")
+        ).lower()
         added = kind in {"add", "added", "create", "created"}
         deleted = kind in {"delete", "deleted", "remove", "removed"}
-        old_path = "/dev/null" if added else f"a/{path}"
-        new_path = "/dev/null" if deleted else f"b/{path}"
-        header = f"diff --git a/{path} b/{path}"
+        old_path = "/dev/null" if added else f"a/{display_path}"
+        new_path = "/dev/null" if deleted else f"b/{display_path}"
+        header = f"diff --git a/{display_path} b/{display_path}"
         if diff.startswith("--- "):
             return f"{header}\n{diff}"
-        return f"{header}\n--- {old_path}\n+++ {new_path}\n{diff}".rstrip()
+        file_headers = f"{header}\n--- {old_path}\n+++ {new_path}"
+        if added:
+            return CodexBackend._content_diff(file_headers, diff, "+", has_final_newline)
+        if deleted:
+            return CodexBackend._content_diff(file_headers, diff, "-", has_final_newline)
+        return f"{file_headers}\n{diff}".rstrip()
+
+    @staticmethod
+    def _content_diff(
+        file_headers: str,
+        content: str,
+        prefix: str,
+        has_final_newline: bool,
+    ) -> str:
+        if not content:
+            return file_headers
+        lines = content.split("\n")
+        count = len(lines)
+        hunk = f"@@ -0,0 +1,{count} @@" if prefix == "+" else f"@@ -1,{count} +0,0 @@"
+        body = "\n".join(f"{prefix}{line}" for line in lines)
+        if not has_final_newline:
+            body += "\n\\ No newline at end of file"
+        return f"{file_headers}\n{hunk}\n{body}"
 
     @staticmethod
     def _select_final_message(messages: list[dict[str, Any]]) -> str:
