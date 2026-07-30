@@ -193,10 +193,25 @@ Harness activity:
 - `request.opened`, `request.resolved`, `approval.review.started`,
   `approval.review.completed`
 
+Codex plan notifications use `plan.updated.data` with `plan: true`, `running`, `status`
+(`pending`, `inProgress`, or `completed`), `completedSteps`, `totalSteps`, and a display `summary`.
+Clients MUST stop an active plan indicator when `running` becomes false or its turn completes, and
+SHOULD replace the prior plan card for the same turn instead of appending every update.
+
 One channel has one global binding. Changing it leaves the old session running and observed by
 the backend, but its activity is not rendered in the channel's main timeline. A client presents
 the session list as a paged sheet and can reattach when Agentwire reports an inactive-session
 request out of band.
+
+After a successful `session.create` or `session.attach`, Agentwire emits `binding.changed`, then a
+`session.snapshot`, then `channel.snapshot`. Clients MUST treat `binding.changed` as a timeline
+boundary and clear activity from the previous binding. For Codex, `session.snapshot.data` contains
+`status` (`ready`, `running`, or `waiting`) and `recentOutputs`: up to three chronological
+`{iid, tid?, phase?, content, omitted}` objects recovered from the resumed thread. Each recovered
+output is limited to 4096 UTF-8 bytes and is wholly replaced when high-confidence secret material
+is detected. Clients SHOULD render those outputs as restored session context, or render `status`
+when the list is empty. Settings-only `session.snapshot` events omit `recentOutputs` and do not
+replace the timeline.
 
 Queues are per channel and session, durable, ordered, and limited to 10 items by default. A busy
 prompt queues or steers according to the session delivery setting. Canceling a turn does not
@@ -207,9 +222,13 @@ Assistant streaming, when a backend exposes it, is limited to two `assistant.del
 second per item. Final assistant text, prompts, session switches, request cards, failures, and
 queue edits/deletions have readable `PRIVMSG` representations. Plans, tools, usage, commentary,
 snapshots, and other state are normally `TAGMSG`. Tool cards contain structured safe metadata;
-large individual fields are capped at 32 KiB and a card at 64 KiB. Binary artifacts are manifests
-only and are never uploaded by this protocol. Token/context metrics are optional; cost is optional
-because many backends cannot calculate it reliably.
+the allowlisted fields are `label`, `input`, `output`, `diff`, `status`, `exitCode`, and
+`durationMs`. Text fields are capped at 4096 UTF-8 bytes (`label` at 200 bytes and `status` at 80),
+and a field is omitted when the high-confidence secret detector matches. Clients SHOULD label tool
+cards from `label` (falling back to `kind`) and render available command, output, or diff previews
+collapsed by default. Binary artifacts are manifests only and are never uploaded by this protocol.
+Token/context metrics are optional; cost is optional because many backends cannot calculate it
+reliably.
 
 ## Secrets and trust boundary
 

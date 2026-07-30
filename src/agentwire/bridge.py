@@ -26,7 +26,7 @@ from agentwire.protocol import (
 )
 from agentwire.redaction import scan_secrets
 from agentwire.state import QueuedPrompt, StateStore
-from agentwire.text import clean_text, safe_one_line, truncate_utf8
+from agentwire.text import clean_block, clean_text, safe_one_line, truncate_utf8
 
 MAX_CONTENT_BYTES = 64 * 1024
 MAX_PREVIEW_BYTES = 4 * 1024
@@ -676,12 +676,23 @@ class Bridge:
                 },
             )
         elif event.kind == "progress":
+            data: dict[str, Any] = {"summary": self._safe_content(event.text, 32 * 1024)}
+            if event.data.get("plan") is True:
+                data["plan"] = True
+                data["running"] = bool(event.data.get("running"))
+                status = event.data.get("status")
+                if isinstance(status, str):
+                    data["status"] = safe_one_line(status, 80)
+                for key in ("completedSteps", "totalSteps"):
+                    value = event.data.get(key)
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        data[key] = value
             await self._emit(
                 channel,
                 "plan.updated",
                 session_id=event.session_id,
                 turn_id=event.turn_id,
-                data={"summary": self._safe_content(event.text, 32 * 1024)},
+                data=data,
             )
         elif event.kind == "assistant":
             findings = scan_secrets(event.text)
@@ -708,7 +719,7 @@ class Bridge:
                 session_id=event.session_id,
                 turn_id=event.turn_id,
                 item_id=event.item_id,
-                data={"kind": event.tool_kind, "success": event.success},
+                data=self._safe_tool_data(event),
             )
         elif event.kind in {"approval", "question"}:
             await self._open_request(channel, event)
@@ -826,6 +837,13 @@ class Bridge:
                 "session": self._session_data(summary),
             },
             preview=f"Agent session switched to {summary.title or summary.id}",
+        )
+        await self._emit(
+            channel,
+            "session.snapshot",
+            session_id=summary.id,
+            turn_id=summary.active_turn_id,
+            data=self._session_snapshot_data(summary),
         )
         await self._emit_snapshot(channel)
 
@@ -999,6 +1017,59 @@ class Bridge:
             "busy": session.busy,
             "flags": list(session.active_flags),
         }
+
+    @staticmethod
+    def _session_snapshot_data(session: SessionSummary) -> dict[str, Any]:
+        recent_outputs: list[dict[str, Any]] = []
+        for output in session.recent_outputs[-3:]:
+            if scan_secrets(output.text):
+                content = "Output omitted from IRC because it may contain a secret"
+                omitted = True
+            else:
+                content = truncate_utf8(clean_text(output.text), MAX_PREVIEW_BYTES)
+                omitted = False
+            item: dict[str, Any] = {
+                "iid": output.id,
+                "content": content,
+                "omitted": omitted,
+            }
+            if output.turn_id:
+                item["tid"] = output.turn_id
+            if output.phase:
+                item["phase"] = output.phase
+            recent_outputs.append(item)
+        status = (
+            "waiting"
+            if session.active_flags
+            else "running" if session.busy else "ready"
+        )
+        return {
+            "cwd": session.cwd,
+            "busy": session.busy,
+            "flags": list(session.active_flags),
+            "status": status,
+            "recentOutputs": recent_outputs,
+        }
+
+    @staticmethod
+    def _safe_tool_data(event: BackendEvent) -> dict[str, Any]:
+        result: dict[str, Any] = {"kind": event.tool_kind, "success": event.success}
+        if event.item_id:
+            result["id"] = event.item_id
+        limits = {"label": 200, "input": 4096, "output": 4096, "diff": 4096, "status": 80}
+        for key, limit in limits.items():
+            value = event.data.get(key)
+            if not isinstance(value, str) or not value:
+                continue
+            cleaned = clean_block(value)
+            if not cleaned or scan_secrets(cleaned):
+                continue
+            result[key] = truncate_utf8(cleaned, limit)
+        for key in ("exitCode", "durationMs"):
+            value = event.data.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                result[key] = value
+        return result
 
     @staticmethod
     def _queue_data(item: QueuedPrompt) -> dict[str, Any]:

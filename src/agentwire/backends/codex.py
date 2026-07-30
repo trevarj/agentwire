@@ -15,8 +15,8 @@ import aiohttp
 
 from agentwire.backends.base import Backend, BackendError
 from agentwire.config import CodexConfig
-from agentwire.models import BackendEvent, Question, SessionSummary
-from agentwire.text import safe_one_line
+from agentwire.models import BackendEvent, Question, SessionOutput, SessionSummary
+from agentwire.text import safe_one_line, truncate_utf8
 
 
 class CodexBackend(Backend):
@@ -36,7 +36,7 @@ class CodexBackend(Backend):
         self._active_turns: dict[str, str] = {}
         self._turn_messages: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self._last_replies: dict[str, str] = {}
-        self._last_plan_updates: dict[tuple[str, str], str] = {}
+        self._last_plan_updates: dict[tuple[str, str], tuple[str, str, int, int]] = {}
         self._session_settings: dict[str, dict[str, Any]] = {}
         self._setting_options: dict[str, Any] | None = None
 
@@ -282,21 +282,31 @@ class CodexBackend(Backend):
             )
             return
         if method == "turn/plan/updated" and thread_id:
-            plan = params.get("plan") or []
+            plan = [item for item in params.get("plan") or [] if isinstance(item, dict)]
             active_step = next(
                 (
                     str(item.get("step") or "").strip()
                     for item in plan
-                    if isinstance(item, dict) and item.get("status") == "inProgress"
+                    if item.get("status") == "inProgress"
                 ),
                 "",
             )
+            completed_steps = sum(item.get("status") == "completed" for item in plan)
+            complete = bool(plan) and completed_steps == len(plan)
+            status = "completed" if complete else "inProgress" if active_step else "pending"
             explanation = str(params.get("explanation") or "").strip()
-            text = explanation or (f"plan: {active_step}" if active_step else "")
+            text = explanation or (
+                "Plan completed"
+                if complete
+                else f"plan: {active_step}"
+                if active_step
+                else "Plan updated"
+            )
             turn_id = str(params.get("turnId") or "")
             key = (thread_id, turn_id)
-            if text and self._last_plan_updates.get(key) != text:
-                self._last_plan_updates[key] = text
+            signature = (text, status, completed_steps, len(plan))
+            if self._last_plan_updates.get(key) != signature:
+                self._last_plan_updates[key] = signature
                 await self._events.put(
                     BackendEvent(
                         kind="progress",
@@ -304,6 +314,13 @@ class CodexBackend(Backend):
                         session_id=thread_id,
                         turn_id=turn_id or None,
                         text=text,
+                        data={
+                            "plan": True,
+                            "running": bool(plan) and not complete,
+                            "status": status,
+                            "completedSteps": completed_steps,
+                            "totalSteps": len(plan),
+                        },
                     )
                 )
             return
@@ -373,6 +390,7 @@ class CodexBackend(Backend):
                         item_id=str(item.get("id") or "") or None,
                         tool_kind=tool_kind,
                         success=success,
+                        data=self._tool_metadata(item),
                     )
                 )
             return
@@ -456,6 +474,73 @@ class CodexBackend(Backend):
         if status:
             return status not in {"failed", "error", "declined"}
         return None
+
+    @staticmethod
+    def _tool_metadata(item: dict[str, Any]) -> dict[str, Any]:
+        item_type = str(item.get("type") or "")
+        data: dict[str, Any] = {}
+        status = item.get("status")
+        if isinstance(status, str) and status:
+            data["status"] = status
+        for key in ("exitCode", "durationMs"):
+            value = item.get(key)
+            if isinstance(value, int) and not isinstance(value, bool):
+                data[key] = value
+        if item_type == "commandExecution":
+            command = str(item.get("command") or "").strip()
+            if command:
+                data["label"] = f"$ {safe_one_line(command, 160)}"
+                data["input"] = truncate_utf8(command, 32 * 1024)
+            output = str(item.get("aggregatedOutput") or "").strip("\r\n")
+            if output:
+                data["output"] = truncate_utf8(output, 32 * 1024)
+        elif item_type == "fileChange":
+            changes = [change for change in item.get("changes") or [] if isinstance(change, dict)]
+            paths = [str(change.get("path") or "").strip() for change in changes]
+            paths = [path for path in paths if path]
+            data["label"] = safe_one_line(
+                "Edit " + ", ".join(paths[:3]) if paths else "File changes",
+                160,
+            )
+            sections = [CodexBackend._git_diff(change) for change in changes]
+            diff = "\n\n".join(section for section in sections if section)
+            if diff:
+                data["diff"] = truncate_utf8(diff, 32 * 1024)
+        elif item_type == "mcpToolCall":
+            server = str(item.get("server") or "").strip()
+            tool = str(item.get("tool") or "").strip()
+            if server or tool:
+                data["label"] = safe_one_line(" / ".join(part for part in (server, tool) if part))
+        elif item_type == "dynamicToolCall":
+            namespace = str(item.get("namespace") or "").strip()
+            tool = str(item.get("tool") or "").strip()
+            if namespace or tool:
+                data["label"] = safe_one_line(
+                    " / ".join(part for part in (namespace, tool) if part)
+                )
+        elif item_type == "webSearch":
+            query = str(item.get("query") or "").strip()
+            if query:
+                data["label"] = safe_one_line(f"Search: {query}", 160)
+        return data
+
+    @staticmethod
+    def _git_diff(change: dict[str, Any]) -> str:
+        path = str(change.get("path") or "").strip()
+        diff = str(change.get("diff") or "").strip("\r\n")
+        if not path:
+            return diff
+        if diff.startswith("diff --git "):
+            return diff
+        kind = str(change.get("kind") or "update").lower()
+        added = kind in {"add", "added", "create", "created"}
+        deleted = kind in {"delete", "deleted", "remove", "removed"}
+        old_path = "/dev/null" if added else f"a/{path}"
+        new_path = "/dev/null" if deleted else f"b/{path}"
+        header = f"diff --git a/{path} b/{path}"
+        if diff.startswith("--- "):
+            return f"{header}\n{diff}"
+        return f"{header}\n--- {old_path}\n+++ {new_path}\n{diff}".rstrip()
 
     @staticmethod
     def _select_final_message(messages: list[dict[str, Any]]) -> str:
@@ -629,7 +714,7 @@ class CodexBackend(Backend):
             "threadId": session_id,
             "excludeTurns": True,
             "initialTurnsPage": {
-                "limit": 1,
+                "limit": 3,
                 "sortDirection": "desc",
                 "itemsView": "full",
             },
@@ -652,6 +737,26 @@ class CodexBackend(Backend):
         )
         if active_turn_id:
             self._active_turns[session_id] = active_turn_id
+        recent_outputs: list[SessionOutput] = []
+        for turn in reversed(turns):
+            if not isinstance(turn, dict):
+                continue
+            turn_id = str(turn.get("id") or "") or None
+            for index, item in enumerate(turn.get("items") or []):
+                if not isinstance(item, dict) or item.get("type") != "agentMessage":
+                    continue
+                text = str(item.get("text") or "").strip()
+                if not text:
+                    continue
+                recent_outputs.append(
+                    SessionOutput(
+                        id=str(item.get("id") or f"{turn_id or 'turn'}-output-{index}"),
+                        turn_id=turn_id,
+                        text=text,
+                        phase=str(item.get("phase") or "") or None,
+                    )
+                )
+        recent_outputs = recent_outputs[-3:]
         latest_turn = next((turn for turn in turns if isinstance(turn, dict)), {})
         messages = [
             item
@@ -682,6 +787,7 @@ class CodexBackend(Backend):
             active_turn_id=active_turn_id,
             last_output=last_output,
             last_reply=last_reply,
+            recent_outputs=tuple(recent_outputs),
         )
 
     @staticmethod

@@ -21,6 +21,14 @@ EventKind = Literal[
 
 
 @dataclass(slots=True, frozen=True)
+class SessionOutput:
+    id: str
+    turn_id: str | None
+    text: str
+    phase: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
 class SessionSummary:
     id: str
     cwd: str
@@ -31,6 +39,7 @@ class SessionSummary:
     active_turn_id: str | None = None
     last_output: str | None = None
     last_reply: str | None = None
+    recent_outputs: tuple[SessionOutput, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)

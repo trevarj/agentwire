@@ -28,6 +28,32 @@ def test_reference_client_reduces_events_to_render_state() -> None:
     assert (action.epoch, action.device) == ("live", "phone")
 
 
+def test_reference_client_replaces_timeline_context_on_binding_change() -> None:
+    client = ProtocolClient(device="phone", instance="client")
+    client.state.assistant = [{"content": "old"}]
+    client.state.apply(
+        new_envelope(
+            "binding.changed",
+            "event",
+            "agent",
+            session_id="s2",
+            data={"session": {"sid": "s2"}},
+        )
+    )
+    assert client.state.assistant == []
+
+    client.state.apply(
+        new_envelope(
+            "session.snapshot",
+            "event",
+            "agent",
+            session_id="s2",
+            data={"status": "ready", "recentOutputs": [{"iid": "i1", "content": "new"}]},
+        )
+    )
+    assert client.state.assistant == [{"iid": "i1", "content": "new"}]
+
+
 def test_jsonl_cli_emits_action_wire_messages() -> None:
     input_stream = io.StringIO(
         '{"op":"topic","topic":"agentwire:v1;account=trev;backend=codex"}\n'

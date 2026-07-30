@@ -10,6 +10,12 @@ def clean_text(text: str) -> str:
     return _CONTROL.sub("", text).strip()
 
 
+def clean_block(text: str) -> str:
+    """Remove controls while preserving meaningful line indentation."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return _CONTROL.sub("", text).strip("\n")
+
+
 def truncate_utf8(text: str, max_bytes: int) -> str:
     encoded = text.encode("utf-8")
     if len(encoded) <= max_bytes:

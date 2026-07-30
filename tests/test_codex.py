@@ -132,7 +132,7 @@ def test_rollout_busy_rejects_unsafe_session_id(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_event_is_sanitized() -> None:
+async def test_tool_event_extracts_safe_display_metadata() -> None:
     backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
     await backend._handle_notification(
         "item/started",
@@ -150,7 +150,87 @@ async def test_tool_event_is_sanitized() -> None:
     assert event.kind == "tool_started"
     assert event.tool_kind == "shell"
     assert event.text == ""
-    assert event.data == {}
+    assert event.data == {"label": "$ cat /secret/file", "input": "cat /secret/file"}
+
+
+@pytest.mark.asyncio
+async def test_completed_command_includes_small_output_metadata() -> None:
+    backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
+    await backend._handle_notification(
+        "item/completed",
+        {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": {
+                "id": "item-1",
+                "type": "commandExecution",
+                "command": "git status --short",
+                "aggregatedOutput": " M src/agentwire/bridge.py",
+                "status": "completed",
+                "exitCode": 0,
+            },
+        },
+    )
+
+    event = await backend._events.get()
+    assert event.kind == "tool_finished"
+    assert event.data == {
+        "status": "completed",
+        "exitCode": 0,
+        "label": "$ git status --short",
+        "input": "git status --short",
+        "output": " M src/agentwire/bridge.py",
+    }
+
+
+@pytest.mark.asyncio
+async def test_completed_file_change_includes_diff_metadata() -> None:
+    backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
+    await backend._handle_notification(
+        "item/completed",
+        {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": {
+                "id": "item-1",
+                "type": "fileChange",
+                "status": "completed",
+                "changes": [
+                    {
+                        "path": "src/agentwire/bridge.py",
+                        "kind": "update",
+                        "diff": "@@ -1 +1 @@\n-old\n+new",
+                    }
+                ],
+            },
+        },
+    )
+
+    event = await backend._events.get()
+    assert event.kind == "tool_finished"
+    assert event.data == {
+        "status": "completed",
+        "label": "Edit src/agentwire/bridge.py",
+        "diff": (
+            "diff --git a/src/agentwire/bridge.py b/src/agentwire/bridge.py\n"
+            "--- a/src/agentwire/bridge.py\n"
+            "+++ b/src/agentwire/bridge.py\n"
+            "@@ -1 +1 @@\n-old\n+new"
+        ),
+    }
+
+
+def test_file_change_does_not_duplicate_existing_unified_headers() -> None:
+    diff = CodexBackend._git_diff(
+        {
+            "path": "changed.py",
+            "kind": "update",
+            "diff": "--- a/changed.py\n+++ b/changed.py\n@@ -1 +1 @@\n-old\n+new",
+        }
+    )
+
+    assert diff.count("--- a/changed.py") == 1
+    assert diff.startswith("diff --git a/changed.py b/changed.py\n")
 
 
 @pytest.mark.asyncio
@@ -236,6 +316,24 @@ async def test_plan_update_relays_current_step() -> None:
     event = await backend._events.get()
     assert event.kind == "progress"
     assert event.text == "plan: Fix status tracking"
+    assert event.data == {
+        "plan": True,
+        "running": True,
+        "status": "inProgress",
+        "completedSteps": 1,
+        "totalSteps": 2,
+    }
+    await backend._handle_notification(
+        "turn/plan/updated",
+        {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "plan": [{"step": "Fix status tracking", "status": "inProgress"}],
+        },
+    )
+    second = await backend._events.get()
+    assert second.data["completedSteps"] == 0
+    assert second.data["totalSteps"] == 1
     await backend._handle_notification(
         "turn/plan/updated",
         {
@@ -246,6 +344,24 @@ async def test_plan_update_relays_current_step() -> None:
     )
     assert backend._events.empty()
 
+    await backend._handle_notification(
+        "turn/plan/updated",
+        {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "plan": [{"step": "Fix status tracking", "status": "completed"}],
+        },
+    )
+    completed = await backend._events.get()
+    assert completed.text == "Plan completed"
+    assert completed.data == {
+        "plan": True,
+        "running": False,
+        "status": "completed",
+        "completedSteps": 1,
+        "totalSteps": 1,
+    }
+
 
 @pytest.mark.asyncio
 async def test_attach_recovers_active_turn() -> None:
@@ -254,7 +370,7 @@ async def test_attach_recovers_active_turn() -> None:
     async def request(method: str, params: dict[str, object]) -> object:
         assert method == "thread/resume"
         assert params["initialTurnsPage"] == {
-            "limit": 1,
+            "limit": 3,
             "sortDirection": "desc",
             "itemsView": "full",
         }
@@ -292,7 +408,47 @@ async def test_attach_recovers_active_turn() -> None:
     assert summary.active_turn_id == "turn-1"
     assert summary.last_output == "Checking the remaining protocol events."
     assert summary.last_reply is None
+    assert [output.text for output in summary.recent_outputs] == [
+        "Checking the remaining protocol events."
+    ]
     assert backend._active_turns == {"thread-1": "turn-1"}
+
+
+@pytest.mark.asyncio
+async def test_attach_restores_the_last_three_outputs_in_chronological_order() -> None:
+    backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
+
+    async def request(_method: str, _params: dict[str, object]) -> object:
+        return {
+            "thread": {"id": "thread-1", "cwd": "/workspace", "status": {"type": "idle"}},
+            "initialTurnsPage": {
+                "data": [
+                    {
+                        "id": "newest",
+                        "status": "completed",
+                        "items": [{"id": "i4", "type": "agentMessage", "text": "Newest"}],
+                    },
+                    {
+                        "id": "middle",
+                        "status": "completed",
+                        "items": [{"id": "i3", "type": "agentMessage", "text": "Middle"}],
+                    },
+                    {
+                        "id": "oldest",
+                        "status": "completed",
+                        "items": [
+                            {"id": "i1", "type": "agentMessage", "text": "Old one"},
+                            {"id": "i2", "type": "agentMessage", "text": "Old two"},
+                        ],
+                    },
+                ]
+            },
+        }
+
+    backend._request = request  # type: ignore[method-assign]
+    summary = await backend.attach_session("thread-1", "/workspace")
+
+    assert [output.text for output in summary.recent_outputs] == ["Old two", "Middle", "Newest"]
 
 
 def test_session_summary_includes_current_thread_status() -> None:

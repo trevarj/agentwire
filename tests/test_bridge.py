@@ -20,7 +20,7 @@ from agentwire.config import (
     SecretsConfig,
     StackConfig,
 )
-from agentwire.models import BackendEvent, ChannelBinding, Question, SessionSummary
+from agentwire.models import BackendEvent, ChannelBinding, Question, SessionOutput, SessionSummary
 from agentwire.protocol import new_envelope
 
 
@@ -271,6 +271,54 @@ async def test_settings_are_isolated_per_bound_session(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_binding_emits_redacted_recent_session_context(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    irc.sent.clear()
+
+    await bridge._set_binding(
+        "#codex",
+        SessionSummary(
+            "s1",
+            str(tmp_path),
+            "Existing",
+            busy=True,
+            active_flags=("waitingOnUserInput",),
+            active_turn_id="t2",
+            recent_outputs=(
+                SessionOutput("i1", "t1", "First recovered output", "final"),
+                SessionOutput("i2", "t2", "API_TOKEN=abcdefghijklmno", "commentary"),
+            ),
+        ),
+    )
+
+    assert [item[1].kind for item in irc.sent] == [
+        "binding.changed",
+        "session.snapshot",
+        "channel.snapshot",
+    ]
+    snapshot = irc.sent[1][1]
+    assert snapshot.turn_id == "t2"
+    assert snapshot.data["status"] == "waiting"
+    assert snapshot.data["recentOutputs"] == [
+        {
+            "iid": "i1",
+            "tid": "t1",
+            "phase": "final",
+            "content": "First recovered output",
+            "omitted": False,
+        },
+        {
+            "iid": "i2",
+            "tid": "t2",
+            "phase": "commentary",
+            "content": "Output omitted from IRC because it may contain a secret",
+            "omitted": True,
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_stale_session_action_cannot_target_new_binding(tmp_path: Path) -> None:
     bridge, irc, backend = make_bridge(tmp_path)
     await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
@@ -433,6 +481,76 @@ async def test_secret_assistant_message_is_wholly_omitted(tmp_path: Path) -> Non
     assert event.kind == "assistant.completed"
     assert event.data["omitted"] is True
     assert "API_TOKEN" not in str(event.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_plan_progress_preserves_completion_state(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    bridge.channels["#codex"].binding = ChannelBinding("codex", "s1", str(tmp_path))
+
+    await bridge._handle_backend_event(
+        "#codex",
+        BackendEvent(
+            "progress",
+            "codex",
+            session_id="s1",
+            turn_id="t1",
+            text="Plan completed",
+            data={
+                "plan": True,
+                "running": False,
+                "status": "completed",
+                "completedSteps": 2,
+                "totalSteps": 2,
+            },
+        ),
+    )
+
+    event = irc.sent[-1][1]
+    assert event.kind == "plan.updated"
+    assert event.data == {
+        "summary": "Plan completed",
+        "plan": True,
+        "running": False,
+        "status": "completed",
+        "completedSteps": 2,
+        "totalSteps": 2,
+    }
+
+
+@pytest.mark.asyncio
+async def test_tool_preview_omits_only_sensitive_fields(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    bridge.channels["#codex"].binding = ChannelBinding("codex", "s1", str(tmp_path))
+
+    await bridge._handle_backend_event(
+        "#codex",
+        BackendEvent(
+            "tool_finished",
+            "codex",
+            session_id="s1",
+            turn_id="t1",
+            item_id="i1",
+            tool_kind="shell",
+            success=True,
+            data={
+                "label": "$ printenv API_TOKEN",
+                "input": "API_TOKEN=abcdefghijklmno",
+                "output": "working tree clean",
+                "status": "completed",
+                "exitCode": 0,
+            },
+        ),
+    )
+
+    data = irc.sent[-1][1].data
+    assert data["id"] == "i1"
+    assert "input" not in data
+    assert data["output"] == "working tree clean"
+    assert data["status"] == "completed"
+    assert data["exitCode"] == 0
 
 
 @pytest.mark.asyncio

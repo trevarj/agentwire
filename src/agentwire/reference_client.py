@@ -62,10 +62,21 @@ class HarnessState:
                 if isinstance(session, dict) and session.get("sid")
                 else event.session_id
             )
+            self.turn_id = None
+            self.busy = False
+            self.assistant.clear()
+            self.tools.clear()
+            self.plan = None
         elif event.kind in {"session.snapshot", "session.status"}:
             self.settings.update(event.data.get("settings") or {})
             if "busy" in event.data:
                 self.busy = bool(event.data["busy"])
+            if event.kind == "session.snapshot" and "recentOutputs" in event.data:
+                self.assistant = [
+                    dict(item)
+                    for item in event.data.get("recentOutputs") or []
+                    if isinstance(item, dict)
+                ]
         elif event.kind == "turn.started":
             self.busy = True
             self.turn_id = event.turn_id
