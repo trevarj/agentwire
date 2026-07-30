@@ -38,6 +38,7 @@ class CodexBackend(Backend):
         self._last_replies: dict[str, str] = {}
         self._last_plan_updates: dict[tuple[str, str], str] = {}
         self._session_settings: dict[str, dict[str, Any]] = {}
+        self._setting_options: dict[str, Any] | None = None
 
     async def start(self) -> None:
         if self._reader_task is not None:
@@ -98,6 +99,7 @@ class CodexBackend(Backend):
 
     async def _close_transport(self) -> None:
         current = asyncio.current_task()
+        self._setting_options = None
         if self._reader_task is not None and self._reader_task is not current:
             self._reader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -727,6 +729,52 @@ class CodexBackend(Backend):
         params = {"threadId": session_id, **self._codex_settings(settings)}
         await self._request("thread/settings/update", params)
         self._session_settings[session_id] = dict(settings)
+
+    async def setting_options(self) -> Mapping[str, Any]:
+        if self._setting_options is not None:
+            return self._setting_options
+        models: list[dict[str, Any]] = []
+        model_ids: set[str] = set()
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {"limit": 100, "includeHidden": False}
+            if cursor is not None:
+                params["cursor"] = cursor
+            result = await self._request("model/list", params)
+            if not isinstance(result, dict):
+                raise BackendError("Codex returned an invalid model catalog")
+            entries = result.get("data")
+            if not isinstance(entries, list):
+                raise BackendError("Codex returned an invalid model catalog")
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                model_id = str(item.get("model") or item.get("id") or "")
+                if not model_id:
+                    continue
+                efforts = [
+                    str(option["reasoningEffort"])
+                    for option in item.get("supportedReasoningEfforts") or ()
+                    if isinstance(option, dict) and option.get("reasoningEffort")
+                ]
+                model: dict[str, Any] = {
+                    "value": model_id,
+                    "label": str(item.get("displayName") or model_id),
+                    "efforts": efforts,
+                }
+                if default_effort := item.get("defaultReasoningEffort"):
+                    model["defaultEffort"] = str(default_effort)
+                if item.get("isDefault") is True:
+                    model["default"] = True
+                if model_id not in model_ids:
+                    models.append(model)
+                    model_ids.add(model_id)
+            next_cursor = result.get("nextCursor")
+            if not next_cursor or next_cursor == cursor:
+                break
+            cursor = str(next_cursor)
+        self._setting_options = {"model": models}
+        return self._setting_options
 
     @staticmethod
     def _codex_settings(settings: Mapping[str, Any]) -> dict[str, Any]:

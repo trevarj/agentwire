@@ -6,6 +6,7 @@ import re
 import secrets
 import uuid
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 from agentwire.backends.base import Backend, BackendError
@@ -54,6 +55,7 @@ class ChannelRuntime:
     settings: dict[str, Any] = field(
         default_factory=lambda: {"delivery": "queue", "approvalReviewer": "manual"}
     )
+    session_settings: dict[str, dict[str, Any]] = field(default_factory=dict)
     requests: dict[str, PendingRequest] = field(default_factory=dict)
     observed_sessions: set[str] = field(default_factory=set)
 
@@ -193,61 +195,69 @@ class Bridge:
 
     async def _emit_hello(self, channel: str, reply: str | None = None) -> None:
         runtime = self.channels[channel]
+        data: dict[str, Any] = {
+            "protocol": "agentwire-irc-v1",
+            "backend": runtime.backend,
+            "epoch": self.epoch,
+            "capabilities": sorted(
+                {
+                    "sync",
+                    "workspaces",
+                    "sessions",
+                    "history",
+                    "settings",
+                    "turns",
+                    "steering",
+                    "queues",
+                    "requests",
+                }
+            ),
+            "actions": sorted(
+                {
+                    "sync.request",
+                    "workspace.list.request",
+                    "session.list.request",
+                    "history.request",
+                    "session.create",
+                    "session.attach",
+                    "session.detach",
+                    "settings.update",
+                    "turn.prompt",
+                    "turn.steer",
+                    "turn.cancel",
+                    "queue.edit",
+                    "queue.move",
+                    "queue.delete",
+                    "queue.clear",
+                    "request.respond",
+                    "request.skip",
+                }
+            ),
+            "limits": {
+                "contentBytes": MAX_CONTENT_BYTES,
+                "queueItems": self.config.bridge.queue_limit,
+                "historyEvents": 200,
+                "historyBytes": 512 * 1024,
+                "historyDays": 30,
+            },
+            "settings": (
+                ["model", "effort", "collaboration", "delivery", "approvalReviewer"]
+                if runtime.backend == "codex"
+                else ["delivery"]
+            ),
+        }
+        try:
+            setting_options = await self.backends[runtime.backend].setting_options()
+        except BackendError:
+            # Picker discovery is optional and must not prevent channel activation.
+            setting_options = {}
+        if setting_options:
+            data["settingOptions"] = dict(setting_options)
         await self._emit(
             channel,
             "agent.hello",
             reply=reply,
-            data={
-                "protocol": "agentwire-irc-v1",
-                "backend": runtime.backend,
-                "epoch": self.epoch,
-                "capabilities": sorted(
-                    {
-                        "sync",
-                        "workspaces",
-                        "sessions",
-                        "history",
-                        "settings",
-                        "turns",
-                        "steering",
-                        "queues",
-                        "requests",
-                    }
-                ),
-                "actions": sorted(
-                    {
-                        "sync.request",
-                        "workspace.list.request",
-                        "session.list.request",
-                        "history.request",
-                        "session.create",
-                        "session.attach",
-                        "session.detach",
-                        "settings.update",
-                        "turn.prompt",
-                        "turn.steer",
-                        "turn.cancel",
-                        "queue.edit",
-                        "queue.move",
-                        "queue.delete",
-                        "queue.clear",
-                        "request.respond",
-                        "request.skip",
-                    }
-                ),
-                "limits": {
-                    "contentBytes": MAX_CONTENT_BYTES,
-                    "queueItems": self.config.bridge.queue_limit,
-                    "historyEvents": 200,
-                    "historyBytes": 512 * 1024,
-                    "historyDays": 30,
-                },
-                "settings": (
-                    ["model", "effort", "collaboration", "delivery", "approvalReviewer"]
-                    if runtime.backend == "codex"
-                    else ["delivery"]
-                ),
-            },
+            data=data,
         )
 
     async def _handle_action(self, channel: str, action: Envelope) -> None:
@@ -317,30 +327,91 @@ class Bridge:
         await self._emit_snapshot(channel, reply=action.id)
 
     async def _action_workspaces(self, channel: str, action: Envelope) -> None:
+        parent_value = action.data.get("parent")
+        if parent_value is None:
+            parent: Path | None = None
+            directories = list(self.config.bridge.allowed_roots)
+        elif isinstance(parent_value, str):
+            parent = resolve_workspace(parent_value, self.config.bridge.allowed_roots)
+            directories = self._workspace_children(parent)
+        else:
+            raise ProtocolError("workspace parent must be a string")
         items = [
-            {"path": str(root), "name": root.name} for root in self.config.bridge.allowed_roots
+            {
+                "path": str(directory),
+                "name": directory.name,
+                "hasChildren": bool(self._workspace_children(directory, limit=1)),
+            }
+            for directory in directories
         ]
         await self._emit(
             channel,
             "workspace.page",
             reply=action.id,
-            data={"items": items, "next": None},
+            data={
+                "parent": str(parent) if parent is not None else None,
+                "items": items,
+                "next": None,
+            },
         )
+
+    def _workspace_children(self, parent: Path, limit: int | None = None) -> list[Path]:
+        children: list[Path] = []
+        try:
+            entries = sorted(parent.iterdir(), key=lambda item: item.name.casefold())
+        except OSError:
+            return children
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            try:
+                resolved = entry.resolve(strict=True)
+                allowed = any(
+                    resolved == root or resolved.is_relative_to(root)
+                    for root in self.config.bridge.allowed_roots
+                )
+                loops_to_ancestor = resolved == parent or parent.is_relative_to(resolved)
+                if not allowed or loops_to_ancestor or not resolved.is_dir():
+                    continue
+            except OSError:
+                continue
+            if resolved not in children:
+                children.append(resolved)
+            if limit is not None and len(children) >= limit:
+                break
+        return children
 
     async def _action_sessions(self, channel: str, action: Envelope) -> None:
         cwd_value = action.data.get("cwd")
+        cursor_value = action.data.get("cursor")
+        if cursor_value is None:
+            offset = 0
+        elif isinstance(cursor_value, str) and cursor_value.isdigit():
+            offset = int(cursor_value)
+        else:
+            raise ProtocolError("session cursor must be a non-negative integer string")
         backend = self.backends[self.channels[channel].backend]
-        if cwd_value:
-            cwd = str(resolve_workspace(str(cwd_value), self.config.bridge.allowed_roots))
+        if cwd_value is not None:
+            if not isinstance(cwd_value, str) or not cwd_value:
+                raise ProtocolError("session cwd must be a non-empty string")
+            cwd = str(resolve_workspace(cwd_value, self.config.bridge.allowed_roots))
             sessions = await backend.list_sessions(cwd)
         else:
+            cwd = None
             sessions = await backend.list_running_sessions()
         allowed = [item for item in sessions if self._workspace_allowed(item.cwd)]
+        page = allowed[offset : offset + 100]
+        next_cursor = str(offset + 100) if offset + 100 < len(allowed) else None
         await self._emit(
             channel,
             "session.page",
             reply=action.id,
-            data={"items": [self._session_data(item) for item in allowed[:100]], "next": None},
+            data={
+                "cwd": cwd,
+                "cursor": str(offset) if offset else None,
+                "items": [self._session_data(item) for item in page],
+                "next": next_cursor,
+            },
         )
 
     async def _action_history(self, channel: str, action: Envelope) -> None:
@@ -394,10 +465,11 @@ class Bridge:
 
     async def _action_detach(self, channel: str, action: Envelope) -> None:
         runtime = self.channels[channel]
-        previous = runtime.binding
+        previous = self._require_binding(runtime, action)
         runtime.binding = None
         runtime.busy = False
         runtime.active_turn = None
+        runtime.settings = {"delivery": "queue", "approvalReviewer": "manual"}
         await self.state.set(channel, None)
         await self._emit(
             channel,
@@ -427,10 +499,11 @@ class Bridge:
         for key in {"model", "effort"} & action.data.keys():
             if not isinstance(action.data[key], str) or not action.data[key]:
                 raise ProtocolError(f"{key} must be a non-empty string")
-        binding = self._require_binding(runtime)
+        binding = self._require_binding(runtime, action)
         candidate = {**runtime.settings, **action.data}
         await self.backends[runtime.backend].configure_session(binding.session_id, candidate)
         runtime.settings = candidate
+        runtime.session_settings[binding.session_id] = dict(candidate)
         await self._emit(
             channel,
             "session.snapshot",
@@ -440,7 +513,7 @@ class Bridge:
 
     async def _action_prompt(self, channel: str, action: Envelope) -> None:
         runtime = self.channels[channel]
-        binding = self._require_binding(runtime)
+        binding = self._require_binding(runtime, action)
         text = self._content(action)
         if runtime.busy:
             if runtime.settings.get("delivery") == "steer":
@@ -464,7 +537,7 @@ class Bridge:
 
     async def _action_steer(self, channel: str, action: Envelope) -> None:
         runtime = self.channels[channel]
-        binding = self._require_binding(runtime)
+        binding = self._require_binding(runtime, action)
         if not runtime.busy:
             raise ValueError("session has no active turn")
         await self.backends[runtime.backend].steer(
@@ -473,7 +546,7 @@ class Bridge:
 
     async def _action_cancel(self, channel: str, action: Envelope) -> None:
         runtime = self.channels[channel]
-        binding = self._require_binding(runtime)
+        binding = self._require_binding(runtime, action)
         await self.backends[runtime.backend].cancel(binding.session_id, runtime.active_turn)
 
     async def _action_queue_edit(self, channel: str, action: Envelope) -> None:
@@ -504,7 +577,7 @@ class Bridge:
 
     async def _action_queue_clear(self, channel: str, action: Envelope) -> None:
         runtime = self.channels[channel]
-        binding = self._require_binding(runtime)
+        binding = self._require_binding(runtime, action)
         count = await self.state.clear_queue(channel, binding.session_id)
         await self._emit(
             channel,
@@ -734,6 +807,12 @@ class Bridge:
             runtime.observed_sessions.add(previous.session_id)
         runtime.observed_sessions.add(summary.id)
         runtime.binding = binding
+        runtime.settings = dict(
+            runtime.session_settings.get(
+                summary.id,
+                {"delivery": "queue", "approvalReviewer": "manual"},
+            )
+        )
         runtime.busy = summary.busy
         runtime.active_turn = summary.active_turn_id
         await self.state.set(channel, binding)
@@ -854,9 +933,16 @@ class Bridge:
         return True
 
     @staticmethod
-    def _require_binding(runtime: ChannelRuntime) -> ChannelBinding:
+    def _require_binding(
+        runtime: ChannelRuntime,
+        action: Envelope | None = None,
+    ) -> ChannelBinding:
         if runtime.binding is None:
             raise ValueError("no agent session is attached")
+        if action is not None and action.session_id is not None and (
+            action.session_id != runtime.binding.session_id
+        ):
+            raise ValueError("action targets a session that is no longer attached")
         return runtime.binding
 
     @staticmethod

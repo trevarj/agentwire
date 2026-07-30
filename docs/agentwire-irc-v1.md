@@ -141,6 +141,18 @@ Prompt and steer text is `data.content` and is capped at 64 KiB. `session.create
 move adds a zero-based `data.position`, and deletion uses `iid`. Approval responses use `rid` and
 boolean `data.allow`; question responses use `rid` and `data.answers`, an array aligned with the
 questions. Skipping is always explicit.
+When an action operating on the current binding supplies `sid`, the bridge MUST reject it if that
+session is no longer attached; it must never redirect a delayed action to a newer binding.
+
+`workspace.list.request` without data lists configured allowlisted roots. Supplying an absolute
+allowlisted directory as `data.parent` lists its immediate non-hidden child directories.
+`workspace.page.data.parent` echoes that directory or is null for the root page; every item has
+`path`, `name`, and `hasChildren`. Clients SHOULD lazy-load children when a directory expands and
+MAY use any returned path as `session.create.data.cwd` or `session.list.request.data.cwd`.
+`session.page.data.cwd` echoes the requested directory or is null for running-session discovery;
+`data.cursor` echoes the page cursor or is null for the first page.
+If `data.next` is non-null, clients request the next page by returning it as
+`session.list.request.data.cursor`; cursors are opaque to clients.
 
 Safe settings are `model`, `effort`, `collaboration`, `delivery`, and `approvalReviewer`.
 `collaboration` is `default` or `plan` and requires an explicit model. `delivery` is `queue` or
@@ -148,6 +160,17 @@ Safe settings are `model`, `effort`, `collaboration`, `delivery`, and `approvalR
 Auto-review keeps the configured interactive approval policy and sandbox and sets
 `approvalsReviewer=auto_review`; it MUST NOT silently use an approval policy equivalent to
 “never ask”. Clients SHOULD require one confirmation per session before first enabling it.
+The bridge keeps settings per session and MUST reset to safe defaults when binding a session that
+has not been configured during the current bridge run; in particular, `auto_review` MUST NOT carry
+across a session switch.
+
+`agent.hello.data.settingOptions` MAY advertise backend-sourced picker metadata for those safe
+settings. Its `model` member is an array of
+`{value, label, efforts, defaultEffort?, default?}` objects.
+Clients SHOULD use it for model selection and restrict effort selection to the chosen model's
+`efforts`; they MUST tolerate the member or the entire object being absent. The Codex bridge
+sources this catalog from app-server `model/list` with hidden models excluded. This object is
+discovery metadata only and does not change the strings accepted by `settings.update`.
 
 ## Events and client rendering
 

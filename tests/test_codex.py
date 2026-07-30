@@ -10,6 +10,47 @@ from agentwire.config import CodexConfig
 
 
 @pytest.mark.asyncio
+async def test_setting_options_are_sourced_from_paginated_model_catalog() -> None:
+    backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def request(method: str, params: dict[str, object]) -> dict[str, object]:
+        calls.append((method, params))
+        if len(calls) == 1:
+            return {
+                "data": [{
+                    "id": "gpt-5.6-sol",
+                    "model": "gpt-5.6-sol",
+                    "displayName": "GPT-5.6 Sol",
+                    "isDefault": True,
+                    "defaultReasoningEffort": "high",
+                    "supportedReasoningEfforts": [
+                        {"reasoningEffort": "medium", "description": "Fast"},
+                        {"reasoningEffort": "high", "description": "Deep"},
+                    ],
+                }],
+                "nextCursor": "next",
+            }
+        return {"data": [], "nextCursor": None}
+
+    backend._request = request  # type: ignore[method-assign]
+    options = await backend.setting_options()
+
+    assert calls == [
+        ("model/list", {"limit": 100, "includeHidden": False}),
+        ("model/list", {"limit": 100, "includeHidden": False, "cursor": "next"}),
+    ]
+    assert options == {"model": [{
+        "value": "gpt-5.6-sol",
+        "label": "GPT-5.6 Sol",
+        "efforts": ["medium", "high"],
+        "defaultEffort": "high",
+        "default": True,
+    }]}
+    assert await backend.setting_options() is options
+
+
+@pytest.mark.asyncio
 async def test_protocol_settings_map_auto_review_without_disabling_approvals() -> None:
     backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
     calls: list[tuple[str, dict[str, object]]] = []

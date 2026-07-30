@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -49,6 +49,7 @@ class FakeBackend(Backend):
         self.sent: list[tuple[str, str]] = []
         self.steered: list[tuple[str, str]] = []
         self.settings: dict[str, Any] = {}
+        self.sessions: list[SessionSummary] | None = None
         self._events: asyncio.Queue[BackendEvent] = asyncio.Queue()
 
     async def start(self) -> None: ...
@@ -65,7 +66,11 @@ class FakeBackend(Backend):
         return iterate()
 
     async def list_sessions(self, cwd: str) -> list[SessionSummary]:
-        return [SessionSummary("s1", cwd, "session")]
+        return (
+            self.sessions
+            if self.sessions is not None
+            else [SessionSummary("s1", cwd, "session")]
+        )
 
     async def list_running_sessions(self) -> list[SessionSummary]:
         return [SessionSummary("s1", self.workspace, "session")]
@@ -78,6 +83,16 @@ class FakeBackend(Backend):
 
     async def configure_session(self, session_id: str, settings: Any) -> None:
         self.settings = dict(settings)
+
+    async def setting_options(self) -> Mapping[str, Any]:
+        return {
+            "model": [{
+                "value": "gpt-test",
+                "label": "GPT Test",
+                "efforts": ["low", "high"],
+                "defaultEffort": "high",
+            }]
+        }
 
     async def send_message(self, session_id: str, text: str) -> str | None:
         self.sent.append((session_id, text))
@@ -134,8 +149,133 @@ async def test_topic_activates_harness_and_emits_bootstrap(tmp_path: Path) -> No
     await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex | Workspace")
     assert bridge.channels["#codex"].activation is not None
     assert [item[1].kind for item in irc.sent] == ["agent.hello", "channel.snapshot"]
+    assert irc.sent[0][1].data["settingOptions"]["model"][0]["value"] == "gpt-test"
     await bridge._handle_topic("#codex", "ordinary channel")
     assert bridge.channels["#codex"].activation is None
+
+
+@pytest.mark.asyncio
+async def test_workspace_pages_browse_allowlisted_directories(tmp_path: Path) -> None:
+    (tmp_path / "project-b").mkdir()
+    (tmp_path / "project-a").mkdir()
+    (tmp_path / ".hidden").mkdir()
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    irc.sent.clear()
+
+    root_action = new_envelope(
+        "workspace.list.request", "action", "client", epoch=bridge.epoch, device="phone"
+    )
+    await bridge._handle_action("#codex", root_action)
+    root_page = next(item[1] for item in irc.sent if item[1].kind == "workspace.page")
+    assert root_page.data == {
+        "parent": None,
+        "items": [{"path": str(tmp_path), "name": tmp_path.name, "hasChildren": True}],
+        "next": None,
+    }
+
+    irc.sent.clear()
+    child_action = new_envelope(
+        "workspace.list.request",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        data={"parent": str(tmp_path)},
+    )
+    await bridge._handle_action("#codex", child_action)
+    child_page = next(item[1] for item in irc.sent if item[1].kind == "workspace.page")
+    assert [item["name"] for item in child_page.data["items"]] == ["project-a", "project-b"]
+    assert child_page.data["parent"] == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_session_pages_echo_workspace_and_continue_with_cursor(tmp_path: Path) -> None:
+    bridge, irc, backend = make_bridge(tmp_path)
+    backend.sessions = [
+        SessionSummary(f"s{index}", str(tmp_path), f"Session {index}")
+        for index in range(101)
+    ]
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    irc.sent.clear()
+
+    first = new_envelope(
+        "session.list.request",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        data={"cwd": str(tmp_path)},
+    )
+    await bridge._handle_action("#codex", first)
+    first_page = next(item[1] for item in irc.sent if item[1].kind == "session.page")
+    assert first_page.data["cwd"] == str(tmp_path)
+    assert first_page.data["cursor"] is None
+    assert len(first_page.data["items"]) == 100
+    assert first_page.data["next"] == "100"
+
+    irc.sent.clear()
+    second = new_envelope(
+        "session.list.request",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        data={"cwd": str(tmp_path), "cursor": "100"},
+    )
+    await bridge._handle_action("#codex", second)
+    second_page = next(item[1] for item in irc.sent if item[1].kind == "session.page")
+    assert second_page.data["cursor"] == "100"
+    assert len(second_page.data["items"]) == 1
+    assert second_page.data["next"] is None
+
+
+@pytest.mark.asyncio
+async def test_settings_are_isolated_per_bound_session(tmp_path: Path) -> None:
+    bridge, irc, backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._set_binding("#codex", SessionSummary("s1", str(tmp_path), "First"))
+    update = new_envelope(
+        "settings.update",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        session_id="s1",
+        data={"model": "gpt-test", "approvalReviewer": "auto_review"},
+    )
+    await bridge._handle_action("#codex", update)
+    assert backend.settings["approvalReviewer"] == "auto_review"
+
+    await bridge._set_binding("#codex", SessionSummary("s2", str(tmp_path), "Second"))
+    assert bridge.channels["#codex"].settings == {
+        "delivery": "queue",
+        "approvalReviewer": "manual",
+    }
+    await bridge._set_binding("#codex", SessionSummary("s1", str(tmp_path), "First"))
+    assert bridge.channels["#codex"].settings["approvalReviewer"] == "auto_review"
+
+
+@pytest.mark.asyncio
+async def test_stale_session_action_cannot_target_new_binding(tmp_path: Path) -> None:
+    bridge, irc, backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._set_binding("#codex", SessionSummary("s2", str(tmp_path), "Second"))
+    irc.sent.clear()
+    stale = new_envelope(
+        "turn.prompt",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        session_id="s1",
+        data={"content": "wrong session"},
+    )
+
+    await bridge._handle_action("#codex", stale)
+
+    assert backend.sent == []
+    assert [item[1].kind for item in irc.sent] == ["action.accepted", "action.failed"]
 
 
 @pytest.mark.asyncio

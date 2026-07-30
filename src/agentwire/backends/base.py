@@ -41,6 +41,10 @@ class Backend(abc.ABC):
     async def session_busy(self, session_id: str) -> bool | None:
         return None
 
+    async def setting_options(self) -> Mapping[str, Any]:
+        """Return optional picker metadata for advertised safe settings."""
+        return {}
+
     async def configure_session(self, session_id: str, settings: Mapping[str, Any]) -> None:
         unsupported = {
             key
