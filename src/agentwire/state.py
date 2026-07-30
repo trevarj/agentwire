@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from agentwire.models import ChannelBinding
-from agentwire.protocol import Envelope, encode_envelope
+from agentwire.protocol import HISTORY_EVENT_KINDS, Envelope, encode_envelope
 
 
 @dataclass(slots=True, frozen=True)
@@ -276,12 +276,21 @@ class StateStore:
 
     def _history(self, channel: str, before_at: int | None, limit: int) -> list[str]:
         cutoff = before_at if before_at is not None else _now_ms() + 1
+        history_kinds = tuple(sorted(HISTORY_EVENT_KINDS))
+        placeholders = ", ".join("?" for _ in history_kinds)
         with self._connect() as database:
             rows = database.execute(
-                """SELECT payload FROM events
-                   WHERE channel = ? AND at < ? AND at >= ?
+                f"""SELECT payload FROM events
+                   WHERE channel = ? AND kind IN ({placeholders})
+                   AND at < ? AND at >= ?
                    ORDER BY at DESC, sequence DESC LIMIT ?""",
-                (channel, cutoff, _now_ms() - 30 * 24 * 60 * 60 * 1000, limit),
+                (
+                    channel,
+                    *history_kinds,
+                    cutoff,
+                    _now_ms() - 30 * 24 * 60 * 60 * 1000,
+                    limit,
+                ),
             ).fetchall()
         payloads = [str(row[0]) for row in reversed(rows)]
         total = 0

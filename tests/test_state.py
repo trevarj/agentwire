@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from agentwire.models import ChannelBinding
-from agentwire.protocol import new_envelope
+from agentwire.protocol import decode_envelope, new_envelope
 from agentwire.state import StateStore
 
 
@@ -67,10 +67,15 @@ async def test_event_history_is_oldest_first_and_marked_by_caller(tmp_path: Path
     now = int(time.time() * 1000)
     first = new_envelope("turn.started", "event", "agent", at=now - 2)
     second = new_envelope("turn.completed", "event", "agent", at=now - 1)
+    control = new_envelope("channel.snapshot", "event", "agent", at=now)
     await store.append_event("#c", first)
     await store.append_event("#c", second)
+    await store.append_event("#c", control)
     payloads = await store.history("#c", before_at=now + 1)
-    assert ["turn.started" in item for item in payloads] == [True, False]
+    assert [decode_envelope(item).kind for item in payloads] == [
+        "turn.started",
+        "turn.completed",
+    ]
 
 
 @pytest.mark.asyncio

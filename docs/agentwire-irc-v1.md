@@ -114,8 +114,11 @@ in `reply`. Clients MUST NOT automatically retry merely because an acknowledgeme
 Actions are deduplicated durably by UUID; a duplicate produces the known status without invoking
 the backend again.
 
-`history.request` reads Agentwire's journal, not arbitrary IRC messages. A page is bounded by 200
-events, 512 KiB, and 30 days and is enclosed by `history.begin` and `history.end`. Replayed events
+`history.request` reads Agentwire's journal, not arbitrary IRC messages. It replays only transcript
+and request lifecycle events: turn, assistant, plan, tool, usage, request, and approval-review events.
+Sync snapshots, discovery pages, action acknowledgements, queue events, and binding/status events are
+live state and MUST NOT appear in history pages. A page is bounded by 200 events, 512 KiB, and 30 days
+and is enclosed by `history.begin` and `history.end`. Replayed events
 carry `hist:true`. IRC message edits affect only readable transcript text; harness state and
 Agentwire journal records are immutable.
 

@@ -83,6 +83,27 @@ EVENT_KINDS = frozenset(
     }
 )
 
+# Only durable transcript and request lifecycle events belong in history replay.
+# Discovery, snapshots, acknowledgements, and queue state are rebuilt by sync.
+HISTORY_EVENT_KINDS = frozenset(
+    {
+        "turn.started",
+        "turn.completed",
+        "turn.failed",
+        "assistant.delta",
+        "assistant.completed",
+        "plan.updated",
+        "tool.started",
+        "tool.updated",
+        "tool.completed",
+        "usage.updated",
+        "request.opened",
+        "request.resolved",
+        "approval.review.started",
+        "approval.review.completed",
+    }
+)
+
 VISIBLE_EVENT_KINDS = frozenset(
     {
         "binding.changed",

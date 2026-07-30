@@ -14,6 +14,7 @@ from agentwire.config import Config, ConfigError, resolve_workspace
 from agentwire.irc import IRCClient
 from agentwire.models import BackendEvent, ChannelBinding, Question, SessionSummary
 from agentwire.protocol import (
+    HISTORY_EVENT_KINDS,
     PROTOCOL_TAG,
     Envelope,
     ProtocolError,
@@ -890,7 +891,7 @@ class Bridge:
         reply: str | None = None,
         data: dict[str, Any] | None = None,
         preview: str | None = None,
-        journal: bool = True,
+        journal: bool | None = None,
     ) -> Envelope:
         envelope = new_envelope(
             kind,
@@ -904,7 +905,8 @@ class Bridge:
             reply=reply,
             data=data or {},
         )
-        if journal:
+        should_journal = kind in HISTORY_EVENT_KINDS if journal is None else journal
+        if should_journal:
             await self.state.append_event(channel, envelope)
         await self.irc.send_protocol(channel, envelope, preview)
         return envelope

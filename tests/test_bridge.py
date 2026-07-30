@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -152,6 +153,19 @@ async def test_topic_activates_harness_and_emits_bootstrap(tmp_path: Path) -> No
     assert irc.sent[0][1].data["settingOptions"]["model"][0]["value"] == "gpt-test"
     await bridge._handle_topic("#codex", "ordinary channel")
     assert bridge.channels["#codex"].activation is None
+
+
+@pytest.mark.asyncio
+async def test_only_replayable_events_are_journaled(tmp_path: Path) -> None:
+    bridge, _irc, _backend = make_bridge(tmp_path)
+    append_event = AsyncMock()
+    bridge.state.append_event = append_event
+
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    append_event.assert_not_awaited()
+
+    await bridge._emit("#codex", "turn.started")
+    append_event.assert_awaited_once()
 
 
 @pytest.mark.asyncio
