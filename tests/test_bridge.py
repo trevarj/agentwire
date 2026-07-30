@@ -20,7 +20,14 @@ from agentwire.config import (
     SecretsConfig,
     StackConfig,
 )
-from agentwire.models import BackendEvent, ChannelBinding, Question, SessionOutput, SessionSummary
+from agentwire.models import (
+    BackendEvent,
+    ChannelBinding,
+    Question,
+    SessionActivity,
+    SessionOutput,
+    SessionSummary,
+)
 from agentwire.protocol import new_envelope
 
 
@@ -68,9 +75,7 @@ class FakeBackend(Backend):
 
     async def list_sessions(self, cwd: str) -> list[SessionSummary]:
         return (
-            self.sessions
-            if self.sessions is not None
-            else [SessionSummary("s1", cwd, "session")]
+            self.sessions if self.sessions is not None else [SessionSummary("s1", cwd, "session")]
         )
 
     async def list_running_sessions(self) -> list[SessionSummary]:
@@ -87,12 +92,14 @@ class FakeBackend(Backend):
 
     async def setting_options(self) -> Mapping[str, Any]:
         return {
-            "model": [{
-                "value": "gpt-test",
-                "label": "GPT Test",
-                "efforts": ["low", "high"],
-                "defaultEffort": "high",
-            }]
+            "model": [
+                {
+                    "value": "gpt-test",
+                    "label": "GPT Test",
+                    "efforts": ["low", "high"],
+                    "defaultEffort": "high",
+                }
+            ]
         }
 
     async def send_message(self, session_id: str, text: str) -> str | None:
@@ -207,8 +214,7 @@ async def test_workspace_pages_browse_allowlisted_directories(tmp_path: Path) ->
 async def test_session_pages_echo_workspace_and_continue_with_cursor(tmp_path: Path) -> None:
     bridge, irc, backend = make_bridge(tmp_path)
     backend.sessions = [
-        SessionSummary(f"s{index}", str(tmp_path), f"Session {index}")
-        for index in range(101)
+        SessionSummary(f"s{index}", str(tmp_path), f"Session {index}") for index in range(101)
     ]
     await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
     irc.sent.clear()
@@ -289,6 +295,15 @@ async def test_binding_emits_redacted_recent_session_context(tmp_path: Path) -> 
                 SessionOutput("i1", "t1", "First recovered output", "final"),
                 SessionOutput("i2", "t2", "API_TOKEN=abcdefghijklmno", "commentary"),
             ),
+            recent_activity=(
+                SessionActivity(
+                    "tool_started",
+                    "tool-1",
+                    "t2",
+                    "shell",
+                    data={"label": "$ git status --short", "input": "git status --short"},
+                ),
+            ),
         ),
     )
 
@@ -315,6 +330,61 @@ async def test_binding_emits_redacted_recent_session_context(tmp_path: Path) -> 
             "content": "Output omitted from IRC because it may contain a secret",
             "omitted": True,
         },
+    ]
+    assert snapshot.data["recentActivity"] == [
+        {
+            "kind": "tool.started",
+            "iid": "tool-1",
+            "tid": "t2",
+            "data": {
+                "id": "tool-1",
+                "kind": "shell",
+                "success": None,
+                "label": "$ git status --short",
+                "input": "git status --short",
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_attach_defers_live_events_until_after_the_session_snapshot(tmp_path: Path) -> None:
+    bridge, irc, backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    irc.sent.clear()
+
+    async def attach(session_id: str, cwd: str | None = None) -> SessionSummary:
+        await bridge._handle_backend_event(
+            "#codex",
+            BackendEvent(
+                kind="tool_started",
+                backend="codex",
+                session_id=session_id,
+                turn_id="turn-1",
+                item_id="tool-1",
+                tool_kind="shell",
+                data={"label": "$ make test"},
+            ),
+        )
+        return SessionSummary(session_id, cwd or str(tmp_path), "Running", busy=True)
+
+    backend.attach_session = attach  # type: ignore[method-assign]
+    action = new_envelope(
+        "session.attach",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        session_id="s1",
+        data={"cwd": str(tmp_path)},
+    )
+    await bridge._action_attach("#codex", action)
+
+    assert [item[1].kind for item in irc.sent] == [
+        "binding.changed",
+        "session.snapshot",
+        "channel.snapshot",
+        "tool.started",
     ]
 
 

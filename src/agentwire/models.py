@@ -29,6 +29,16 @@ class SessionOutput:
 
 
 @dataclass(slots=True, frozen=True)
+class SessionActivity:
+    kind: Literal["tool_started", "tool_finished"]
+    item_id: str
+    turn_id: str | None
+    tool_kind: str
+    success: bool | None = None
+    data: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True, frozen=True)
 class SessionSummary:
     id: str
     cwd: str
@@ -36,10 +46,12 @@ class SessionSummary:
     updated_at: float = 0
     busy: bool = False
     active_flags: tuple[str, ...] = ()
+    tui_attached: bool = False
     active_turn_id: str | None = None
     last_output: str | None = None
     last_reply: str | None = None
     recent_outputs: tuple[SessionOutput, ...] = ()
+    recent_activity: tuple[SessionActivity, ...] = ()
 
 
 @dataclass(slots=True, frozen=True)

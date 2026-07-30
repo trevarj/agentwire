@@ -59,6 +59,8 @@ class ChannelRuntime:
     session_settings: dict[str, dict[str, Any]] = field(default_factory=dict)
     requests: dict[str, PendingRequest] = field(default_factory=dict)
     observed_sessions: set[str] = field(default_factory=set)
+    attaching_session: str | None = None
+    deferred_events: list[BackendEvent] = field(default_factory=list)
 
 
 class Bridge:
@@ -459,10 +461,22 @@ class Bridge:
             if cwd_value
             else None
         )
-        summary = await self.backends[runtime.backend].attach_session(session_id, cwd)
-        if not self._workspace_allowed(summary.cwd):
-            raise ConfigError("session workspace is outside allowed roots")
-        await self._set_binding(channel, summary)
+        runtime.attaching_session = session_id
+        runtime.deferred_events.clear()
+        try:
+            summary = await self.backends[runtime.backend].attach_session(session_id, cwd)
+            if not self._workspace_allowed(summary.cwd):
+                raise ConfigError("session workspace is outside allowed roots")
+            await self._set_binding(channel, summary)
+            deferred = list(runtime.deferred_events)
+        except Exception:
+            runtime.deferred_events.clear()
+            raise
+        finally:
+            runtime.attaching_session = None
+        runtime.deferred_events.clear()
+        for event in deferred:
+            await self._handle_backend_event(channel, event)
 
     async def _action_detach(self, channel: str, action: Envelope) -> None:
         runtime = self.channels[channel]
@@ -639,6 +653,9 @@ class Bridge:
     async def _handle_backend_event(self, channel: str, event: BackendEvent) -> None:
         runtime = self.channels[channel]
         if runtime.activation is None:
+            return
+        if runtime.attaching_session == event.session_id:
+            runtime.deferred_events.append(event)
             return
         selected = runtime.binding is not None and runtime.binding.session_id == event.session_id
         if not selected:
@@ -939,6 +956,7 @@ class Bridge:
                 if runtime.backend == backend
                 and (
                     (runtime.binding is not None and runtime.binding.session_id == session_id)
+                    or runtime.attaching_session == session_id
                     or session_id in runtime.observed_sessions
                 )
             ),
@@ -959,8 +977,10 @@ class Bridge:
     ) -> ChannelBinding:
         if runtime.binding is None:
             raise ValueError("no agent session is attached")
-        if action is not None and action.session_id is not None and (
-            action.session_id != runtime.binding.session_id
+        if (
+            action is not None
+            and action.session_id is not None
+            and (action.session_id != runtime.binding.session_id)
         ):
             raise ValueError("action targets a session that is no longer attached")
         return runtime.binding
@@ -1016,6 +1036,7 @@ class Bridge:
             "updatedAt": session.updated_at,
             "busy": session.busy,
             "flags": list(session.active_flags),
+            "tuiAttached": session.tui_attached,
         }
 
     @staticmethod
@@ -1038,17 +1059,35 @@ class Bridge:
             if output.phase:
                 item["phase"] = output.phase
             recent_outputs.append(item)
-        status = (
-            "waiting"
-            if session.active_flags
-            else "running" if session.busy else "ready"
-        )
+        recent_activity: list[dict[str, Any]] = []
+        for activity in session.recent_activity[-6:]:
+            event = BackendEvent(
+                kind=activity.kind,
+                backend="codex",
+                session_id=session.id,
+                turn_id=activity.turn_id,
+                item_id=activity.item_id,
+                tool_kind=activity.tool_kind,
+                success=activity.success,
+                data=activity.data,
+            )
+            item = {
+                "kind": "tool.started" if activity.kind == "tool_started" else "tool.completed",
+                "iid": activity.item_id,
+                "data": Bridge._safe_tool_data(event),
+            }
+            if activity.turn_id:
+                item["tid"] = activity.turn_id
+            recent_activity.append(item)
+        status = "waiting" if session.active_flags else "running" if session.busy else "ready"
         return {
             "cwd": session.cwd,
             "busy": session.busy,
             "flags": list(session.active_flags),
+            "tuiAttached": session.tui_attached,
             "status": status,
             "recentOutputs": recent_outputs,
+            "recentActivity": recent_activity,
         }
 
     @staticmethod

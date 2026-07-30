@@ -153,7 +153,9 @@ allowlisted directory as `data.parent` lists its immediate non-hidden child dire
 `path`, `name`, and `hasChildren`. Clients SHOULD lazy-load children when a directory expands and
 MAY use any returned path as `session.create.data.cwd` or `session.list.request.data.cwd`.
 `session.page.data.cwd` echoes the requested directory or is null for running-session discovery;
-`data.cursor` echoes the page cursor or is null for the first page.
+each session item includes `busy`, runtime `flags`, and `tuiAttached`, which is true only when
+Agentwire can identify that exact thread in a live TUI. `data.cursor` echoes the page cursor or is
+null for the first page.
 If `data.next` is non-null, clients request the next page by returning it as
 `session.list.request.data.cursor`; cursors are opaque to clients.
 
@@ -209,9 +211,11 @@ boundary and clear activity from the previous binding. For Codex, `session.snaps
 `status` (`ready`, `running`, or `waiting`) and `recentOutputs`: up to three chronological
 `{iid, tid?, phase?, content, omitted}` objects recovered from the resumed thread. Each recovered
 output is limited to 4096 UTF-8 bytes and is wholly replaced when high-confidence secret material
-is detected. Clients SHOULD render those outputs as restored session context, or render `status`
-when the list is empty. Settings-only `session.snapshot` events omit `recentOutputs` and do not
-replace the timeline.
+is detected. An in-progress Codex turn also includes `recentActivity`: up to six chronological
+`{kind, iid, tid?, data}` tool items recovered from the active app-server thread, using the same
+safe metadata allowlist as live tool events. Clients SHOULD render those outputs and tool items as
+restored session context, or render `status` when both lists are empty. Settings-only
+`session.snapshot` events omit both lists and do not replace the timeline.
 
 Queues are per channel and session, durable, ordered, and limited to 10 items by default. A busy
 prompt queues or steers according to the session delivery setting. Canceling a turn does not

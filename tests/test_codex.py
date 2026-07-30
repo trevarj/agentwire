@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import pytest
 
-from agentwire.backends.codex import CodexBackend
+from agentwire.backends.codex import CodexBackend, CodexTuiSessionPresence
 from agentwire.config import CodexConfig
+from agentwire.stack import _CodexTuiRelayTracker
 
 
 @pytest.mark.asyncio
@@ -18,17 +18,19 @@ async def test_setting_options_are_sourced_from_paginated_model_catalog() -> Non
         calls.append((method, params))
         if len(calls) == 1:
             return {
-                "data": [{
-                    "id": "gpt-5.6-sol",
-                    "model": "gpt-5.6-sol",
-                    "displayName": "GPT-5.6 Sol",
-                    "isDefault": True,
-                    "defaultReasoningEffort": "high",
-                    "supportedReasoningEfforts": [
-                        {"reasoningEffort": "medium", "description": "Fast"},
-                        {"reasoningEffort": "high", "description": "Deep"},
-                    ],
-                }],
+                "data": [
+                    {
+                        "id": "gpt-5.6-sol",
+                        "model": "gpt-5.6-sol",
+                        "displayName": "GPT-5.6 Sol",
+                        "isDefault": True,
+                        "defaultReasoningEffort": "high",
+                        "supportedReasoningEfforts": [
+                            {"reasoningEffort": "medium", "description": "Fast"},
+                            {"reasoningEffort": "high", "description": "Deep"},
+                        ],
+                    }
+                ],
                 "nextCursor": "next",
             }
         return {"data": [], "nextCursor": None}
@@ -40,13 +42,17 @@ async def test_setting_options_are_sourced_from_paginated_model_catalog() -> Non
         ("model/list", {"limit": 100, "includeHidden": False}),
         ("model/list", {"limit": 100, "includeHidden": False, "cursor": "next"}),
     ]
-    assert options == {"model": [{
-        "value": "gpt-5.6-sol",
-        "label": "GPT-5.6 Sol",
-        "efforts": ["medium", "high"],
-        "defaultEffort": "high",
-        "default": True,
-    }]}
+    assert options == {
+        "model": [
+            {
+                "value": "gpt-5.6-sol",
+                "label": "GPT-5.6 Sol",
+                "efforts": ["medium", "high"],
+                "defaultEffort": "high",
+                "default": True,
+            }
+        ]
+    }
     assert await backend.setting_options() is options
 
 
@@ -87,30 +93,70 @@ async def test_protocol_settings_map_auto_review_without_disabling_approvals() -
     assert "approvalPolicy" not in params
 
 
-def _fake_process(proc_root: Path, pid: int, cwd: Path, *arguments: str) -> None:
+def _fake_process(proc_root: Path, pid: int, *arguments: str) -> None:
     process = proc_root / str(pid)
     process.mkdir()
     (process / "cmdline").write_bytes(b"\0".join(item.encode() for item in arguments) + b"\0")
-    os.symlink(cwd, process / "cwd")
 
 
-def test_live_codex_processes_find_new_and_resumed_sessions(tmp_path: Path) -> None:
+def _fake_process_stat(proc_root: Path, pid: int, start_time: str) -> None:
+    process = proc_root / str(pid)
+    process.mkdir(exist_ok=True)
+    fields = ["S", *("0" for _ in range(18)), start_time]
+    (process / "stat").write_text(f"{pid} (agentwire) {' '.join(fields)}\n", encoding="utf-8")
+
+
+def test_explicit_codex_sessions_only_accept_resumed_session_ids(tmp_path: Path) -> None:
     proc_root = tmp_path / "proc"
     proc_root.mkdir()
-    first = tmp_path / "first"
-    second = tmp_path / "second"
-    first.mkdir()
-    second.mkdir()
-    _fake_process(proc_root, 10, first, "/bin/codex")
-    _fake_process(proc_root, 11, first, "/bin/codex")
-    _fake_process(proc_root, 12, second, "/bin/codex", "resume", "thread-12")
-    _fake_process(proc_root, 13, second, "/bin/codex", "app-server")
-    _fake_process(proc_root, 14, second, "/bin/not-codex")
+    _fake_process(proc_root, 10, "/bin/codex")
+    _fake_process(proc_root, 12, "/bin/codex", "resume", "thread-12")
+    _fake_process(proc_root, 13, "/bin/codex", "app-server")
+    _fake_process(proc_root, 14, "/bin/not-codex", "resume", "thread-14")
 
-    explicit, workspaces = CodexBackend._live_codex_processes(proc_root)
+    explicit = CodexBackend._explicit_codex_sessions(proc_root)
 
     assert explicit == {"thread-12"}
-    assert workspaces == {str(first): 2}
+
+
+def test_tui_presence_tracks_exact_session_and_removes_stale_process(tmp_path: Path) -> None:
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    _fake_process_stat(proc_root, 42, "100")
+    socket_path = tmp_path / "runtime" / "codex.sock"
+    presence = CodexTuiSessionPresence(socket_path, pid=42, proc_root=proc_root)
+
+    presence.update("thread-42")
+    assert CodexTuiSessionPresence.sessions(socket_path, proc_root) == {"thread-42"}
+
+    _fake_process_stat(proc_root, 42, "101")
+    assert CodexTuiSessionPresence.sessions(socket_path, proc_root) == set()
+    assert not presence.path.exists()
+
+
+def test_tui_relay_tracks_thread_switches_and_disconnect() -> None:
+    updates: list[str | None] = []
+
+    class Presence:
+        def update(self, session_id: str | None) -> None:
+            updates.append(session_id)
+
+        def clear(self) -> None:
+            updates.append(None)
+
+    tracker = _CodexTuiRelayTracker(Presence())  # type: ignore[arg-type]
+    tracker.client_message('{"id":7,"method":"thread/resume","params":{"threadId":"thread-old"}}')
+    tracker.server_message('{"id":7,"result":{"thread":{"id":"thread-current"}}}')
+    assert tracker.current_session == "thread-current"
+
+    tracker.client_message(
+        '{"id":8,"method":"thread/unsubscribe","params":{"threadId":"thread-current"}}'
+    )
+    tracker.server_message('{"id":8,"result":{"status":"unsubscribed"}}')
+    tracker.server_message('{"method":"thread/started","params":{"thread":{"id":"thread-next"}}}')
+    tracker.close()
+
+    assert updates == ["thread-current", None, "thread-next", None]
 
 
 def test_rollout_busy_tracks_latest_task_boundary(tmp_path: Path) -> None:
@@ -408,6 +454,26 @@ async def test_attach_recovers_active_turn() -> None:
     backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
 
     async def request(method: str, params: dict[str, object]) -> object:
+        if method == "thread/items/list":
+            assert params == {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "limit": 50,
+                "sortDirection": "desc",
+            }
+            return {
+                "data": [
+                    {
+                        "turnId": "turn-1",
+                        "item": {
+                            "id": "tool-1",
+                            "type": "commandExecution",
+                            "command": "git status --short",
+                            "status": "inProgress",
+                        },
+                    }
+                ]
+            }
         assert method == "thread/resume"
         assert params["initialTurnsPage"] == {
             "limit": 3,
@@ -450,6 +516,9 @@ async def test_attach_recovers_active_turn() -> None:
     assert summary.last_reply is None
     assert [output.text for output in summary.recent_outputs] == [
         "Checking the remaining protocol events."
+    ]
+    assert [(item.kind, item.item_id, item.tool_kind) for item in summary.recent_activity] == [
+        ("tool_started", "tool-1", "shell")
     ]
     assert backend._active_turns == {"thread-1": "turn-1"}
 
@@ -543,7 +612,7 @@ async def test_running_sessions_paginates_and_filters_active_threads() -> None:
 
 
 @pytest.mark.asyncio
-async def test_running_sessions_include_threads_with_live_codex_processes(
+async def test_running_sessions_include_exact_tui_presence_without_workspace_guessing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
@@ -560,11 +629,41 @@ async def test_running_sessions_include_threads_with_live_codex_processes(
 
     monkeypatch.setattr(
         CodexBackend,
-        "_live_codex_processes",
-        staticmethod(lambda: ({"resumed"}, {"/workspace": 1})),
+        "_explicit_codex_sessions",
+        staticmethod(lambda: {"resumed"}),
+    )
+    monkeypatch.setattr(
+        CodexTuiSessionPresence,
+        "sessions",
+        staticmethod(lambda _socket_path: {"old"}),
     )
     backend._request = request  # type: ignore[method-assign]
 
     sessions = await backend.list_running_sessions()
 
-    assert [session.id for session in sessions] == ["newest", "resumed"]
+    assert [session.id for session in sessions] == ["resumed", "old"]
+    assert [session.tui_attached for session in sessions] == [True, True]
+
+
+@pytest.mark.asyncio
+async def test_workspace_session_page_preserves_exact_tui_presence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
+
+    async def request(method: str, params: dict[str, object]) -> object:
+        assert method == "thread/list"
+        assert params["cwd"] == "/workspace"
+        return {
+            "data": [
+                {"id": "tui", "cwd": "/workspace", "status": {"type": "idle"}},
+                {"id": "stored", "cwd": "/workspace", "status": {"type": "idle"}},
+            ]
+        }
+
+    monkeypatch.setattr(backend, "_tui_session_ids", lambda: {"tui"})
+    backend._request = request  # type: ignore[method-assign]
+
+    sessions = await backend.list_sessions("/workspace")
+
+    assert [session.tui_attached for session in sessions] == [True, False]

@@ -5,9 +5,11 @@ import contextlib
 import json
 import os
 import re
+import secrets
+import tempfile
 import time
-from collections import Counter
 from collections.abc import AsyncIterator, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +17,99 @@ import aiohttp
 
 from agentwire.backends.base import Backend, BackendError
 from agentwire.config import CodexConfig
-from agentwire.models import BackendEvent, Question, SessionOutput, SessionSummary
+from agentwire.models import (
+    BackendEvent,
+    Question,
+    SessionActivity,
+    SessionOutput,
+    SessionSummary,
+)
 from agentwire.text import safe_one_line, truncate_utf8
+
+
+def _process_start_time(pid: int, proc_root: Path = Path("/proc")) -> str | None:
+    """Return Linux's stable process start tick without trusting a reused PID."""
+    try:
+        fields = (proc_root / str(pid) / "stat").read_text(encoding="utf-8").rsplit(") ", 1)[1]
+        return fields.split()[19]
+    except (IndexError, OSError):
+        return None
+
+
+class CodexTuiSessionPresence:
+    """Publish one Agentwire-launched TUI's exact current Codex thread."""
+
+    def __init__(
+        self,
+        socket_path: Path,
+        pid: int | None = None,
+        proc_root: Path = Path("/proc"),
+    ) -> None:
+        self.pid = pid if pid is not None else os.getpid()
+        self.proc_root = proc_root
+        self.directory = socket_path.parent / "tui-presence"
+        self.path = self.directory / f"{self.pid}-{secrets.token_hex(8)}.json"
+        self.start_time = _process_start_time(self.pid, proc_root)
+
+    def update(self, session_id: str | None) -> None:
+        if not session_id:
+            self.clear()
+            return
+        self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.directory, 0o700)
+        payload = {
+            "pid": self.pid,
+            "startTime": self.start_time,
+            "sessionId": session_id,
+        }
+        descriptor, temp_name = tempfile.mkstemp(prefix=".presence-", dir=self.directory)
+        temp = Path(temp_name)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"))
+                handle.write("\n")
+            os.chmod(temp, 0o600)
+            os.replace(temp, self.path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                temp.unlink()
+
+    def clear(self) -> None:
+        with contextlib.suppress(FileNotFoundError):
+            self.path.unlink()
+
+    @staticmethod
+    def sessions(
+        socket_path: Path,
+        proc_root: Path = Path("/proc"),
+    ) -> set[str]:
+        directory = socket_path.parent / "tui-presence"
+        sessions: set[str] = set()
+        try:
+            records = tuple(directory.glob("*.json"))
+        except OSError:
+            return sessions
+        for record in records:
+            valid = False
+            try:
+                payload = json.loads(record.read_text(encoding="utf-8"))
+                pid = int(payload["pid"])
+                session_id = str(payload["sessionId"])
+                current_start = _process_start_time(pid, proc_root)
+                recorded_start = payload.get("startTime")
+                valid = bool(
+                    session_id
+                    and current_start is not None
+                    and (recorded_start is None or current_start == str(recorded_start))
+                )
+                if valid:
+                    sessions.add(session_id)
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+            if not valid:
+                with contextlib.suppress(OSError):
+                    record.unlink()
+        return sessions
 
 
 class CodexBackend(Backend):
@@ -625,7 +718,8 @@ class CodexBackend(Backend):
             if not isinstance(item, dict):
                 continue
             sessions.append(self._summary(item))
-        return sessions
+        tui_sessions = self._tui_session_ids()
+        return [replace(session, tui_attached=session.id in tui_sessions) for session in sessions]
 
     async def list_running_sessions(self) -> list[SessionSummary]:
         sessions: list[SessionSummary] = []
@@ -646,16 +740,19 @@ class CodexBackend(Backend):
             if not cursor:
                 break
 
-        explicit_ids, workspace_counts = self._live_codex_processes()
+        explicit_ids = self._tui_session_ids()
         selected = {session.id for session in sessions if session.busy}
         selected.update(explicit_ids)
-        for cwd, count in workspace_counts.items():
-            matches = (
-                session for session in sessions if session.cwd == cwd and session.id not in selected
-            )
-            for session in list(matches)[:count]:
-                selected.add(session.id)
-        return [session for session in sessions if session.id in selected]
+        return [
+            replace(session, tui_attached=session.id in explicit_ids)
+            for session in sessions
+            if session.id in selected
+        ]
+
+    def _tui_session_ids(self) -> set[str]:
+        sessions = self._explicit_codex_sessions()
+        sessions.update(CodexTuiSessionPresence.sessions(self.config.socket_path))
+        return sessions
 
     async def session_busy(self, session_id: str) -> bool | None:
         return self._rollout_busy(session_id)
@@ -696,15 +793,14 @@ class CodexBackend(Backend):
         return None
 
     @staticmethod
-    def _live_codex_processes(
+    def _explicit_codex_sessions(
         proc_root: Path = Path("/proc"),
-    ) -> tuple[set[str], Counter[str]]:
+    ) -> set[str]:
         explicit_ids: set[str] = set()
-        workspace_counts: Counter[str] = Counter()
         try:
             processes = tuple(proc_root.iterdir())
         except OSError:
-            return explicit_ids, workspace_counts
+            return explicit_ids
         for process in processes:
             if not process.name.isdigit():
                 continue
@@ -722,12 +818,9 @@ class CodexBackend(Backend):
                     position = arguments.index("resume")
                     if position + 1 < len(arguments):
                         explicit_ids.add(arguments[position + 1])
-                        continue
-                workspace = str((process / "cwd").resolve(strict=True))
             except (OSError, ValueError):
                 continue
-            workspace_counts[workspace] += 1
-        return explicit_ids, workspace_counts
+        return explicit_ids
 
     async def create_session(self, cwd: str) -> SessionSummary:
         result = await self._request(
@@ -767,6 +860,11 @@ class CodexBackend(Backend):
         )
         if active_turn_id:
             self._active_turns[session_id] = active_turn_id
+        recent_activity = await self._active_turn_activity(
+            session_id,
+            active_turn_id,
+            turns,
+        )
         recent_outputs: list[SessionOutput] = []
         for turn in reversed(turns):
             if not isinstance(turn, dict):
@@ -814,11 +912,75 @@ class CodexBackend(Backend):
             updated_at=summary.updated_at,
             busy=summary.busy,
             active_flags=summary.active_flags,
+            tui_attached=session_id in self._tui_session_ids(),
             active_turn_id=active_turn_id,
             last_output=last_output,
             last_reply=last_reply,
             recent_outputs=tuple(recent_outputs),
+            recent_activity=tuple(recent_activity),
         )
+
+    async def _active_turn_activity(
+        self,
+        session_id: str,
+        active_turn_id: str | None,
+        resumed_turns: list[Any],
+    ) -> list[SessionActivity]:
+        if not active_turn_id:
+            return []
+        items: list[dict[str, Any]] = []
+        try:
+            result = await self._request(
+                "thread/items/list",
+                {
+                    "threadId": session_id,
+                    "turnId": active_turn_id,
+                    "limit": 50,
+                    "sortDirection": "desc",
+                },
+            )
+            for entry in reversed((result or {}).get("data") or []):
+                item = entry.get("item") if isinstance(entry, dict) else None
+                if isinstance(item, dict):
+                    items.append(item)
+        except BackendError:
+            # Older app-server builds can still return current in-memory items on resume.
+            active_turn = next(
+                (
+                    turn
+                    for turn in resumed_turns
+                    if isinstance(turn, dict) and str(turn.get("id") or "") == active_turn_id
+                ),
+                {},
+            )
+            items = [item for item in active_turn.get("items") or [] if isinstance(item, dict)]
+
+        activity: list[SessionActivity] = []
+        for item in items:
+            item_id = str(item.get("id") or "")
+            tool_kind = self._tool_kind(str(item.get("type") or ""))
+            if not item_id or not tool_kind:
+                continue
+            status = str(item.get("status") or "").lower()
+            finished = status in {
+                "completed",
+                "success",
+                "failed",
+                "error",
+                "declined",
+                "interrupted",
+            } or isinstance(item.get("exitCode"), int)
+            activity.append(
+                SessionActivity(
+                    kind="tool_finished" if finished else "tool_started",
+                    item_id=item_id,
+                    turn_id=active_turn_id,
+                    tool_kind=tool_kind,
+                    success=self._tool_success(item) if finished else None,
+                    data=self._tool_metadata(item),
+                )
+            )
+        return activity[-6:]
 
     @staticmethod
     def _summary(thread: dict[str, Any]) -> SessionSummary:
