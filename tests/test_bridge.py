@@ -20,7 +20,7 @@ from agentwire.config import (
     StackConfig,
 )
 from agentwire.models import BackendEvent, ChannelBinding, Question, SessionSummary
-from agentwire.protocol import ProtocolError, new_envelope
+from agentwire.protocol import new_envelope
 
 
 class FakeIRC:
@@ -139,6 +139,23 @@ async def test_topic_activates_harness_and_emits_bootstrap(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_sync_returns_correlated_hello_and_snapshot(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    irc.sent.clear()
+    action = new_envelope("sync.request", "action", "client", device="phone")
+    await bridge._handle_action("#codex", action)
+    correlated = [item for item in irc.sent if item[1].reply == action.id]
+    assert [item[1].kind for item in correlated] == [
+        "action.accepted",
+        "agent.hello",
+        "channel.snapshot",
+        "action.succeeded",
+    ]
+    assert correlated[1][1].epoch == bridge.epoch
+
+
+@pytest.mark.asyncio
 async def test_live_prompt_is_acknowledged_and_deduplicated(tmp_path: Path) -> None:
     bridge, irc, backend = make_bridge(tmp_path)
     await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
@@ -166,7 +183,9 @@ async def test_live_prompt_is_acknowledged_and_deduplicated(tmp_path: Path) -> N
 
 @pytest.mark.asyncio
 async def test_stale_epoch_is_rejected_before_backend_dispatch(tmp_path: Path) -> None:
-    bridge, _irc, backend = make_bridge(tmp_path)
+    bridge, irc, backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    irc.sent.clear()
     action = new_envelope(
         "turn.prompt",
         "action",
@@ -175,8 +194,29 @@ async def test_stale_epoch_is_rejected_before_backend_dispatch(tmp_path: Path) -
         device="phone",
         data={"content": "hello"},
     )
-    with pytest.raises(ProtocolError, match="epoch"):
-        await bridge._handle_action("#codex", action)
+    await bridge._handle_action("#codex", action)
+    assert irc.sent[-1][1].kind == "action.failed"
+    assert irc.sent[-1][1].reply == action.id
+    assert backend.sent == []
+
+
+@pytest.mark.asyncio
+async def test_historic_action_is_explicitly_rejected(tmp_path: Path) -> None:
+    bridge, irc, backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    irc.sent.clear()
+    action = new_envelope(
+        "turn.prompt",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        history=True,
+        data={"content": "hello"},
+    )
+    await bridge._handle_action("#codex", action)
+    assert irc.sent[-1][1].kind == "action.failed"
+    assert irc.sent[-1][1].reply == action.id
     assert backend.sent == []
 
 
@@ -206,6 +246,27 @@ async def test_busy_prompt_queues_and_completion_drains_it(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_topic_reactivation_reconciles_idle_backend_and_drains_queue(
+    tmp_path: Path,
+) -> None:
+    bridge, irc, backend = make_bridge(tmp_path)
+    await bridge.state.initialize()
+    runtime = bridge.channels["#codex"]
+    runtime.binding = ChannelBinding("codex", "s1", str(tmp_path))
+    runtime.busy = True
+    await bridge.state.set("#codex", runtime.binding)
+    await bridge.state.enqueue("queued", "#codex", "s1", "after restore", 2)
+
+    await bridge._handle_topic("#codex", "ordinary topic")
+    assert runtime.activation is None
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+
+    assert runtime.busy is True
+    assert backend.sent == [("s1", "after restore")]
+    assert any(item[1].kind == "queue.item.removed" for item in irc.sent)
+
+
+@pytest.mark.asyncio
 async def test_secret_assistant_message_is_wholly_omitted(tmp_path: Path) -> None:
     bridge, irc, _backend = make_bridge(tmp_path)
     await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
@@ -218,3 +279,53 @@ async def test_secret_assistant_message_is_wholly_omitted(tmp_path: Path) -> Non
     assert event.kind == "assistant.completed"
     assert event.data["omitted"] is True
     assert "API_TOKEN" not in str(event.to_dict())
+
+
+@pytest.mark.asyncio
+async def test_sensitive_question_is_redacted_even_without_backend_flag(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    bridge.channels["#codex"].binding = ChannelBinding("codex", "s1", str(tmp_path))
+
+    await bridge._handle_backend_event(
+        "#codex",
+        BackendEvent(
+            "question",
+            "codex",
+            session_id="s1",
+            request_token=7,
+            questions=(
+                Question(
+                    id="database_password",
+                    header="Credentials",
+                    prompt="What is the database password?",
+                ),
+            ),
+        ),
+    )
+
+    event = irc.sent[-1][1]
+    assert event.kind == "request.opened"
+    assert event.data["redacted"] is True
+    assert "password" not in str(event.to_dict()).lower()
+
+
+@pytest.mark.asyncio
+async def test_request_preserves_zero_json_rpc_token(tmp_path: Path) -> None:
+    bridge, _irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    bridge.channels["#codex"].binding = ChannelBinding("codex", "s1", str(tmp_path))
+
+    await bridge._handle_backend_event(
+        "#codex",
+        BackendEvent(
+            "approval",
+            "codex",
+            session_id="s1",
+            request_token=0,
+            text="shell command approval needed",
+        ),
+    )
+
+    pending = next(iter(bridge.channels["#codex"].requests.values()))
+    assert pending.token == 0

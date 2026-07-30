@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import secrets
 import uuid
 from dataclasses import dataclass, field, replace
@@ -27,6 +28,11 @@ from agentwire.text import clean_text, safe_one_line, truncate_utf8
 
 MAX_CONTENT_BYTES = 64 * 1024
 MAX_PREVIEW_BYTES = 4 * 1024
+_SENSITIVE_QUESTION_RE = re.compile(
+    r"\b(?:password|passphrase|secret|api[ _-]?key|access[ _-]?token|"
+    r"private[ _-]?key|credential)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -172,9 +178,25 @@ class Bridge:
         if activation.backend != runtime.backend:
             raise ProtocolError("topic backend does not match the configured channel backend")
         runtime.activation = activation
+        if runtime.binding is not None:
+            summary = await self.backends[runtime.backend].attach_session(
+                runtime.binding.session_id, runtime.binding.cwd
+            )
+            runtime.binding = ChannelBinding(runtime.backend, summary.id, summary.cwd)
+            runtime.busy = summary.busy
+            runtime.active_turn = summary.active_turn_id
+            await self.state.set(channel, runtime.binding)
+        await self._emit_hello(channel)
+        await self._emit_snapshot(channel)
+        if runtime.binding is not None and not runtime.busy:
+            await self._drain_queue(channel)
+
+    async def _emit_hello(self, channel: str, reply: str | None = None) -> None:
+        runtime = self.channels[channel]
         await self._emit(
             channel,
             "agent.hello",
+            reply=reply,
             data={
                 "protocol": "agentwire-irc-v1",
                 "backend": runtime.backend,
@@ -227,17 +249,19 @@ class Bridge:
                 ),
             },
         )
-        await self._emit_snapshot(channel)
 
     async def _handle_action(self, channel: str, action: Envelope) -> None:
         if action.message_type != "action":
             return
         if action.history:
+            await self._emit_failure(channel, action.id, "historic actions cannot be executed")
             return
         if not action.device:
-            raise ProtocolError("actions require device")
+            await self._emit_failure(channel, action.id, "actions require device")
+            return
         if action.kind != "sync.request" and action.epoch != self.epoch:
-            raise ProtocolError("stale or missing live epoch")
+            await self._emit_failure(channel, action.id, "stale or missing live epoch")
+            return
         duplicate = await self.state.claim_action(action)
         if duplicate is not None:
             await self._emit(
@@ -289,6 +313,7 @@ class Bridge:
         await handler(channel, action)
 
     async def _action_sync(self, channel: str, action: Envelope) -> None:
+        await self._emit_hello(channel, reply=action.id)
         await self._emit_snapshot(channel, reply=action.id)
 
     async def _action_workspaces(self, channel: str, action: Envelope) -> None:
@@ -631,9 +656,12 @@ class Bridge:
     ) -> None:
         runtime = self.channels[channel]
         request_id = str(uuid.uuid4())
-        secret_question = event.kind == "question" and any(q.secret for q in event.questions)
+        secret_question = event.kind == "question" and any(
+            q.secret or _SENSITIVE_QUESTION_RE.search(f"{q.header} {q.prompt}")
+            for q in event.questions
+        )
         pending = PendingRequest(
-            token=event.request_token or request_id,
+            token=event.request_token if event.request_token is not None else request_id,
             kind=event.kind,
             session_id=event.session_id,
             questions=event.questions,

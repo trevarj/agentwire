@@ -18,17 +18,11 @@ nickname = "agentwire"
 username = "agentwire"
 realname = "Agentwire agent bridge"
 password_env = "AGENTWIRE_IRC_PASSWORD"
-channels = { "#codex" = "codex", "#opencode" = "opencode" }
+channels = { "#codex" = "codex" }
 
 [codex]
 socket_path = "$XDG_RUNTIME_DIR/agentwire/codex.sock"
 binary = "codex"
-
-[opencode]
-url = "http://127.0.0.1:14096"
-username = "opencode"
-password_env = "OPENCODE_SERVER_PASSWORD"
-binary = "opencode"
 
 [stack]
 ssh_binary = "ssh"
@@ -37,5 +31,4 @@ local_port = 16698
 remote_host = "127.0.0.1"
 remote_port = 6698
 remote_cert_path = "/path/to/ergo/fullchain.pem"
-opencode_port = 14096
 startup_timeout = 30

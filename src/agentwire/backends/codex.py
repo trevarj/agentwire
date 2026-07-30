@@ -307,7 +307,13 @@ class CodexBackend(Backend):
             return
         if method == "serverRequest/resolved":
             token = params.get("requestId")
-            self._server_requests.pop(token, None)
+            stored = self._server_requests.pop(token, None)
+            if thread_id is None and stored is not None:
+                stored_params = stored[1]
+                thread_id = (
+                    str(stored_params.get("threadId") or stored_params.get("conversationId") or "")
+                    or None
+                )
             await self._events.put(
                 BackendEvent(
                     kind="request_resolved",

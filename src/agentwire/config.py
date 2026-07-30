@@ -101,7 +101,7 @@ class Config:
     secrets: SecretsConfig
     irc: IRCConfig
     codex: CodexConfig
-    opencode: OpenCodeConfig
+    opencode: OpenCodeConfig | None
     stack: StackConfig
 
 
@@ -139,7 +139,7 @@ def load_config(path: str | Path) -> Config:
         channels[channel.lower()] = backend
 
     codex = _table(raw, "codex")
-    opencode = _table(raw, "opencode")
+    opencode = _table(raw, "opencode") if "opencode" in channels.values() else None
     stack = _table(raw, "stack")
 
     result = Config(
@@ -168,11 +168,15 @@ def load_config(path: str | Path) -> Config:
             socket_path=_path(_required_str(codex, "socket_path", "codex")),
             binary=_required_str(codex, "binary", "codex"),
         ),
-        opencode=OpenCodeConfig(
-            url=_required_str(opencode, "url", "opencode").rstrip("/"),
-            username=_required_str(opencode, "username", "opencode"),
-            password_env=_required_str(opencode, "password_env", "opencode"),
-            binary=_required_str(opencode, "binary", "opencode"),
+        opencode=(
+            OpenCodeConfig(
+                url=_required_str(opencode, "url", "opencode").rstrip("/"),
+                username=_required_str(opencode, "username", "opencode"),
+                password_env=_required_str(opencode, "password_env", "opencode"),
+                binary=_required_str(opencode, "binary", "opencode"),
+            )
+            if opencode is not None
+            else None
         ),
         stack=StackConfig(
             ssh_binary=_required_str(stack, "ssh_binary", "stack"),
@@ -193,7 +197,7 @@ def _validate_cross_fields(config: Config) -> None:
     if config.irc.port != config.stack.local_port:
         raise ConfigError("[irc].port and [stack].local_port must match")
     expected_url = f"http://127.0.0.1:{config.stack.opencode_port}"
-    if config.opencode.url != expected_url:
+    if config.opencode is not None and config.opencode.url != expected_url:
         raise ConfigError(f"[opencode].url must be {expected_url}")
     for root in config.bridge.allowed_roots:
         if not root.is_absolute():
@@ -233,7 +237,9 @@ def load_secret_env(path: Path) -> dict[str, str]:
 
 def install_secret_env(config: Config) -> None:
     secrets = load_secret_env(config.secrets.env_file)
-    required = {config.irc.password_env, config.opencode.password_env}
+    required = {config.irc.password_env}
+    if config.opencode is not None:
+        required.add(config.opencode.password_env)
     missing = sorted(required - secrets.keys())
     if missing:
         raise ConfigError(f"missing required secret variables: {', '.join(missing)}")

@@ -6,7 +6,14 @@ from pathlib import Path
 import pytest
 
 from agentwire.cli import default_config_path
-from agentwire.config import ConfigError, _path, load_secret_env, resolve_workspace
+from agentwire.config import (
+    ConfigError,
+    _path,
+    install_secret_env,
+    load_config,
+    load_secret_env,
+    resolve_workspace,
+)
 
 
 def test_default_config_path_prefers_agentwire_and_falls_back_to_legacy(
@@ -74,3 +81,66 @@ def test_secret_file_requires_private_permissions(tmp_path: Path) -> None:
         load_secret_env(secrets)
     os.chmod(secrets, 0o600)
     assert load_secret_env(secrets) == {"PASSWORD": "correct-horse-battery-staple"}
+
+
+def _write_config(tmp_path: Path, channels: str) -> Path:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f"""
+[bridge]
+owner_account = "owner"
+allowed_roots = ["{tmp_path}"]
+state_file = "{tmp_path / "state.sqlite3"}"
+queue_limit = 10
+
+[secrets]
+env_file = "{tmp_path / "secrets.env"}"
+
+[irc]
+host = "127.0.0.1"
+port = 16698
+server_hostname = "irc.example"
+ca_file = "{tmp_path / "ca.pem"}"
+nickname = "agentwire"
+username = "agentwire"
+realname = "Agentwire"
+password_env = "IRC_PASSWORD"
+channels = {channels}
+
+[codex]
+socket_path = "{tmp_path / "codex.sock"}"
+binary = "codex"
+
+[stack]
+ssh_binary = "ssh"
+ssh_host = "example"
+local_port = 16698
+remote_host = "127.0.0.1"
+remote_port = 6698
+remote_cert_path = "/tmp/cert.pem"
+startup_timeout = 30
+""",
+        encoding="utf-8",
+    )
+    return config
+
+
+def test_codex_only_config_does_not_require_opencode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _write_config(tmp_path, '{ "#codex" = "codex" }')
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("IRC_PASSWORD=test-only\n", encoding="utf-8")
+    secrets.chmod(0o600)
+
+    monkeypatch.setenv("IRC_PASSWORD", "placeholder")
+    config = load_config(config_path)
+    assert config.opencode is None
+    install_secret_env(config)
+    assert os.environ["IRC_PASSWORD"] == "test-only"
+
+
+def test_opencode_channel_still_requires_opencode_table(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, '{ "#opencode" = "opencode" }')
+    with pytest.raises(ConfigError, match=r"missing \[opencode\] table"):
+        load_config(config_path)

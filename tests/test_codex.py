@@ -129,6 +129,23 @@ async def test_approval_omits_reason_and_command() -> None:
 
 
 @pytest.mark.asyncio
+async def test_resolved_request_recovers_missing_thread_context() -> None:
+    backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
+    backend._server_requests[7] = (
+        "item/commandExecution/requestApproval",
+        {"threadId": "thread-1"},
+    )
+
+    await backend._handle_notification("serverRequest/resolved", {"requestId": 7})
+
+    event = await backend._events.get()
+    assert event.kind == "request_resolved"
+    assert event.session_id == "thread-1"
+    assert event.request_token == 7
+    assert 7 not in backend._server_requests
+
+
+@pytest.mark.asyncio
 async def test_completed_commentary_is_relayed_as_progress() -> None:
     backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
     await backend._handle_notification(

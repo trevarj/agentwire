@@ -52,8 +52,9 @@ def doctor(config: Config) -> list[str]:
     checks = {
         "ssh": config.stack.ssh_binary,
         "codex": config.codex.binary,
-        "opencode": config.opencode.binary,
     }
+    if config.opencode is not None:
+        checks["opencode"] = config.opencode.binary
     return [f"{label}: {_binary(binary)}" for label, binary in checks.items()]
 
 
@@ -84,11 +85,10 @@ def _prepare_runtime(config: Config) -> None:
 async def run_bridge(config: Config) -> None:
     install_secret_env(config)
     irc_password = os.environ[config.irc.password_env]
-    opencode_password = os.environ[config.opencode.password_env]
-    backends = {
-        "codex": CodexBackend(config.codex),
-        "opencode": OpenCodeBackend(config.opencode, opencode_password),
-    }
+    backends = {"codex": CodexBackend(config.codex)}
+    if config.opencode is not None:
+        opencode_password = os.environ[config.opencode.password_env]
+        backends["opencode"] = OpenCodeBackend(config.opencode, opencode_password)
     bridge = Bridge(config, IRCClient(config.irc, irc_password), backends)
     await bridge.run()
 
@@ -100,7 +100,6 @@ async def run_stack(config: Config) -> None:
     _prepare_runtime(config)
     ssh = _binary(config.stack.ssh_binary)
     codex = _binary(config.codex.binary)
-    opencode = _binary(config.opencode.binary)
     commands = [
         (
             "ssh tunnel",
@@ -128,18 +127,21 @@ async def run_stack(config: Config) -> None:
                 f"unix://{config.codex.socket_path}",
             ],
         ),
-        (
-            "OpenCode server",
-            [
-                opencode,
-                "serve",
-                "--hostname",
-                "127.0.0.1",
-                "--port",
-                str(config.stack.opencode_port),
-            ],
-        ),
     ]
+    if config.opencode is not None:
+        commands.append(
+            (
+                "OpenCode server",
+                [
+                    _binary(config.opencode.binary),
+                    "serve",
+                    "--hostname",
+                    "127.0.0.1",
+                    "--port",
+                    str(config.stack.opencode_port),
+                ],
+            )
+        )
     processes: list[tuple[str, asyncio.subprocess.Process]] = []
     try:
         for name, command in commands:
@@ -231,6 +233,8 @@ def codex_tui(config: Config) -> None:
 
 def opencode_tui(config: Config, cwd: str) -> None:
     install_secret_env(config)
+    if config.opencode is None:
+        raise StackError("OpenCode is not enabled by any configured IRC channel")
     binary = _binary(config.opencode.binary)
     os.execv(
         binary,

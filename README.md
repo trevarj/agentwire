@@ -1,6 +1,6 @@
 # Agentwire
 
-Agentwire exposes live Codex and OpenCode sessions as a structured agent harness over IRCv3. A
+Agentwire exposes live Codex sessions as a structured agent harness over IRCv3. A
 supporting client renders sessions, turns, plans, tool cards, approvals, questions, queues, usage,
 and history while the channel remains a useful readable transcript.
 
@@ -32,7 +32,8 @@ deduplication, event history, and prompt queues.
 On first use of an old JSON state path, Agentwire imports its bindings and preserves the original
 as a mode-0600 `.legacy-json` backup.
 
-The foreground stack still starts the SSH tunnel, Codex app-server, OpenCode server, and bridge:
+The foreground stack starts the SSH tunnel, Codex app-server, and bridge. It starts OpenCode only
+when an OpenCode-backed channel is configured:
 
 ```console
 nix run .#stack
