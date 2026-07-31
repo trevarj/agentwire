@@ -114,12 +114,17 @@ in `reply`. Clients MUST NOT automatically retry merely because an acknowledgeme
 Actions are deduplicated durably by UUID; a duplicate produces the known status without invoking
 the backend again.
 
-`history.request` reads Agentwire's journal, not arbitrary IRC messages. It replays only transcript
-and request lifecycle events: turn, assistant, plan, tool, usage, request, and approval-review events.
+`history.request` targets the currently attached session using the envelope `sid`; older clients
+that omit it target the current binding. A supplied `sid` that differs from the binding is rejected.
+Backends with authoritative transcript pagination, including Codex, provide full persisted turns.
+Other backends fall back to Agentwire's session-indexed journal. History never reads arbitrary IRC
+messages. It replays only transcript and request lifecycle events: user prompt, turn, assistant,
+plan, tool, usage, request, and approval-review events.
 Sync snapshots, discovery pages, action acknowledgements, queue events, and binding/status events are
 live state and MUST NOT appear in history pages. A page is bounded by 200 events, 512 KiB, and 30 days
 and is enclosed by `history.begin` and `history.end`. Replayed events
-carry `hist:true`. IRC message edits affect only readable transcript text; harness state and
+carry `hist:true`, the requested `sid`, and the request UUID in `reply`. `data.cursor` and
+`data.next` are opaque backend cursors. IRC message edits affect only readable transcript text; harness state and
 Agentwire journal records are immutable.
 
 ## Actions
@@ -152,10 +157,12 @@ allowlisted directory as `data.parent` lists its immediate non-hidden child dire
 `workspace.page.data.parent` echoes that directory or is null for the root page; every item has
 `path`, `name`, and `hasChildren`. Clients SHOULD lazy-load children when a directory expands and
 MAY use any returned path as `session.create.data.cwd` or `session.list.request.data.cwd`.
-`session.page.data.cwd` echoes the requested directory or is null for running-session discovery;
+`session.list.request.data.scope` is `workspace` or `live`; older `cwd=null` live discovery remains
+valid. `session.page.data.scope` echoes the resolved scope and `data.cwd` echoes the requested
+directory or is null for live-session discovery;
 each session item includes `busy`, runtime `flags`, and `tuiAttached`, which is true only when
-Agentwire can identify that exact thread in a live TUI. `data.cursor` echoes the page cursor or is
-null for the first page.
+Agentwire can identify that exact top-level thread in a live TUI. Subagent and guardian threads are
+not attachable discovery results. `data.cursor` echoes the page cursor or is null for the first page.
 If `data.next` is non-null, clients request the next page by returning it as
 `session.list.request.data.cursor`; cursors are opaque to clients.
 

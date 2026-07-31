@@ -23,6 +23,7 @@ from agentwire.config import (
 from agentwire.models import (
     BackendEvent,
     ChannelBinding,
+    HistoryPage,
     Question,
     SessionActivity,
     SessionOutput,
@@ -230,6 +231,7 @@ async def test_session_pages_echo_workspace_and_continue_with_cursor(tmp_path: P
     await bridge._handle_action("#codex", first)
     first_page = next(item[1] for item in irc.sent if item[1].kind == "session.page")
     assert first_page.data["cwd"] == str(tmp_path)
+    assert first_page.data["scope"] == "workspace"
     assert first_page.data["cursor"] is None
     assert len(first_page.data["items"]) == 100
     assert first_page.data["next"] == "100"
@@ -248,6 +250,86 @@ async def test_session_pages_echo_workspace_and_continue_with_cursor(tmp_path: P
     assert second_page.data["cursor"] == "100"
     assert len(second_page.data["items"]) == 1
     assert second_page.data["next"] is None
+
+
+@pytest.mark.asyncio
+async def test_live_session_page_is_explicitly_scoped(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    irc.sent.clear()
+
+    action = new_envelope(
+        "session.list.request",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        data={"scope": "live"},
+    )
+    await bridge._handle_action("#codex", action)
+
+    page = next(item[1] for item in irc.sent if item[1].kind == "session.page")
+    assert page.data["scope"] == "live"
+    assert page.data["cwd"] is None
+
+
+@pytest.mark.asyncio
+async def test_history_is_scoped_to_binding_and_echoes_backend_cursor(tmp_path: Path) -> None:
+    bridge, irc, backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._set_binding("#codex", SessionSummary("s1", str(tmp_path), "session"))
+    backend.list_history = AsyncMock(  # type: ignore[method-assign]
+        return_value=HistoryPage(
+            (
+                BackendEvent(
+                    "user_prompt",
+                    "codex",
+                    session_id="s1",
+                    turn_id="t1",
+                    item_id="i1",
+                    text="hello",
+                    at=100,
+                    event_id="8eaf7815-cc5c-50de-836f-a2f2c70ca283",
+                ),
+            ),
+            "older",
+        )
+    )
+    irc.sent.clear()
+
+    action = new_envelope(
+        "history.request",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        session_id="s1",
+        data={"cursor": "current", "limit": 20},
+    )
+    await bridge._handle_action("#codex", action)
+
+    backend.list_history.assert_awaited_once_with("s1", "current", 20)
+    begin = next(item[1] for item in irc.sent if item[1].kind == "history.begin")
+    prompt = next(item[1] for item in irc.sent if item[1].kind == "user.prompt")
+    end = next(item[1] for item in irc.sent if item[1].kind == "history.end")
+    assert begin.session_id == end.session_id == prompt.session_id == "s1"
+    assert begin.reply == end.reply == prompt.reply == action.id
+    assert begin.data["next"] == end.data["next"] == "older"
+    assert prompt.history is True
+    assert prompt.data == {"content": "hello"}
+
+    bad = new_envelope(
+        "history.request",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        session_id="other",
+    )
+    irc.sent.clear()
+    await bridge._handle_action("#codex", bad)
+    failed = next(item[1] for item in irc.sent if item[1].kind == "action.failed")
+    assert "no longer attached" in failed.data["message"]
 
 
 @pytest.mark.asyncio
@@ -445,8 +527,11 @@ async def test_live_prompt_is_acknowledged_and_deduplicated(tmp_path: Path) -> N
     await bridge._handle_action("#codex", action)
     await bridge._handle_action("#codex", action)
     assert backend.sent == [("s1", "hello")]
+    prompt = next(item[1] for item in irc.sent if item[1].kind == "user.prompt")
+    assert prompt.item_id == action.id
     assert [item[1].kind for item in irc.sent] == [
         "action.accepted",
+        "user.prompt",
         "action.succeeded",
         "action.succeeded",
     ]

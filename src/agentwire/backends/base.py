@@ -4,7 +4,7 @@ import abc
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 
-from agentwire.models import BackendEvent, Question, SessionSummary
+from agentwire.models import BackendEvent, HistoryPage, Question, SessionSummary
 
 
 class BackendError(RuntimeError):
@@ -39,6 +39,15 @@ class Backend(abc.ABC):
     async def attach_session(self, session_id: str, cwd: str | None = None) -> SessionSummary: ...
 
     async def session_busy(self, session_id: str) -> bool | None:
+        return None
+
+    async def list_history(
+        self,
+        session_id: str,
+        cursor: str | None,
+        limit: int,
+    ) -> HistoryPage | None:
+        """Return authoritative backend history, or None for journal fallback."""
         return None
 
     async def setting_options(self) -> Mapping[str, Any]:

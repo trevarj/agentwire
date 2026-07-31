@@ -66,6 +66,7 @@ EVENT_KINDS = frozenset(
         "queue.item.updated",
         "queue.item.moved",
         "queue.item.removed",
+        "user.prompt",
         "turn.started",
         "turn.completed",
         "turn.failed",
@@ -88,6 +89,7 @@ EVENT_KINDS = frozenset(
 HISTORY_EVENT_KINDS = frozenset(
     {
         "turn.started",
+        "user.prompt",
         "turn.completed",
         "turn.failed",
         "assistant.delta",

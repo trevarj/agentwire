@@ -28,7 +28,7 @@
             "session.page", "history.begin", "history.end", "action.accepted",
             "action.succeeded", "action.failed", "action.uncertain", "queue.snapshot",
             "queue.item.added", "queue.item.updated", "queue.item.moved",
-            "queue.item.removed", "turn.started", "turn.completed", "turn.failed",
+            "queue.item.removed", "user.prompt", "turn.started", "turn.completed", "turn.failed",
             "assistant.delta", "assistant.completed", "plan.updated", "tool.started",
             "tool.updated", "tool.completed", "usage.updated", "request.opened",
             "request.resolved", "approval.review.started", "approval.review.completed"

@@ -8,6 +8,7 @@ import re
 import secrets
 import tempfile
 import time
+import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -19,6 +20,7 @@ from agentwire.backends.base import Backend, BackendError
 from agentwire.config import CodexConfig
 from agentwire.models import (
     BackendEvent,
+    HistoryPage,
     Question,
     SessionActivity,
     SessionOutput,
@@ -715,7 +717,7 @@ class CodexBackend(Backend):
         )
         sessions: list[SessionSummary] = []
         for item in (result or {}).get("data") or []:
-            if not isinstance(item, dict):
+            if not isinstance(item, dict) or not self._top_level_thread(item):
                 continue
             sessions.append(self._summary(item))
         tui_sessions = self._tui_session_ids()
@@ -734,7 +736,7 @@ class CodexBackend(Backend):
                 params["cursor"] = cursor
             result = await self._request("thread/list", params)
             for item in (result or {}).get("data") or []:
-                if isinstance(item, dict):
+                if isinstance(item, dict) and self._top_level_thread(item):
                     sessions.append(self._summary(item))
             cursor = str((result or {}).get("nextCursor") or "") or None
             if not cursor:
@@ -748,6 +750,186 @@ class CodexBackend(Backend):
             for session in sessions
             if session.id in selected
         ]
+
+    async def list_history(
+        self,
+        session_id: str,
+        cursor: str | None,
+        limit: int,
+    ) -> HistoryPage:
+        params: dict[str, Any] = {
+            "threadId": session_id,
+            "limit": limit,
+            "sortDirection": "desc",
+            "itemsView": "full",
+        }
+        if cursor:
+            params["cursor"] = cursor
+        result = await self._request("thread/turns/list", params)
+        turns = [turn for turn in (result or {}).get("data") or [] if isinstance(turn, dict)]
+        events: list[BackendEvent] = []
+        fallback_at = int(time.time() * 1000) - len(turns) * 1000
+        for turn_index, turn in enumerate(reversed(turns)):
+            turn_id = str(turn.get("id") or "") or None
+            turn_at = self._timestamp_ms(
+                turn.get("createdAt") or turn.get("startedAt") or turn.get("updatedAt"),
+                fallback_at + turn_index * 1000,
+            )
+            events.append(
+                BackendEvent(
+                    kind="turn_started",
+                    backend=self.name,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    at=turn_at,
+                    event_id=self._history_event_id(session_id, turn_id, None, "turn.started"),
+                )
+            )
+            for item_index, item in enumerate(turn.get("items") or []):
+                if not isinstance(item, dict):
+                    continue
+                event = self._history_item(
+                    session_id,
+                    turn_id,
+                    item,
+                    turn_at + item_index + 1,
+                )
+                if event is not None:
+                    events.append(event)
+            status = str(turn.get("status") or "completed")
+            if status in {"inProgress", "in_progress", "running"}:
+                continue
+            kind = "turn_failed" if status in {"failed", "error"} else "turn_done"
+            error = turn.get("error")
+            message = (
+                safe_one_line(str(error.get("message") or status))
+                if kind == "turn_failed" and isinstance(error, dict)
+                else ""
+            )
+            events.append(
+                BackendEvent(
+                    kind=kind,
+                    backend=self.name,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    text=message,
+                    at=turn_at + len(turn.get("items") or []) + 1,
+                    event_id=self._history_event_id(
+                        session_id,
+                        turn_id,
+                        None,
+                        "turn.failed" if kind == "turn_failed" else "turn.completed",
+                    ),
+                )
+            )
+        return HistoryPage(
+            events=tuple(events),
+            next_cursor=str((result or {}).get("nextCursor") or "") or None,
+        )
+
+    def _history_item(
+        self,
+        session_id: str,
+        turn_id: str | None,
+        item: dict[str, Any],
+        at: int,
+    ) -> BackendEvent | None:
+        item_type = str(item.get("type") or "")
+        item_id = str(item.get("id") or "") or None
+        common = {
+            "backend": self.name,
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "item_id": item_id,
+            "at": at,
+        }
+        if item_type == "userMessage":
+            text = self._user_message_text(item)
+            if not text:
+                return None
+            return BackendEvent(
+                kind="user_prompt",
+                text=text,
+                event_id=self._history_event_id(session_id, turn_id, item_id, "user.prompt"),
+                **common,
+            )
+        if item_type == "agentMessage":
+            text = str(item.get("text") or "").strip()
+            if not text:
+                return None
+            progress = item.get("phase") == "commentary"
+            return BackendEvent(
+                kind="progress" if progress else "assistant",
+                text=text,
+                data={"plan": False} if progress else {},
+                event_id=self._history_event_id(
+                    session_id,
+                    turn_id,
+                    item_id,
+                    "plan.updated" if progress else "assistant.completed",
+                ),
+                **common,
+            )
+        if item_type == "plan":
+            text = str(item.get("text") or item.get("explanation") or "Plan updated").strip()
+            return BackendEvent(
+                kind="progress",
+                text=text,
+                data={"plan": True, "running": False},
+                event_id=self._history_event_id(session_id, turn_id, item_id, "plan.updated"),
+                **common,
+            )
+        tool_kind = self._tool_kind(item_type)
+        if tool_kind:
+            status = str(item.get("status") or "").lower()
+            finished = status not in {"", "inprogress", "in_progress", "running", "pending"}
+            return BackendEvent(
+                kind="tool_finished" if finished else "tool_started",
+                tool_kind=tool_kind,
+                success=self._tool_success(item) if finished else None,
+                data=self._tool_metadata(item),
+                event_id=self._history_event_id(
+                    session_id,
+                    turn_id,
+                    item_id,
+                    "tool.completed" if finished else "tool.started",
+                ),
+                **common,
+            )
+        # Reasoning and unsupported attachment types are intentionally omitted.
+        return None
+
+    @staticmethod
+    def _user_message_text(item: Mapping[str, Any]) -> str:
+        direct = str(item.get("text") or "").strip()
+        if direct:
+            return direct
+        parts: list[str] = []
+        for content in item.get("content") or ():
+            if not isinstance(content, Mapping):
+                continue
+            if content.get("type") in {"text", "inputText"}:
+                text = str(content.get("text") or "").strip()
+                if text:
+                    parts.append(text)
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _timestamp_ms(value: Any, fallback: int) -> int:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            timestamp = float(value)
+            return int(timestamp if timestamp > 10_000_000_000 else timestamp * 1000)
+        return fallback
+
+    @staticmethod
+    def _history_event_id(
+        session_id: str,
+        turn_id: str | None,
+        item_id: str | None,
+        kind: str,
+    ) -> str:
+        seed = "\0".join((session_id, turn_id or "", item_id or "", kind))
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"agentwire-history:{seed}"))
 
     def _tui_session_ids(self) -> set[str]:
         sessions = self._explicit_codex_sessions()
@@ -805,6 +987,8 @@ class CodexBackend(Backend):
             if not process.name.isdigit():
                 continue
             try:
+                if process.stat().st_uid != os.getuid():
+                    continue
                 arguments = [
                     part.decode(errors="replace")
                     for part in (process / "cmdline").read_bytes().split(b"\0")
@@ -818,9 +1002,46 @@ class CodexBackend(Backend):
                     position = arguments.index("resume")
                     if position + 1 < len(arguments):
                         explicit_ids.add(arguments[position + 1])
+                rollout = CodexBackend._process_rollout_session(process)
+                if rollout:
+                    explicit_ids.add(rollout)
             except (OSError, ValueError):
                 continue
         return explicit_ids
+
+    @staticmethod
+    def _process_rollout_session(process: Path) -> str | None:
+        """Return the newest top-level Codex TUI rollout held open by a process."""
+        candidates: list[tuple[int, str]] = []
+        try:
+            descriptors = tuple((process / "fd").iterdir())
+        except OSError:
+            return None
+        for descriptor in descriptors:
+            try:
+                target = descriptor.resolve(strict=True)
+                if target.suffix != ".jsonl":
+                    continue
+                with target.open(encoding="utf-8") as handle:
+                    first = json.loads(handle.readline())
+                if first.get("type") != "session_meta":
+                    continue
+                payload = first.get("payload")
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get("originator") != "codex-tui" or payload.get("source") != "cli":
+                    continue
+                session_id = str(payload.get("id") or "")
+                if not session_id:
+                    continue
+                candidates.append((target.stat().st_mtime_ns, session_id))
+            except (OSError, TypeError, json.JSONDecodeError):
+                continue
+        return max(candidates)[1] if candidates else None
+
+    @staticmethod
+    def _top_level_thread(thread: Mapping[str, Any]) -> bool:
+        return not bool(thread.get("parentThreadId"))
 
     async def create_session(self, cwd: str) -> SessionSummary:
         result = await self._request(

@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import re
 import secrets
+import time
 import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -386,6 +387,13 @@ class Bridge:
 
     async def _action_sessions(self, channel: str, action: Envelope) -> None:
         cwd_value = action.data.get("cwd")
+        scope_value = action.data.get("scope")
+        if scope_value is not None and scope_value not in {"live", "workspace"}:
+            raise ProtocolError("session scope must be live or workspace")
+        if scope_value == "workspace" and cwd_value is None:
+            raise ProtocolError("workspace session scope requires cwd")
+        if scope_value == "live" and cwd_value is not None:
+            raise ProtocolError("live session scope cannot include cwd")
         cursor_value = action.data.get("cursor")
         if cursor_value is None:
             offset = 0
@@ -410,6 +418,7 @@ class Bridge:
             "session.page",
             reply=action.id,
             data={
+                "scope": "workspace" if cwd is not None else "live",
                 "cwd": cwd,
                 "cursor": str(offset) if offset else None,
                 "items": [self._session_data(item) for item in page],
@@ -418,29 +427,69 @@ class Bridge:
         )
 
     async def _action_history(self, channel: str, action: Envelope) -> None:
+        runtime = self.channels[channel]
+        binding = self._require_binding(runtime, action)
+        data_sid = action.data.get("sid")
+        if data_sid is not None and (not isinstance(data_sid, str) or not data_sid):
+            raise ProtocolError("history sid must be a non-empty string")
+        session_id = action.session_id or data_sid or binding.session_id
+        if session_id != binding.session_id:
+            raise ValueError("history targets a session that is no longer attached")
+        cursor = action.data.get("cursor")
+        if cursor is not None and not isinstance(cursor, str):
+            raise ProtocolError("history cursor must be a string")
         before = action.data.get("beforeAt")
         if before is not None and not isinstance(before, int):
             raise ProtocolError("beforeAt must be an integer")
         limit = action.data.get("limit", 200)
         if not isinstance(limit, int):
             raise ProtocolError("limit must be an integer")
-        payloads = await self.state.history(channel, before, limit)
+        if not 1 <= limit <= 200:
+            raise ProtocolError("history limit must be between 1 and 200")
+        backend_page = await self.backends[runtime.backend].list_history(
+            session_id,
+            cursor,
+            limit,
+        )
         page_id = str(uuid.uuid4())
+        if backend_page is not None:
+            history = [self._history_envelope(event, action.id) for event in backend_page.events]
+            next_cursor = backend_page.next_cursor
+        else:
+            payloads = await self.state.history(channel, session_id, before, limit)
+            history = [
+                replace(
+                    decode_envelope(payload),
+                    history=True,
+                    reply=action.id,
+                    session_id=session_id,
+                )
+                for payload in payloads
+            ]
+            next_cursor = None
+        page_data: dict[str, Any] = {
+            "page": page_id,
+            "count": len(history),
+            "cursor": cursor,
+        }
+        if backend_page is not None:
+            page_data["next"] = next_cursor
         await self._emit(
             channel,
             "history.begin",
+            session_id=session_id,
             reply=action.id,
-            data={"page": page_id, "count": len(payloads)},
+            data=page_data,
             journal=False,
         )
-        for payload in payloads:
-            historic = replace(decode_envelope(payload), history=True, reply=action.id)
+        for historic in history:
             await self.irc.send_protocol(channel, historic)
         await self._emit(
             channel,
             "history.end",
+            session_id=session_id,
             reply=action.id,
-            data={"page": page_id, "count": len(payloads)},
+            data=page_data,
             journal=False,
         )
 
@@ -535,9 +584,17 @@ class Bridge:
                 await self.backends[runtime.backend].steer(
                     binding.session_id, runtime.active_turn, text
                 )
+                await self._emit(
+                    channel,
+                    "user.prompt",
+                    session_id=binding.session_id,
+                    turn_id=runtime.active_turn,
+                    item_id=action.item_id or action.id,
+                    data=self._safe_user_prompt(text),
+                )
                 return
             item = await self.state.enqueue(
-                action.item_id or str(uuid.uuid4()),
+                action.item_id or action.id,
                 channel,
                 binding.session_id,
                 text,
@@ -549,6 +606,14 @@ class Bridge:
             binding.session_id, text
         )
         runtime.busy = True
+        await self._emit(
+            channel,
+            "user.prompt",
+            session_id=binding.session_id,
+            turn_id=runtime.active_turn,
+            item_id=action.item_id or action.id,
+            data=self._safe_user_prompt(text),
+        )
 
     async def _action_steer(self, channel: str, action: Envelope) -> None:
         runtime = self.channels[channel]
@@ -827,6 +892,14 @@ class Bridge:
             runtime.binding.session_id, item.text
         )
         runtime.busy = True
+        await self._emit(
+            channel,
+            "user.prompt",
+            session_id=runtime.binding.session_id,
+            turn_id=runtime.active_turn,
+            item_id=item.id,
+            data=self._safe_user_prompt(item.text),
+        )
 
     async def _set_binding(self, channel: str, summary: SessionSummary) -> None:
         runtime = self.channels[channel]
@@ -1004,6 +1077,63 @@ class Bridge:
         if len(cleaned.encode("utf-8")) > limit:
             raise ProtocolError(f"content exceeds {limit} bytes")
         return cleaned
+
+    @staticmethod
+    def _safe_user_prompt(text: str) -> dict[str, Any]:
+        if scan_secrets(text):
+            return {"omitted": True, "reason": "high-confidence secret detected"}
+        return {"content": truncate_utf8(clean_text(text), MAX_CONTENT_BYTES)}
+
+    def _history_envelope(self, event: BackendEvent, reply: str) -> Envelope:
+        kind = {
+            "user_prompt": "user.prompt",
+            "turn_started": "turn.started",
+            "turn_done": "turn.completed",
+            "turn_failed": "turn.failed",
+            "progress": "plan.updated",
+            "assistant": "assistant.completed",
+            "tool_started": "tool.started",
+            "tool_finished": "tool.completed",
+        }.get(event.kind)
+        if kind is None:
+            raise ProtocolError(f"unsupported backend history event: {event.kind}")
+        if event.kind == "user_prompt":
+            data = self._safe_user_prompt(event.text)
+        elif event.kind == "assistant":
+            data = (
+                {"omitted": True, "reason": "high-confidence secret detected"}
+                if scan_secrets(event.text)
+                else {"content": truncate_utf8(clean_text(event.text), MAX_CONTENT_BYTES)}
+            )
+        elif event.kind == "progress":
+            data = (
+                {"omitted": True, "reason": "high-confidence secret detected"}
+                if scan_secrets(event.text)
+                else {"summary": truncate_utf8(clean_text(event.text), 32 * 1024)}
+            )
+            if event.data.get("plan") is True:
+                data["plan"] = True
+                data["running"] = bool(event.data.get("running"))
+        elif event.kind in {"tool_started", "tool_finished"}:
+            data = self._safe_tool_data(event)
+        elif event.kind == "turn_failed" and event.text:
+            data = {"message": safe_one_line(event.text, 1000)}
+        else:
+            data = {}
+        return new_envelope(
+            kind,
+            "event",
+            self.instance,
+            id=event.event_id or str(uuid.uuid4()),
+            at=event.at or int(time.time() * 1000),
+            epoch=self.epoch,
+            session_id=event.session_id,
+            turn_id=event.turn_id,
+            item_id=event.item_id,
+            reply=reply,
+            history=True,
+            data=data,
+        )
 
     def _content(self, action: Envelope) -> str:
         return self._safe_content(self._data_string(action, "content"), MAX_CONTENT_BYTES)

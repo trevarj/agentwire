@@ -106,6 +106,25 @@ def _fake_process_stat(proc_root: Path, pid: int, start_time: str) -> None:
     (process / "stat").write_text(f"{pid} (agentwire) {' '.join(fields)}\n", encoding="utf-8")
 
 
+def _fake_open_rollout(
+    proc_root: Path,
+    pid: int,
+    rollout: Path,
+    session_id: str,
+    source: object = "cli",
+) -> None:
+    rollout.write_text(
+        '{"type":"session_meta","payload":'
+        f'{{"id":"{session_id}","originator":"codex-tui","source":{source!r}}}}}\n'.replace(
+            "'", '"'
+        ),
+        encoding="utf-8",
+    )
+    descriptors = proc_root / str(pid) / "fd"
+    descriptors.mkdir()
+    (descriptors / "7").symlink_to(rollout)
+
+
 def test_explicit_codex_sessions_only_accept_resumed_session_ids(tmp_path: Path) -> None:
     proc_root = tmp_path / "proc"
     proc_root.mkdir()
@@ -117,6 +136,24 @@ def test_explicit_codex_sessions_only_accept_resumed_session_ids(tmp_path: Path)
     explicit = CodexBackend._explicit_codex_sessions(proc_root)
 
     assert explicit == {"thread-12"}
+
+
+def test_explicit_codex_sessions_reads_top_level_rollout_from_plain_tui(tmp_path: Path) -> None:
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    _fake_process(proc_root, 10, "/bin/codex")
+    root = tmp_path / "root.jsonl"
+    guardian = tmp_path / "guardian.jsonl"
+    _fake_open_rollout(proc_root, 10, root, "thread-root")
+    guardian.write_text(
+        '{"type":"session_meta","payload":{"id":"thread-guardian",'
+        '"originator":"codex-tui","source":{"subagent":{"thread_spawn":{"parent_thread_id":'
+        '"thread-root"}}}}}\n',
+        encoding="utf-8",
+    )
+    (proc_root / "10" / "fd" / "8").symlink_to(guardian)
+
+    assert CodexBackend._explicit_codex_sessions(proc_root) == {"thread-root"}
 
 
 def test_tui_presence_tracks_exact_session_and_removes_stale_process(tmp_path: Path) -> None:
@@ -592,6 +629,12 @@ async def test_running_sessions_paginates_and_filters_active_threads() -> None:
                         "cwd": "/workspace/one",
                         "status": {"type": "idle"},
                     },
+                    {
+                        "id": "subagent",
+                        "cwd": "/workspace/one",
+                        "parentThreadId": "active-1",
+                        "status": {"type": "active"},
+                    },
                 ],
                 "nextCursor": "page-2",
             }
@@ -609,6 +652,64 @@ async def test_running_sessions_paginates_and_filters_active_threads() -> None:
     sessions = await backend.list_running_sessions()
     assert [session.id for session in sessions] == ["active-1", "active-2"]
     assert calls[1]["cursor"] == "page-2"
+
+
+@pytest.mark.asyncio
+async def test_history_reads_exact_thread_and_omits_reasoning() -> None:
+    backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def request(method: str, params: dict[str, object]) -> object:
+        calls.append((method, params))
+        return {
+            "data": [
+                {
+                    "id": "turn-1",
+                    "status": "completed",
+                    "createdAt": 10,
+                    "items": [
+                        {
+                            "id": "user-1",
+                            "type": "userMessage",
+                            "content": [{"type": "text", "text": "Fix the session list"}],
+                        },
+                        {"id": "reasoning-1", "type": "reasoning", "text": "private chain"},
+                        {
+                            "id": "assistant-1",
+                            "type": "agentMessage",
+                            "phase": "final_answer",
+                            "text": "Done",
+                        },
+                    ],
+                }
+            ],
+            "nextCursor": "older",
+        }
+
+    backend._request = request  # type: ignore[method-assign]
+    page = await backend.list_history("thread-1", "cursor-1", 25)
+
+    assert calls == [
+        (
+            "thread/turns/list",
+            {
+                "threadId": "thread-1",
+                "limit": 25,
+                "sortDirection": "desc",
+                "itemsView": "full",
+                "cursor": "cursor-1",
+            },
+        )
+    ]
+    assert page.next_cursor == "older"
+    assert [event.kind for event in page.events] == [
+        "turn_started",
+        "user_prompt",
+        "assistant",
+        "turn_done",
+    ]
+    assert page.events[1].text == "Fix the session list"
+    assert all(event.event_id for event in page.events)
 
 
 @pytest.mark.asyncio

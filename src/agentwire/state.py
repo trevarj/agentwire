@@ -72,13 +72,23 @@ class StateStore:
             await asyncio.to_thread(self._append_event, channel.lower(), envelope)
 
     async def history(
-        self, channel: str, before_at: int | None = None, limit: int = 200
+        self,
+        channel: str,
+        session_id: str,
+        before_at: int | None = None,
+        limit: int = 200,
     ) -> list[str]:
         if not 1 <= limit <= 200:
             raise ValueError("history limit must be between 1 and 200")
         await self.initialize()
         async with self._lock:
-            return await asyncio.to_thread(self._history, channel.lower(), before_at, limit)
+            return await asyncio.to_thread(
+                self._history,
+                channel.lower(),
+                session_id,
+                before_at,
+                limit,
+            )
 
     async def list_queue(self, channel: str, session_id: str) -> list[QueuedPrompt]:
         await self.initialize()
@@ -152,6 +162,7 @@ class StateStore:
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                     id TEXT UNIQUE NOT NULL,
                     channel TEXT NOT NULL,
+                    session_id TEXT,
                     at INTEGER NOT NULL,
                     kind TEXT NOT NULL,
                     payload TEXT NOT NULL
@@ -168,6 +179,27 @@ class StateStore:
                     UNIQUE(channel, session_id, position)
                 );
                 """
+            )
+            event_columns = {
+                str(row[1]) for row in database.execute("PRAGMA table_info(events)").fetchall()
+            }
+            if "session_id" not in event_columns:
+                database.execute("ALTER TABLE events ADD COLUMN session_id TEXT")
+            for sequence, payload in database.execute(
+                "SELECT sequence, payload FROM events WHERE session_id IS NULL"
+            ).fetchall():
+                try:
+                    session_id = json.loads(str(payload)).get("sid")
+                except (AttributeError, json.JSONDecodeError, TypeError):
+                    session_id = None
+                if isinstance(session_id, str) and session_id:
+                    database.execute(
+                        "UPDATE events SET session_id = ? WHERE sequence = ?",
+                        (session_id, sequence),
+                    )
+            database.execute(
+                """CREATE INDEX IF NOT EXISTS events_channel_session_at
+                   ON events(channel, session_id, at DESC, sequence DESC)"""
             )
             database.execute(
                 """UPDATE actions SET status = 'uncertain',
@@ -269,23 +301,38 @@ class StateStore:
     def _append_event(self, channel: str, envelope: Envelope) -> None:
         with self._connect() as database:
             database.execute(
-                """INSERT OR IGNORE INTO events(id, channel, at, kind, payload)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (envelope.id, channel, envelope.at, envelope.kind, encode_envelope(envelope)),
+                """INSERT OR IGNORE INTO events
+                   (id, channel, session_id, at, kind, payload)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    envelope.id,
+                    channel,
+                    envelope.session_id,
+                    envelope.at,
+                    envelope.kind,
+                    encode_envelope(envelope),
+                ),
             )
 
-    def _history(self, channel: str, before_at: int | None, limit: int) -> list[str]:
+    def _history(
+        self,
+        channel: str,
+        session_id: str,
+        before_at: int | None,
+        limit: int,
+    ) -> list[str]:
         cutoff = before_at if before_at is not None else _now_ms() + 1
         history_kinds = tuple(sorted(HISTORY_EVENT_KINDS))
         placeholders = ", ".join("?" for _ in history_kinds)
         with self._connect() as database:
             rows = database.execute(
                 f"""SELECT payload FROM events
-                   WHERE channel = ? AND kind IN ({placeholders})
+                   WHERE channel = ? AND session_id = ? AND kind IN ({placeholders})
                    AND at < ? AND at >= ?
                    ORDER BY at DESC, sequence DESC LIMIT ?""",
                 (
                     channel,
+                    session_id,
                     *history_kinds,
                     cutoff,
                     _now_ms() - 30 * 24 * 60 * 60 * 1000,

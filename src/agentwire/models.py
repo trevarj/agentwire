@@ -6,6 +6,7 @@ from typing import Any, Literal
 EventKind = Literal[
     "connected",
     "disconnected",
+    "user_prompt",
     "turn_started",
     "turn_done",
     "turn_failed",
@@ -78,6 +79,14 @@ class BackendEvent:
     success: bool | None = None
     questions: tuple[Question, ...] = ()
     data: dict[str, Any] = field(default_factory=dict)
+    at: int | None = None
+    event_id: str | None = None
+
+
+@dataclass(slots=True, frozen=True)
+class HistoryPage:
+    events: tuple[BackendEvent, ...]
+    next_cursor: str | None = None
 
 
 @dataclass(slots=True, frozen=True)

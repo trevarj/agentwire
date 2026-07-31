@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -65,17 +66,48 @@ async def test_interrupted_accepted_action_becomes_uncertain_on_restart(tmp_path
 async def test_event_history_is_oldest_first_and_marked_by_caller(tmp_path: Path) -> None:
     store = StateStore(tmp_path / "state.sqlite3")
     now = int(time.time() * 1000)
-    first = new_envelope("turn.started", "event", "agent", at=now - 2)
-    second = new_envelope("turn.completed", "event", "agent", at=now - 1)
+    first = new_envelope("turn.started", "event", "agent", at=now - 2, session_id="s1")
+    second = new_envelope("turn.completed", "event", "agent", at=now - 1, session_id="s1")
+    other = new_envelope("turn.completed", "event", "agent", at=now, session_id="s2")
     control = new_envelope("channel.snapshot", "event", "agent", at=now)
     await store.append_event("#c", first)
     await store.append_event("#c", second)
+    await store.append_event("#c", other)
     await store.append_event("#c", control)
-    payloads = await store.history("#c", before_at=now + 1)
+    payloads = await store.history("#c", "s1", before_at=now + 1)
     assert [decode_envelope(item).kind for item in payloads] == [
         "turn.started",
         "turn.completed",
     ]
+
+
+@pytest.mark.asyncio
+async def test_event_history_migration_backfills_session_id(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    event = new_envelope("assistant.completed", "event", "agent", session_id="session-old")
+    with sqlite3.connect(path) as database:
+        database.execute(
+            """CREATE TABLE events (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                id TEXT UNIQUE NOT NULL,
+                channel TEXT NOT NULL,
+                at INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT NOT NULL
+            )"""
+        )
+        database.execute(
+            "INSERT INTO events(id, channel, at, kind, payload) VALUES (?, ?, ?, ?, ?)",
+            (event.id, "#c", event.at, event.kind, json.dumps(event.to_dict())),
+        )
+
+    payloads = await StateStore(path).history("#c", "session-old")
+
+    assert [decode_envelope(item).id for item in payloads] == [event.id]
+    with sqlite3.connect(path) as database:
+        assert database.execute(
+            "SELECT session_id FROM events WHERE id = ?", (event.id,)
+        ).fetchone() == ("session-old",)
 
 
 @pytest.mark.asyncio
