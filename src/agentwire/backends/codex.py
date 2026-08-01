@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import os
+import random
 import re
 import secrets
 import tempfile
@@ -27,6 +28,18 @@ from agentwire.models import (
     SessionSummary,
 )
 from agentwire.text import safe_one_line, truncate_utf8
+
+_MAX_WEBSOCKET_MESSAGE_BYTES = 8 * 1024 * 1024
+_OVERLOAD_ERROR_CODE = -32001
+_OVERLOAD_RETRIES = 3
+
+
+class _CodexRPCError(BackendError):
+    """Preserve JSON-RPC error metadata needed for safe retry decisions."""
+
+    def __init__(self, message: str, code: int | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _process_start_time(pid: int, proc_root: Path = Path("/proc")) -> str | None:
@@ -122,6 +135,8 @@ class CodexBackend(Backend):
         self._session: aiohttp.ClientSession | None = None
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._reader_task: asyncio.Task[None] | None = None
+        self._connect_lock = asyncio.Lock()
+        self._transport_closing = False
         self._events: asyncio.Queue[BackendEvent] = asyncio.Queue()
         self._ready = asyncio.Event()
         self._closed = False
@@ -136,50 +151,56 @@ class CodexBackend(Backend):
         self._setting_options: dict[str, Any] | None = None
 
     async def start(self) -> None:
-        if self._reader_task is not None:
-            return
-        deadline = asyncio.get_running_loop().time() + 30
-        last_error: BaseException | None = None
-        while asyncio.get_running_loop().time() < deadline:
-            try:
-                connector = aiohttp.UnixConnector(path=str(self.config.socket_path))
-                self._session = aiohttp.ClientSession(connector=connector)
-                self._ws = await self._session.ws_connect(
-                    "http://localhost/",
-                    timeout=aiohttp.ClientWSTimeout(ws_close=5),
-                    heartbeat=20,
-                )
-                self._reader_task = asyncio.create_task(self._reader(), name="codex-reader")
-                await self._request(
-                    "initialize",
-                    {
-                        "clientInfo": {
-                            "name": "agentwire",
-                            "title": "IRC agent bridge",
-                            "version": "0.1.0",
-                        },
-                        "capabilities": {
-                            "experimentalApi": True,
-                            "requestAttestation": False,
-                            "optOutNotificationMethods": [
-                                "item/agentMessage/delta",
-                                "item/reasoning/summaryTextDelta",
-                                "item/reasoning/textDelta",
-                                "item/commandExecution/outputDelta",
-                                "item/fileChange/outputDelta",
-                            ],
-                        },
-                    },
-                )
-                await self._send({"method": "initialized"})
-                self._ready.set()
-                await self._events.put(BackendEvent(kind="connected", backend=self.name))
+        async with self._connect_lock:
+            if self._reader_task is not None and not self._reader_task.done():
                 return
-            except (OSError, aiohttp.ClientError, TimeoutError, BackendError) as exc:
-                last_error = exc
-                await self._close_transport()
-                await asyncio.sleep(0.25)
-        raise BackendError(f"Codex app-server did not become ready: {last_error}")
+            self._closed = False
+            await self._close_transport()
+            deadline = asyncio.get_running_loop().time() + 30
+            last_error: BaseException | None = None
+            while asyncio.get_running_loop().time() < deadline:
+                try:
+                    connector = aiohttp.UnixConnector(path=str(self.config.socket_path))
+                    timeout = aiohttp.ClientTimeout(total=None, connect=5, sock_connect=5)
+                    self._session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+                    self._ws = await self._session.ws_connect(
+                        "http://localhost/",
+                        timeout=aiohttp.ClientWSTimeout(ws_close=5),
+                        heartbeat=20,
+                        compress=0,
+                        max_msg_size=_MAX_WEBSOCKET_MESSAGE_BYTES,
+                    )
+                    self._reader_task = asyncio.create_task(self._reader(), name="codex-reader")
+                    await self._request(
+                        "initialize",
+                        {
+                            "clientInfo": {
+                                "name": "agentwire",
+                                "title": "IRC agent bridge",
+                                "version": "0.1.0",
+                            },
+                            "capabilities": {
+                                "experimentalApi": True,
+                                "requestAttestation": False,
+                                "optOutNotificationMethods": [
+                                    "item/agentMessage/delta",
+                                    "item/reasoning/summaryTextDelta",
+                                    "item/reasoning/textDelta",
+                                    "item/commandExecution/outputDelta",
+                                    "item/fileChange/outputDelta",
+                                ],
+                            },
+                        },
+                    )
+                    await self._send({"method": "initialized"})
+                    self._ready.set()
+                    await self._events.put(BackendEvent(kind="connected", backend=self.name))
+                    return
+                except (OSError, aiohttp.ClientError, TimeoutError, BackendError) as exc:
+                    last_error = exc
+                    await self._close_transport()
+                    await asyncio.sleep(0.25)
+            raise BackendError(f"Codex app-server did not become ready: {last_error}")
 
     async def wait_ready(self, timeout: float = 30) -> None:
         try:
@@ -195,22 +216,30 @@ class CodexBackend(Backend):
     async def _close_transport(self) -> None:
         current = asyncio.current_task()
         self._setting_options = None
-        if self._reader_task is not None and self._reader_task is not current:
-            self._reader_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._reader_task
-        self._reader_task = None
-        if self._ws is not None:
-            with contextlib.suppress(Exception):
-                await self._ws.close()
-        self._ws = None
-        if self._session is not None:
-            with contextlib.suppress(Exception):
-                await self._session.close()
-        self._session = None
+        self._transport_closing = True
+        try:
+            if self._reader_task is not None and self._reader_task is not current:
+                self._reader_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._reader_task
+            self._reader_task = None
+            if self._ws is not None:
+                with contextlib.suppress(Exception):
+                    await self._ws.close()
+            self._ws = None
+            if self._session is not None:
+                with contextlib.suppress(Exception):
+                    await self._session.close()
+            self._session = None
+            self._fail_pending("Codex connection closed")
+        finally:
+            self._transport_closing = False
+
+    def _fail_pending(self, message: str) -> None:
+        """Wake every caller when the transport fails instead of waiting for RPC timeouts."""
         for future in self._pending.values():
             if not future.done():
-                future.set_exception(BackendError("Codex connection closed"))
+                future.set_exception(BackendError(message))
         self._pending.clear()
 
     async def _reader(self) -> None:
@@ -235,8 +264,9 @@ class CodexBackend(Backend):
         except Exception:
             pass
         finally:
-            if not self._closed:
+            if not self._closed and not self._transport_closing:
                 self._ready.clear()
+                self._fail_pending("Codex app-server disconnected")
                 await self._events.put(
                     BackendEvent(
                         kind="disconnected",
@@ -254,9 +284,14 @@ class CodexBackend(Backend):
                 return
             if "error" in message:
                 error = message.get("error") or {}
-                future.set_exception(
-                    BackendError(str(error.get("message", "Codex request failed")))
-                )
+                if isinstance(error, dict):
+                    raw_code = error.get("code")
+                    code = raw_code if isinstance(raw_code, int) else None
+                    detail = str(error.get("message", "Codex request failed"))
+                else:
+                    code = None
+                    detail = "Codex request failed"
+                future.set_exception(_CodexRPCError(detail, code))
             else:
                 future.set_result(message.get("result"))
             return
@@ -684,6 +719,23 @@ class CodexBackend(Backend):
         await self._ws.send_str(json.dumps(message, separators=(",", ":")))
 
     async def _request(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        for attempt in range(_OVERLOAD_RETRIES + 1):
+            try:
+                return await self._request_once(method, params)
+            except _CodexRPCError as exc:
+                if exc.code != _OVERLOAD_ERROR_CODE or attempt == _OVERLOAD_RETRIES:
+                    raise
+                # App-server guarantees -32001 means ingress rejection, so replay is safe.
+                delay = 0.1 * (2**attempt) + random.uniform(0, 0.1)
+                await asyncio.sleep(delay)
+        raise AssertionError("unreachable")
+
+    async def _request_once(self, method: str, params: dict[str, Any] | None = None) -> Any:
+        reader_stopped = self._reader_task is None or self._reader_task.done()
+        if self._ws is None or self._ws.closed or reader_stopped:
+            if method == "initialize":
+                raise BackendError("Codex app-server is not connected")
+            await self.start()
         self._request_id += 1
         request_id = self._request_id
         future = asyncio.get_running_loop().create_future()
@@ -695,8 +747,11 @@ class CodexBackend(Backend):
             await self._send(message)
             return await asyncio.wait_for(future, 30)
         except TimeoutError as exc:
-            self._pending.pop(request_id, None)
             raise BackendError(f"Codex request {method} timed out") from exc
+        finally:
+            pending = self._pending.pop(request_id, None)
+            if pending is not None and not pending.done():
+                pending.cancel()
 
     def events(self) -> AsyncIterator[BackendEvent]:
         async def iterate() -> AsyncIterator[BackendEvent]:

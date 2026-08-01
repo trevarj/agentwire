@@ -29,6 +29,10 @@ class StackError(RuntimeError):
     pass
 
 
+_MAX_WEBSOCKET_MESSAGE_BYTES = 8 * 1024 * 1024
+_TRANSPORT_CLOSE_TIMEOUT = 5
+
+
 class _CodexTuiRelayTracker:
     """Track the thread selected by one TUI connection from JSON-RPC lifecycle traffic."""
 
@@ -234,6 +238,7 @@ async def run_stack(config: Config) -> None:
         )
         for task in pending:
             task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
         if bridge_task in done:
             exception = bridge_task.exception()
             if exception:
@@ -255,15 +260,19 @@ async def _stop_processes(
     for _name, process in reversed(processes):
         if process.returncode is None:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGTERM)
+                # Let the parent reap its own workers before escalating to its process group.
+                process.terminate()
     for _name, process in reversed(processes):
         if process.returncode is None:
             try:
-                await asyncio.wait_for(process.wait(), 5)
+                await asyncio.wait_for(process.wait(), _TRANSPORT_CLOSE_TIMEOUT)
             except TimeoutError:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
-                await process.wait()
+                try:
+                    await asyncio.wait_for(process.wait(), _TRANSPORT_CLOSE_TIMEOUT)
+                except TimeoutError as exc:
+                    raise StackError(f"process {process.pid} did not exit after SIGKILL") from exc
 
 
 def sync_certificate(config: Config) -> None:
@@ -325,21 +334,33 @@ async def _run_codex_tui(config: Config, binary: str) -> int:
     connected = asyncio.Lock()
 
     async def relay(request: web.Request) -> web.StreamResponse:
+        if "Origin" in request.headers:
+            raise web.HTTPForbidden(text="Origin-bearing requests are not allowed")
+        probe = web.WebSocketResponse().can_prepare(request)
+        if not probe.ok:
+            raise web.HTTPUpgradeRequired(text="WebSocket upgrade required")
         if connected.locked():
             raise web.HTTPServiceUnavailable(text="this Agentwire TUI relay is already in use")
         async with connected:
-            downstream = web.WebSocketResponse()
-            await downstream.prepare(request)
             connector = aiohttp.UnixConnector(path=str(config.codex.socket_path))
+            timeout = aiohttp.ClientTimeout(total=None, connect=5, sock_connect=5)
+            downstream = web.WebSocketResponse(
+                heartbeat=20,
+                compress=False,
+                max_msg_size=_MAX_WEBSOCKET_MESSAGE_BYTES,
+            )
             try:
                 async with (
-                    aiohttp.ClientSession(connector=connector) as session,
+                    aiohttp.ClientSession(connector=connector, timeout=timeout) as session,
                     session.ws_connect(
                         "http://localhost/",
                         timeout=aiohttp.ClientWSTimeout(ws_close=5),
                         heartbeat=20,
+                        compress=0,
+                        max_msg_size=_MAX_WEBSOCKET_MESSAGE_BYTES,
                     ) as upstream,
                 ):
+                    await downstream.prepare(request)
                     client_to_server = asyncio.create_task(
                         _relay_websocket_frames(
                             downstream,
@@ -363,19 +384,30 @@ async def _run_codex_tui(config: Config, binary: str) -> int:
                     await asyncio.gather(*pending, return_exceptions=True)
                     for task in done:
                         task.result()
-            except (OSError, aiohttp.ClientError):
-                await downstream.close(
-                    code=aiohttp.WSCloseCode.INTERNAL_ERROR,
-                    message=b"Codex app-server relay failed",
-                )
+            except asyncio.CancelledError:
+                raise
+            except (OSError, aiohttp.ClientError, TimeoutError):
+                if downstream.prepared:
+                    await downstream.close(
+                        code=aiohttp.WSCloseCode.INTERNAL_ERROR,
+                        message=b"Codex app-server relay failed",
+                    )
+                else:
+                    raise web.HTTPBadGateway(text="Codex app-server is unavailable") from None
             finally:
                 tracker.close()
-                await downstream.close()
+                if downstream.prepared:
+                    await downstream.close()
             return downstream
 
-    application = web.Application()
+    application = web.Application(client_max_size=64 * 1024)
     application.router.add_get("/", relay)
-    runner = web.AppRunner(application, access_log=None)
+    runner = web.AppRunner(
+        application,
+        access_log=None,
+        handler_cancellation=True,
+        shutdown_timeout=_TRANSPORT_CLOSE_TIMEOUT,
+    )
     process: asyncio.subprocess.Process | None = None
     try:
         await runner.setup()
@@ -393,11 +425,12 @@ async def _run_codex_tui(config: Config, binary: str) -> int:
         if process is not None and process.returncode is None:
             process.terminate()
             try:
-                await asyncio.wait_for(process.wait(), 5)
+                await asyncio.wait_for(process.wait(), _TRANSPORT_CLOSE_TIMEOUT)
             except TimeoutError:
                 process.kill()
-                await process.wait()
-        await runner.cleanup()
+                await asyncio.wait_for(process.wait(), _TRANSPORT_CLOSE_TIMEOUT)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(runner.cleanup(), _TRANSPORT_CLOSE_TIMEOUT)
         with contextlib.suppress(FileNotFoundError):
             relay_path.unlink()
 

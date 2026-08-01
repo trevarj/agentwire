@@ -13,7 +13,7 @@ from aiohttp import web
 
 from agentwire.backends.codex import CodexTuiSessionPresence
 from agentwire.config import CodexConfig
-from agentwire.stack import _run_codex_tui
+from agentwire.stack import _run_codex_tui, _stop_processes
 
 
 @pytest.mark.asyncio
@@ -51,6 +51,7 @@ async def test_codex_tui_relay_forwards_lifecycle_and_publishes_presence(
     await site.start()
 
     fake_codex = tmp_path / "fake-codex"
+    status_path = tmp_path / "relay-status"
     fake_codex.write_text(
         f"""#!{sys.executable}
 import asyncio
@@ -61,6 +62,15 @@ async def main():
     socket_path = sys.argv[2].removeprefix("unix://")
     connector = aiohttp.UnixConnector(path=socket_path)
     async with aiohttp.ClientSession(connector=connector) as session:
+        async with session.get("http://localhost/") as response:
+            plain_status = response.status
+        async with session.get(
+            "http://localhost/",
+            headers={{"Origin": "https://untrusted.example"}},
+        ) as response:
+            origin_status = response.status
+        with open({str(status_path)!r}, "w", encoding="utf-8") as handle:
+            handle.write(f"{{plain_status}} {{origin_status}}")
         async with session.ws_connect("http://localhost/") as websocket:
             await websocket.send_json({{
                 "id": 1,
@@ -83,5 +93,28 @@ asyncio.run(main())
         await runner.cleanup()
 
     assert result == 0
+    assert status_path.read_text(encoding="utf-8") == "426 403"
     assert observed_sessions == [{"thread-live"}]
     assert CodexTuiSessionPresence.sessions(upstream_path) == set()
+
+
+@pytest.mark.asyncio
+async def test_stop_processes_lets_parent_reap_children() -> None:
+    class Process:
+        pid = 42
+        returncode: int | None = None
+        terminated = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        async def wait(self) -> int:
+            self.returncode = 0
+            return 0
+
+    process = Process()
+
+    await _stop_processes([("Codex app-server", process)])  # type: ignore[list-item]
+
+    assert process.terminated
+    assert process.returncode == 0

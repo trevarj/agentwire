@@ -1,12 +1,134 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 
-from agentwire.backends.codex import CodexBackend, CodexTuiSessionPresence
+from agentwire.backends.base import BackendError
+from agentwire.backends.codex import CodexBackend, CodexTuiSessionPresence, _CodexRPCError
 from agentwire.config import CodexConfig
 from agentwire.stack import _CodexTuiRelayTracker
+
+
+@pytest.mark.asyncio
+async def test_overloaded_requests_retry_with_exponential_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
+    attempts = 0
+    delays: list[float] = []
+
+    async def request_once(method: str, params: object) -> object:
+        nonlocal attempts
+        attempts += 1
+        assert method == "thread/list"
+        assert params == {"limit": 20}
+        if attempts < 3:
+            raise _CodexRPCError("Server overloaded; retry later.", -32001)
+        return {"data": []}
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(backend, "_request_once", request_once)
+    monkeypatch.setattr("agentwire.backends.codex.random.uniform", lambda _a, _b: 0.05)
+    monkeypatch.setattr("agentwire.backends.codex.asyncio.sleep", sleep)
+
+    assert await backend._request("thread/list", {"limit": 20}) == {"data": []}
+    assert attempts == 3
+    assert delays == pytest.approx([0.15, 0.25])
+
+
+@pytest.mark.asyncio
+async def test_non_overload_rpc_errors_are_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
+    attempts = 0
+
+    async def request_once(_method: str, _params: object) -> object:
+        nonlocal attempts
+        attempts += 1
+        raise _CodexRPCError("invalid request", -32600)
+
+    monkeypatch.setattr(backend, "_request_once", request_once)
+
+    with pytest.raises(BackendError, match="invalid request"):
+        await backend._request("thread/list")
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_reader_disconnect_fails_pending_requests_immediately() -> None:
+    backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
+    pending = asyncio.get_running_loop().create_future()
+    backend._pending[1] = pending
+
+    class ClosedWebSocket:
+        def __aiter__(self) -> ClosedWebSocket:
+            return self
+
+        async def __anext__(self) -> object:
+            raise StopAsyncIteration
+
+    backend._ws = ClosedWebSocket()  # type: ignore[assignment]
+    await backend._reader()
+
+    with pytest.raises(BackendError, match="disconnected"):
+        await pending
+    event = await backend._events.get()
+    assert event.kind == "disconnected"
+
+
+@pytest.mark.asyncio
+async def test_request_reconnects_when_reader_stopped(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
+    stale_reader = asyncio.create_task(asyncio.sleep(0))
+    await stale_reader
+    backend._reader_task = stale_reader
+
+    class StaleWebSocket:
+        closed = False
+
+    backend._ws = StaleWebSocket()  # type: ignore[assignment]
+    reconnected = False
+
+    async def start() -> None:
+        nonlocal reconnected
+        reconnected = True
+
+    async def send(message: dict[str, object]) -> None:
+        await backend._handle_message({"id": message["id"], "result": {"data": []}})
+
+    monkeypatch.setattr(backend, "start", start)
+    monkeypatch.setattr(backend, "_send", send)
+
+    assert await backend._request_once("thread/list") == {"data": []}
+    assert reconnected
+
+
+@pytest.mark.asyncio
+async def test_send_failure_does_not_leak_pending_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend = CodexBackend(CodexConfig(Path("/tmp/codex.sock"), "codex"))
+
+    class OpenWebSocket:
+        closed = False
+
+    backend._ws = OpenWebSocket()  # type: ignore[assignment]
+    backend._reader_task = asyncio.create_task(asyncio.sleep(30))
+
+    async def send(_message: dict[str, object]) -> None:
+        raise BackendError("send failed")
+
+    monkeypatch.setattr(backend, "_send", send)
+
+    try:
+        with pytest.raises(BackendError, match="send failed"):
+            await backend._request_once("thread/list")
+        assert backend._pending == {}
+    finally:
+        backend._reader_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await backend._reader_task
 
 
 @pytest.mark.asyncio
