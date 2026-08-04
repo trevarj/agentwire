@@ -290,7 +290,12 @@ def parse_topic(topic: str) -> TopicActivation | None:
         options[key] = urllib.parse.unquote(value)
     account = options.get("account", "").lower()
     agent = options.get("agent", "").lower()
-    backend = options.get("backend", "")
+    # Backend names are a closed lowercase set and the bridge compares this
+    # against the configured channel backend with ==. Folding here keeps a
+    # topic reading "backend=Claude" from suspending the channel: activation
+    # would stay None, every action would be dropped before reaching the
+    # journal, and the client would see nothing but an endless sync.
+    backend = options.get("backend", "").lower()
     if not account or not agent or not backend:
         raise ProtocolError("Agentwire topic requires account, agent, and backend")
     return TopicActivation(account, agent, backend, title if separator else "", options)

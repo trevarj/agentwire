@@ -42,6 +42,17 @@ def test_topic_activation_is_exact_and_percent_decoded() -> None:
         parse_topic("agentwire:v1;account=trev;backend=codex")
 
 
+def test_topic_backend_is_case_folded() -> None:
+    # The bridge compares the parsed backend against the configured channel
+    # backend with ==, and a mismatch leaves activation None so every action is
+    # dropped before it is journaled — a silent, endless sync on the client.
+    # Backends are a closed lowercase set, so fold rather than reject.
+    for written in ("claude", "Claude", "CLAUDE"):
+        activation = parse_topic(f"agentwire:v1;account=trev;agent=agentwire;backend={written}")
+        assert activation is not None
+        assert activation.backend == "claude"
+
+
 def test_single_account_topics_are_first_class() -> None:
     # One SASL account for controller and bot, separated by channel, is a
     # supported deployment: agent defaults to account and parses back equal.
