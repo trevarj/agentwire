@@ -22,7 +22,7 @@ from agentwire.backends.claude import ClaudeBackend
 from agentwire.backends.codex import CodexBackend, CodexTuiSessionPresence
 from agentwire.backends.opencode import OpenCodeBackend
 from agentwire.bridge import Bridge
-from agentwire.config import Config, install_secret_env
+from agentwire.config import ClaudeConfig, Config, install_secret_env
 from agentwire.irc import IRCClient
 
 
@@ -132,7 +132,38 @@ def doctor(config: Config) -> list[str]:
         checks["opencode"] = config.opencode.binary
     if config.claude is not None:
         checks["claude"] = config.claude.binary
-    return [f"{label}: {_binary(binary)}" for label, binary in checks.items()]
+    results = [f"{label}: {_binary(binary)}" for label, binary in checks.items()]
+    if config.claude is not None:
+        results.append(f"claude auth: {_claude_credentials(config.claude)}")
+    return results
+
+
+def _claude_credentials(claude: ClaudeConfig) -> str:
+    """Validate that the `claude` CLI will be able to authenticate."""
+    if claude.api_key_env is not None:
+        # install_secret_env already proved the variable exists in the secrets
+        # file; the value itself must never appear in doctor output.
+        return f"api key from {claude.api_key_env}"
+    try:
+        result = subprocess.run(
+            [_binary(claude.binary), "auth", "status"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise StackError(f"cannot check claude credentials: {exc}") from exc
+    try:
+        status = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        status = {}
+    if not isinstance(status, dict) or status.get("loggedIn") is not True:
+        raise StackError(
+            "claude CLI has no stored credentials; run `claude auth login` "
+            "or set [claude].api_key_env"
+        )
+    return f"logged in via {status.get('authMethod') or 'stored credentials'}"
 
 
 def _prepare_runtime(config: Config) -> None:

@@ -118,3 +118,42 @@ async def test_stop_processes_lets_parent_reap_children() -> None:
 
     assert process.terminated
     assert process.returncode == 0
+
+
+def test_claude_credentials_check_reads_auth_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agentwire import stack
+    from agentwire.config import ClaudeConfig
+    from agentwire.stack import StackError, _claude_credentials
+
+    keyed = ClaudeConfig(binary="claude", model=None, permission_mode="default", api_key_env="KEY")
+    # A configured api_key_env is validated by install_secret_env; doctor must
+    # name the variable without ever touching its value.
+    assert _claude_credentials(keyed) == "api key from KEY"
+
+    stored = ClaudeConfig(binary="claude", model=None, permission_mode="default", api_key_env=None)
+    monkeypatch.setattr(stack, "_binary", lambda name: f"/bin/{name}")
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> SimpleNamespace:
+        calls.append(command)
+        return SimpleNamespace(stdout='{"loggedIn": true, "authMethod": "claude.ai"}', returncode=0)
+
+    monkeypatch.setattr(stack.subprocess, "run", fake_run)
+    assert _claude_credentials(stored) == "logged in via claude.ai"
+    assert calls == [["/bin/claude", "auth", "status"]]
+
+    monkeypatch.setattr(
+        stack.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(stdout='{"loggedIn": false}', returncode=1),
+    )
+    with pytest.raises(StackError, match="no stored credentials"):
+        _claude_credentials(stored)
+
+    monkeypatch.setattr(
+        stack.subprocess,
+        "run",
+        lambda *a, **k: SimpleNamespace(stdout="not json", returncode=0),
+    )
+    with pytest.raises(StackError, match="no stored credentials"):
+        _claude_credentials(stored)
