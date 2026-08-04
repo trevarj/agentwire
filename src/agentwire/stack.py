@@ -18,6 +18,7 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
+from agentwire.backends.claude import ClaudeBackend
 from agentwire.backends.codex import CodexBackend, CodexTuiSessionPresence
 from agentwire.backends.opencode import OpenCodeBackend
 from agentwire.bridge import Bridge
@@ -129,6 +130,8 @@ def doctor(config: Config) -> list[str]:
     }
     if config.opencode is not None:
         checks["opencode"] = config.opencode.binary
+    if config.claude is not None:
+        checks["claude"] = config.claude.binary
     return [f"{label}: {_binary(binary)}" for label, binary in checks.items()]
 
 
@@ -163,6 +166,11 @@ async def run_bridge(config: Config) -> None:
     if config.opencode is not None:
         opencode_password = os.environ[config.opencode.password_env]
         backends["opencode"] = OpenCodeBackend(config.opencode, opencode_password)
+    if config.claude is not None:
+        api_key = (
+            os.environ[config.claude.api_key_env] if config.claude.api_key_env is not None else None
+        )
+        backends["claude"] = ClaudeBackend(config.claude, api_key)
     bridge = Bridge(config, IRCClient(config.irc, irc_password), backends)
     await bridge.run()
 
@@ -216,6 +224,8 @@ async def run_stack(config: Config) -> None:
                 ],
             )
         )
+    # Claude deliberately starts no process here: the Agent SDK owns one `claude`
+    # CLI subprocess per session, created and torn down by ClaudeBackend itself.
     processes: list[tuple[str, asyncio.subprocess.Process]] = []
     try:
         for name, command in commands:

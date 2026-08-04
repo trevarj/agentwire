@@ -1,5 +1,5 @@
 {
-  description = "Agentwire: an owner-only IRC bridge for Codex and OpenCode sessions";
+  description = "Agentwire: an owner-only IRC bridge for Codex, OpenCode, and Claude sessions";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -13,7 +13,7 @@
         src = ./.;
         pyproject = true;
         build-system = [ pkgs.python3Packages.setuptools ];
-        dependencies = [ pkgs.python3Packages.aiohttp ];
+        dependencies = with pkgs.python3Packages; [ aiohttp claude-agent-sdk ];
         nativeCheckInputs = with pkgs.python3Packages; [ pytest pytest-asyncio ] ++ [ pkgs.ruff ];
         checkPhase = ''
           runHook preCheck
@@ -73,6 +73,7 @@
             packages = [
               (pkgs.python3.withPackages (pythonPackages: with pythonPackages; [
                 aiohttp
+                claude-agent-sdk
                 pytest
                 pytest-asyncio
               ]))

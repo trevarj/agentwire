@@ -22,7 +22,8 @@ The first byte of the channel topic MUST begin this exact, case-sensitive prefix
 agentwire:v1;account=agentwire;backend=codex | Human-readable title
 ```
 
-`account` and `backend` are required. Parameter values use UTF-8 percent encoding. Unknown
+`account` and `backend` are required. `backend` is `codex`, `opencode`, or `claude`, and MUST match
+the backend the deployment has assigned to that channel. Parameter values use UTF-8 percent encoding. Unknown
 parameters MUST be preserved or ignored. ` | ` and everything after it is a human title. Topic
 removal or an invalid topic immediately suspends the harness and pauses queued prompts. It does
 not cancel a running backend turn.
@@ -116,7 +117,8 @@ the backend again.
 
 `history.request` targets the currently attached session using the envelope `sid`; older clients
 that omit it target the current binding. A supplied `sid` that differs from the binding is rejected.
-Backends with authoritative transcript pagination, including Codex, provide full persisted turns.
+Backends with authoritative transcript pagination, including Codex and Claude, provide full
+persisted turns.
 Other backends fall back to Agentwire's session-indexed journal. History never reads arbitrary IRC
 messages. It replays only transcript and request lifecycle events: user prompt, turn, assistant,
 plan, tool, usage, request, and approval-review events.
@@ -176,6 +178,11 @@ The bridge keeps settings per session and MUST reset to safe defaults when bindi
 has not been configured during the current bridge run; in particular, `auto_review` MUST NOT carry
 across a session switch.
 
+`agent.hello.data.settings` lists only what the bound backend accepts, so clients MUST drive their
+settings UI from that list rather than from the full safe-setting vocabulary. Codex advertises all
+five; OpenCode and Claude advertise `delivery` alone, and Claude takes its model from deployment
+configuration rather than from `settings.update`.
+
 `agent.hello.data.settingOptions` MAY advertise backend-sourced picker metadata for those safe
 settings. Its `model` member is an array of
 `{value, label, efforts, defaultEffort?, default?}` objects.
@@ -202,7 +209,8 @@ Harness activity:
 - `request.opened`, `request.resolved`, `approval.review.started`,
   `approval.review.completed`
 
-Codex plan notifications use `plan.updated.data` with `plan: true`, `running`, `status`
+Codex plan notifications, and the Claude backend's translation of its todo list, use
+`plan.updated.data` with `plan: true`, `running`, `status`
 (`pending`, `inProgress`, or `completed`), `completedSteps`, `totalSteps`, and a display `summary`.
 Clients MUST stop an active plan indicator when `running` becomes false or its turn completes, and
 SHOULD replace the prior plan card for the same turn instead of appending every update.

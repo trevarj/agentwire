@@ -18,11 +18,26 @@ nickname = "agentwire"
 username = "agentwire"
 realname = "Agentwire agent bridge"
 password_env = "AGENTWIRE_IRC_PASSWORD"
+# Each channel names the backend that owns it: codex, opencode, or claude.
 channels = { "#codex" = "codex" }
 
 [codex]
 socket_path = "$XDG_RUNTIME_DIR/agentwire/codex.sock"
 binary = "codex"
+
+# Only read when a channel above is bound to the "claude" backend, for example
+# channels = { "#codex" = "codex", "#claude" = "claude" }
+[claude]
+binary = "claude"
+# Optional. Omit to use whatever model the claude CLI defaults to.
+model = "claude-opus-5"
+# "default" keeps every tool approval flowing to IRC. "acceptEdits", "plan",
+# and "bypassPermissions" are also accepted.
+permission_mode = "default"
+# Optional. Names the variable in the mode-0600 secrets env file that holds the
+# credential (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN). Omit this to reuse
+# the credentials the claude CLI already stores. Never put a value here.
+api_key_env = "AGENTWIRE_CLAUDE_API_KEY"
 
 [stack]
 ssh_binary = "ssh"

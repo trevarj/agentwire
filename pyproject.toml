@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agentwire"
 version = "0.1.0"
-description = "A private IRCv3 bridge for Codex and OpenCode sessions"
+description = "A private IRCv3 bridge for Codex, OpenCode, and Claude sessions"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
-dependencies = ["aiohttp>=3.11,<4"]
+dependencies = ["aiohttp>=3.11,<4", "claude-agent-sdk>=0.2,<0.3"]
 
 [project.scripts]
 agentwire = "agentwire.cli:main"

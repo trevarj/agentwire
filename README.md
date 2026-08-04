@@ -1,6 +1,6 @@
 # Agentwire
 
-Agentwire exposes live Codex sessions as a structured agent harness over IRCv3. A
+Agentwire exposes live Codex, OpenCode, and Claude sessions as a structured agent harness over IRCv3. A
 supporting client renders sessions, turns, plans, tool cards, approvals, questions, queues, usage,
 and history while the channel remains a useful readable transcript.
 
@@ -33,7 +33,9 @@ On first use of an old JSON state path, Agentwire imports its bindings and prese
 as a mode-0600 `.legacy-json` backup.
 
 The foreground stack starts the SSH tunnel, Codex app-server, and bridge. It starts OpenCode only
-when an OpenCode-backed channel is configured:
+when an OpenCode-backed channel is configured. Claude needs no server here: when a Claude-backed
+channel is configured, the bridge starts one `claude` CLI subprocess per session through the
+Claude Agent SDK and stops it with the session.
 
 ```console
 nix run .#stack
@@ -50,6 +52,9 @@ Set a channel topic to activate the harness only after testing:
 ```text
 agentwire:v1;account=your-account;backend=codex | Project title
 ```
+
+`backend` is `codex`, `opencode`, or `claude`, and must match the backend that
+[`config.example.toml`](config.example.toml) assigns to that channel.
 
 The owner account comes from the IRCv3 `account` tag, not the nickname. Use a separate SASL
 account for the bot. Removing the prefix suspends the harness and pauses queue dispatch without

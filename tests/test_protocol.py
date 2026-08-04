@@ -116,3 +116,19 @@ def test_committed_fixtures_decode_with_reference_codec() -> None:
     prompt = decode_envelope((fixtures / "prompt-action.json").read_text(encoding="utf-8"))
     assert hello.kind == "agent.hello"
     assert prompt.kind == "turn.prompt"
+
+    claude_topic = parse_topic((fixtures / "claude-topic.txt").read_text(encoding="utf-8").strip())
+    assert claude_topic is not None
+    assert claude_topic.backend == "claude"
+    claude_hello = decode_envelope((fixtures / "claude-hello.json").read_text(encoding="utf-8"))
+    assert claude_hello.kind == "agent.hello"
+    assert claude_hello.data["backend"] == "claude"
+    # Claude advertises no model picker, so delivery is its only safe setting.
+    assert claude_hello.data["settings"] == ["delivery"]
+
+
+def test_every_committed_envelope_fixture_re_encodes_byte_for_byte() -> None:
+    fixtures = Path(__file__).parents[1] / "protocol" / "fixtures"
+    for name in ("hello.json", "prompt-action.json", "claude-hello.json"):
+        raw = (fixtures / name).read_text(encoding="utf-8").strip()
+        assert encode_envelope(decode_envelope(raw)) == raw

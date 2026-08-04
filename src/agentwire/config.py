@@ -35,6 +35,15 @@ def _required_str(data: Mapping[str, Any], key: str, section: str) -> str:
     return value.strip()
 
 
+def _optional_str(data: Mapping[str, Any], key: str, section: str) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"[{section}].{key} must be a non-empty string when present")
+    return value.strip()
+
+
 def _positive_int(data: Mapping[str, Any], key: str, default: int, section: str) -> int:
     value = data.get(key, default)
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -83,6 +92,14 @@ class OpenCodeConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class ClaudeConfig:
+    binary: str
+    model: str | None
+    permission_mode: str
+    api_key_env: str | None
+
+
+@dataclass(slots=True, frozen=True)
 class StackConfig:
     ssh_binary: str
     ssh_host: str
@@ -103,6 +120,13 @@ class Config:
     codex: CodexConfig
     opencode: OpenCodeConfig | None
     stack: StackConfig
+    # Trails the required sections so existing positional construction keeps
+    # working for deployments and tests that never enable Claude.
+    claude: ClaudeConfig | None = None
+
+
+# Only the modes that keep Agentwire's approval routing meaningful are accepted.
+CLAUDE_PERMISSION_MODES = frozenset({"default", "acceptEdits", "plan", "bypassPermissions"})
 
 
 def load_config(path: str | Path) -> Config:
@@ -134,13 +158,20 @@ def load_config(path: str | Path) -> Config:
     for channel, backend in channels_raw.items():
         if not isinstance(channel, str) or not channel.startswith("#"):
             raise ConfigError(f"invalid IRC channel: {channel!r}")
-        if backend not in {"codex", "opencode"}:
+        if backend not in {"codex", "opencode", "claude"}:
             raise ConfigError(f"unsupported backend {backend!r} for {channel}")
         channels[channel.lower()] = backend
 
     codex = _table(raw, "codex")
     opencode = _table(raw, "opencode") if "opencode" in channels.values() else None
+    claude = _table(raw, "claude") if "claude" in channels.values() else None
     stack = _table(raw, "stack")
+    permission_mode = "default"
+    if claude is not None:
+        permission_mode = _optional_str(claude, "permission_mode", "claude") or "default"
+        if permission_mode not in CLAUDE_PERMISSION_MODES:
+            allowed = ", ".join(sorted(CLAUDE_PERMISSION_MODES))
+            raise ConfigError(f"[claude].permission_mode must be one of: {allowed}")
 
     result = Config(
         path=config_path,
@@ -176,6 +207,16 @@ def load_config(path: str | Path) -> Config:
                 binary=_required_str(opencode, "binary", "opencode"),
             )
             if opencode is not None
+            else None
+        ),
+        claude=(
+            ClaudeConfig(
+                binary=_required_str(claude, "binary", "claude"),
+                model=_optional_str(claude, "model", "claude"),
+                permission_mode=permission_mode,
+                api_key_env=_optional_str(claude, "api_key_env", "claude"),
+            )
+            if claude is not None
             else None
         ),
         stack=StackConfig(
@@ -240,6 +281,10 @@ def install_secret_env(config: Config) -> None:
     required = {config.irc.password_env}
     if config.opencode is not None:
         required.add(config.opencode.password_env)
+    # Claude may authenticate through the CLI's own stored credentials, so an
+    # API key is only mandatory once the config names the variable holding it.
+    if config.claude is not None and config.claude.api_key_env is not None:
+        required.add(config.claude.api_key_env)
     missing = sorted(required - secrets.keys())
     if missing:
         raise ConfigError(f"missing required secret variables: {', '.join(missing)}")
