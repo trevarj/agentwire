@@ -296,9 +296,27 @@ def parse_topic(topic: str) -> TopicActivation | None:
     # would stay None, every action would be dropped before reaching the
     # journal, and the client would see nothing but an endless sync.
     backend = options.get("backend", "").lower()
-    if not account or not agent or not backend:
-        raise ProtocolError("Agentwire topic requires account, agent, and backend")
+    # Naming the absent fields is what makes the v1 upgrade actionable. A topic
+    # written before `agent` became required fails here, and its operator needs
+    # to be told which field to add, not that three fields are required.
+    missing = [
+        name
+        for name, value in (("account", account), ("agent", agent), ("backend", backend))
+        if not value
+    ]
+    if missing:
+        raise ProtocolError("topic is missing " + ", ".join(f"{name}=" for name in missing))
     return TopicActivation(account, agent, backend, title if separator else "", options)
+
+
+def suggested_topic(topic: str, *, account: str, agent: str, backend: str) -> str:
+    """Rebuild a correct activation topic, preserving any human title.
+
+    The result is what the deployment's own configuration says the topic should
+    be, so an operator can paste it verbatim to repair a rejected one.
+    """
+
+    return build_topic(account, backend, topic.partition(" | ")[2], agent=agent)
 
 
 def build_topic(account: str, backend: str, title: str = "", *, agent: str | None = None) -> str:

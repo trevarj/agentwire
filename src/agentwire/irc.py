@@ -123,6 +123,8 @@ class IRCClient:
         self._writer: asyncio.StreamWriter | None = None
         self._caps: set[str] = set()
         self._joined: set[str] = set()
+        # Channels whose topic the server has answered, with 331 or 332.
+        self._topics: set[str] = set()
         self._batches: dict[str, _IncomingBatch] = {}
 
     async def start(self) -> None:
@@ -213,6 +215,7 @@ class IRCClient:
         self._writer = writer
         self._caps.clear()
         self._joined.clear()
+        self._topics.clear()
         self._batches.clear()
         # The account is re-confirmed by SASL on every connection.
         self.account = ""
@@ -315,19 +318,26 @@ class IRCClient:
         await self._write_line(f"MODE {self.config.nickname} +B")
         for channel in self.config.channels:
             await self._write_line(f"JOIN {channel}")
-        while self._joined != set(self.config.channels):
+            # A server sends RPL_TOPIC unsolicited only when a topic is set, and
+            # sends nothing at all for a channel that has none. Activation is
+            # driven entirely by the topic, so waiting for a line the server was
+            # never obliged to send left such a channel indistinguishable from
+            # one whose topic had not arrived yet: silent, suspended, forever.
+            # Asking explicitly guarantees exactly one 331 or 332 per channel.
+            await self._write_line(f"TOPIC {channel}")
+        expected = set(self.config.channels)
+        while self._joined != expected or self._topics != expected:
             raw = await reader.readline()
             if not raw:
                 raise IRCError("IRC disconnected while joining channels")
             line = parse_irc_line(raw.decode("utf-8", errors="replace"))
             if line.command in {"403", "405", "471", "473", "474", "475", "477"}:
                 raise IRCError(f"IRC could not join a configured channel ({line.command})")
-            # Every other line goes through the normal dispatcher. A server
-            # answers each JOIN with the channel's topic before the next JOIN is
-            # echoed, so consuming lines here without dispatching them silently
-            # discarded the RPL_TOPIC of every channel but the last one to join:
-            # those channels then stayed suspended, with no topic, no error, and
-            # no diagnostic, until somebody happened to change their topic.
+            # Every other line goes through the normal dispatcher, so a topic
+            # reply that arrives while a later channel is still joining reaches
+            # the bridge instead of being consumed and discarded here. Readiness
+            # waits for the topic of every channel, not merely the last JOIN
+            # echo, so no reply is left unread behind the loop either.
             await self._handle_line(line)
         self._ready.set()
 
@@ -359,7 +369,10 @@ class IRCClient:
             if target.lower() == self.config.nickname.lower():
                 LOGGER.warning("kicked from %s; rejoining", channel.lower())
                 self._joined.discard(channel.lower())
+                self._topics.discard(channel.lower())
                 await self._write_line(f"JOIN {channel}")
+                # Re-ask, for the same reason the join sequence asks.
+                await self._write_line(f"TOPIC {channel}")
                 self._ready.clear()
             return
         if line.command == "JOIN" and nick.lower() == self.config.nickname.lower():
@@ -367,7 +380,7 @@ class IRCClient:
             if channel in self.config.channels:
                 LOGGER.info("joined %s", channel)
                 self._joined.add(channel)
-                if self._joined == set(self.config.channels):
+                if self._joined == self._topics == set(self.config.channels):
                     self._ready.set()
             else:
                 LOGGER.info("parting %s: not a configured bridge channel", channel)
@@ -419,7 +432,15 @@ class IRCClient:
             else:
                 return
             if channel in self.config.channels:
-                LOGGER.info("%s: topic reply %s received", channel, line.command)
+                LOGGER.info(
+                    "%s: topic reply %s received (%s)",
+                    channel,
+                    line.command,
+                    "no topic is set" if line.command == "331" else "topic present",
+                )
+                self._topics.add(channel)
+                if self._joined == self._topics == set(self.config.channels):
+                    self._ready.set()
                 await self._messages.put(
                     IRCMessage(
                         channel,

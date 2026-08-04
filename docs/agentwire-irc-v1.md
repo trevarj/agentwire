@@ -44,7 +44,13 @@ suspends the harness and pauses queued prompts. It does not cancel a running bac
 A suspended channel can publish no events, so Agentwire announces the suspension as a plain
 `NOTICE` reading `agentwire suspended: <reason>`: once for a marker that fails validation, and
 once for a marker removed from a channel it had activated. A channel that was never activated
-stays quiet, because an ordinary topic on such a channel is not an event.
+stays quiet, because an ordinary topic on such a channel is not an event. A marker that was
+meant to activate a channel also gets `; set: <topic>`, the corrected topic built from the
+deployment's own owner account, authenticated account, and channel backend, preserving any
+title, so a topic predating the required `agent` field is repaired by pasting one line.
+Agentwire never supplies a missing `agent` itself: clients authenticate events by that account
+and ignore a bridge the topic does not name, so activating anyway would publish into a void
+that is harder to diagnose than a suspension.
 
 Clients MUST authenticate both identities by the IRCv3 `account` tag, never by nickname: `account`
 is the identity whose commands the bridge obeys, and `agent` is the identity whose messages a
@@ -62,6 +68,12 @@ There is no compatibility mode. Agentwire refuses registration unless the server
 - `sasl`, `message-tags`, `account-tag`, `server-time`, `batch`, and `echo-message`
 - `labeled-response` and `standard-replies`
 - `draft/multiline`, `draft/chathistory`, and `draft/event-playback`
+
+Agentwire queries `TOPIC` for every configured channel after joining and treats registration as
+complete only once each has answered `331` or `332`. A server sends `RPL_TOPIC` unsolicited only
+when a topic is set, so a channel with no topic is otherwise indistinguishable from one whose
+topic has not arrived: both are silence, and the harness would wait for a line that is never
+coming.
 
 Deployments target Ergo 2.19.0 or newer. They SHOULD use persistent SQLite history, retain the
 channel for 30 days, and allow the client-only tag `+trevarj.github.io/agentwire` on `TAGMSG` in

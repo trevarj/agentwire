@@ -25,6 +25,7 @@ from agentwire.protocol import (
     decode_envelope,
     new_envelope,
     parse_topic,
+    suggested_topic,
 )
 from agentwire.redaction import scan_secrets
 from agentwire.state import QueuedPrompt, StateStore
@@ -64,6 +65,8 @@ class ChannelRuntime:
     )
     session_settings: dict[str, dict[str, Any]] = field(default_factory=dict)
     requests: dict[str, PendingRequest] = field(default_factory=dict)
+    # The reason last announced, so a repeated topic reply does not repeat it.
+    suspended_reason: str | None = None
     observed_sessions: set[str] = field(default_factory=set)
     attaching_session: str | None = None
     deferred_events: list[BackendEvent] = field(default_factory=list)
@@ -156,7 +159,10 @@ class Bridge:
         while True:
             message = await self.irc.recv()
             try:
-                if message.command in {"TOPIC", "332"}:
+                # 331 is "no topic is set". Treating it as an empty topic is
+                # what turns an unset topic into a stated fact rather than an
+                # absence indistinguishable from a reply that never arrived.
+                if message.command in {"TOPIC", "331", "332"}:
                     await self._handle_topic(message.channel, message.text)
                     continue
                 value = message.tags.get(PROTOCOL_TAG)
@@ -226,9 +232,18 @@ class Bridge:
 
         return self.irc.account or self.config.irc.nickname.lower()
 
-    async def _suspend(self, channel: str, reason: str) -> None:
+    async def _suspend(self, channel: str, reason: str, repair: str | None = None) -> None:
+        runtime = self.channels[channel]
+        # The reason is bounded, but a repair is appended afterwards so it is
+        # never truncated: a half-printed topic is not pasteable.
         detail = safe_one_line(reason, MAX_REASON_BYTES)
+        if repair:
+            detail = f"{detail}; set: {repair}"
         LOGGER.warning("%s: suspended: %s", channel, detail)
+        if runtime.suspended_reason == detail:
+            # A reconnect re-reads the same topic. Say it once per cause.
+            return
+        runtime.suspended_reason = detail
         # Suspension is otherwise invisible: no event can be published to a
         # channel that has no activation, so the humans in it must be told here.
         await self.irc.send_notice(channel, f"agentwire suspended: {detail}")
@@ -274,9 +289,22 @@ class Bridge:
                     f"{runtime.backend}"
                 )
         except ProtocolError as exc:
-            await self._suspend(channel, str(exc))
+            # This topic was written to activate the channel, so the operator
+            # gets the exact line that would work here. A topic predating the
+            # required `agent` field is repaired by pasting one message.
+            await self._suspend(
+                channel,
+                str(exc),
+                suggested_topic(
+                    topic,
+                    account=self.config.bridge.owner_account,
+                    agent=self._bridge_account,
+                    backend=runtime.backend,
+                ),
+            )
             raise
         runtime.activation = activation
+        runtime.suspended_reason = None
         LOGGER.info(
             "%s: activated for owner %s, agent %s, backend %s",
             channel,

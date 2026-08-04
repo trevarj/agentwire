@@ -197,7 +197,8 @@ async def test_topic_agent_is_validated_against_the_authenticated_account(tmp_pa
         (
             "#codex",
             "agentwire suspended: topic agent bridge is not this bridge's "
-            "authenticated account agentwire",
+            "authenticated account agentwire; "
+            "set: agentwire:v1;account=trev;agent=agentwire;backend=codex",
         )
     ]
 
@@ -205,6 +206,46 @@ async def test_topic_agent_is_validated_against_the_authenticated_account(tmp_pa
     await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=agentwire;backend=codex")
     assert bridge.channels["#codex"].activation is not None
     assert irc.notices == []
+
+
+@pytest.mark.asyncio
+async def test_topic_written_before_agent_was_required_gets_a_pasteable_repair(
+    tmp_path: Path,
+) -> None:
+    """The v1 upgrade made `agent=` mandatory and suspended working channels.
+
+    The bridge must not default the field: a client authenticates events by the
+    topic's agent account and ignores a bridge the topic does not name, so a
+    silently activated channel publishes into a void, which is harder to
+    diagnose than suspension. It refuses, and hands over the exact replacement.
+    """
+
+    bridge, irc, _backend = make_bridge(tmp_path)
+    with pytest.raises(ProtocolError, match="topic is missing agent="):
+        await bridge._handle_topic(
+            "#codex", "agentwire:v1;account=trev;backend=codex | Project title"
+        )
+    assert bridge.channels["#codex"].activation is None
+    assert irc.notices == [
+        (
+            "#codex",
+            "agentwire suspended: topic is missing agent=; "
+            "set: agentwire:v1;account=trev;agent=bridge;backend=codex | Project title",
+        )
+    ]
+
+    # Pasting that exact line activates the channel.
+    repair = irc.notices[0][1].split("set: ", 1)[1]
+    await bridge._handle_topic("#codex", repair)
+    assert bridge.channels["#codex"].activation is not None
+
+    # A reconnect re-reads the same broken topic; the channel is told once per
+    # cause, not once per topic reply.
+    irc.notices.clear()
+    for _ in range(3):
+        with pytest.raises(ProtocolError):
+            await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    assert len(irc.notices) == 1
 
 
 @pytest.mark.asyncio
@@ -223,7 +264,8 @@ async def test_suspension_is_announced_for_every_silent_failure(tmp_path: Path) 
     assert irc.notices == [
         (
             "#codex",
-            "agentwire suspended: topic backend claude is not the configured channel backend codex",
+            "agentwire suspended: topic backend claude is not the configured "
+            "channel backend codex; set: agentwire:v1;account=trev;agent=bridge;backend=codex",
         )
     ]
 

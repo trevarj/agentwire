@@ -99,16 +99,7 @@ CAPABILITIES = (
 )
 
 
-@pytest.mark.asyncio
-async def test_join_burst_topic_reaches_the_bridge(tmp_path: Path) -> None:
-    """Every channel's topic survives registration, not only the last one's.
-
-    A server answers each JOIN with that channel's topic before it echoes the
-    next JOIN, so a registration loop that consumed lines without dispatching
-    them discarded the topic of every channel but the last. Those channels then
-    stayed suspended with no topic, no error, and no diagnostic.
-    """
-
+def make_two_channel_client(tmp_path: Path, written: list[str]) -> IRCClient:
     client = IRCClient(
         IRCConfig(
             "localhost",
@@ -123,33 +114,105 @@ async def test_join_burst_topic_reaches_the_bridge(tmp_path: Path) -> None:
         ),
         "secret",
     )
-    client._write_line = _discard  # type: ignore[method-assign]
-    reader = asyncio.StreamReader()
-    for line in (
-        f":s CAP * LS :{CAPABILITIES}",
-        f":s CAP * ACK :{CAPABILITIES}",
-        "AUTHENTICATE +",
-        ":s 900 agentwire agentwire!u@h agentwire :You are now logged in as agentwire",
-        ":s 903 agentwire :SASL authentication successful",
-        ":s 001 agentwire :Welcome",
-        ":agentwire!u@h JOIN #codex",
-        ":s 332 agentwire #codex :agentwire:v1;account=trev;agent=agentwire;backend=codex",
-        ":s 353 agentwire = #codex :@agentwire trev",
-        ":s 366 agentwire #codex :End of NAMES",
-        ":agentwire!u@h JOIN #claude",
-    ):
+
+    async def capture(line: str) -> None:
+        written.append(line)
+
+    client._write_line = capture  # type: ignore[method-assign]
+    return client
+
+
+def feed(reader: asyncio.StreamReader, lines: tuple[str, ...]) -> None:
+    for line in lines:
         reader.feed_data(f"{line}\r\n".encode())
     reader.feed_eof()
+
+
+REGISTRATION = (
+    f":s CAP * LS :{CAPABILITIES}",
+    f":s CAP * ACK :{CAPABILITIES}",
+    "AUTHENTICATE +",
+    ":s 900 agentwire agentwire!u@h agentwire :You are now logged in as agentwire",
+    ":s 903 agentwire :SASL authentication successful",
+    ":s 001 agentwire :Welcome",
+)
+
+
+@pytest.mark.asyncio
+async def test_every_channel_topic_reaches_the_bridge(tmp_path: Path) -> None:
+    """Both channels' topics reach the bridge, not just one of them.
+
+    Two ways to lose a topic meet here. A server answers each JOIN with that
+    channel's topic before it echoes the next JOIN, so a registration loop that
+    consumed lines without dispatching them discarded the earlier channel's
+    topic; and a readiness condition satisfied by the last JOIN echo returned
+    before the last channel's topic had been read at all.
+    """
+
+    written: list[str] = []
+    client = make_two_channel_client(tmp_path, written)
+    reader = asyncio.StreamReader()
+    feed(
+        reader,
+        REGISTRATION
+        + (
+            ":agentwire!u@h JOIN #codex",
+            ":s 332 agentwire #codex :agentwire:v1;account=trev;agent=agentwire;backend=codex",
+            ":s 353 agentwire = #codex :@agentwire trev",
+            ":s 366 agentwire #codex :End of NAMES",
+            ":agentwire!u@h JOIN #claude",
+            ":s 353 agentwire = #claude :@agentwire trev",
+            ":s 366 agentwire #claude :End of NAMES",
+            ":s 332 agentwire #claude :agentwire:v1;account=trev;agent=agentwire;backend=claude",
+        ),
+    )
 
     await client._negotiate(reader)
 
     # The account the server granted, not the configured nickname, is what
     # activation validates a topic's agent against.
     assert client.account == "agentwire"
-    topic = client._messages.get_nowait()
-    assert (topic.command, topic.channel) == ("332", "#codex")
-    assert topic.text == "agentwire:v1;account=trev;agent=agentwire;backend=codex"
+    topics = {}
+    while not client._messages.empty():
+        message = client._messages.get_nowait()
+        topics[message.channel] = (message.command, message.text)
+    assert topics == {
+        "#codex": ("332", "agentwire:v1;account=trev;agent=agentwire;backend=codex"),
+        "#claude": ("332", "agentwire:v1;account=trev;agent=agentwire;backend=claude"),
+    }
 
 
-async def _discard(line: str) -> None:
-    return None
+@pytest.mark.asyncio
+async def test_channel_without_a_topic_is_reported_not_awaited(tmp_path: Path) -> None:
+    """A channel with no topic answers 331, and only because the bridge asks.
+
+    A server sends RPL_TOPIC unsolicited only when a topic exists, and sends
+    nothing at all when it does not, so a bridge that waits for the join burst
+    cannot tell "no topic" from "topic still coming": both are silence.
+    """
+
+    written: list[str] = []
+    client = make_two_channel_client(tmp_path, written)
+    reader = asyncio.StreamReader()
+    feed(
+        reader,
+        REGISTRATION
+        + (
+            ":agentwire!u@h JOIN #codex",
+            ":s 332 agentwire #codex :agentwire:v1;account=trev;agent=agentwire;backend=codex",
+            ":agentwire!u@h JOIN #claude",
+            ":s 331 agentwire #claude :No topic is set",
+        ),
+    )
+
+    await client._negotiate(reader)
+
+    assert [line for line in written if line.startswith("TOPIC ")] == [
+        "TOPIC #codex",
+        "TOPIC #claude",
+    ]
+    replies = [client._messages.get_nowait() for _ in range(client._messages.qsize())]
+    assert [(item.channel, item.command, item.text) for item in replies] == [
+        ("#codex", "332", "agentwire:v1;account=trev;agent=agentwire;backend=codex"),
+        ("#claude", "331", ""),
+    ]
