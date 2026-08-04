@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import os
 import time
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import (
@@ -75,7 +79,9 @@ class _Session:
     final_text: str = ""
     last_reply: str | None = None
     tools: dict[str, tuple[str, dict[str, Any]]] = field(default_factory=dict)
-    plan_tools: set[str] = field(default_factory=set)
+    # Tool calls rendered through a richer channel (plan updates, question
+    # requests) whose raw tool cards and results must stay off the wire.
+    hidden_tools: set[str] = field(default_factory=set)
     plan_signature: tuple[Any, ...] | None = None
 
 
@@ -97,6 +103,8 @@ class ClaudeBackend(Backend):
         self._closed = False
         self._sessions: dict[str, _Session] = {}
         self._approvals: dict[str, asyncio.Future[bool]] = {}
+        # A resolved question carries per-question answer lists; None is a skip.
+        self._questions: dict[str, asyncio.Future[list[list[str]] | None]] = {}
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -118,10 +126,11 @@ class ClaudeBackend(Backend):
     async def close(self) -> None:
         self._closed = True
         self._ready.clear()
-        for future in self._approvals.values():
+        for future in (*self._approvals.values(), *self._questions.values()):
             if not future.done():
                 future.set_exception(BackendError("Claude backend is shutting down"))
         self._approvals.clear()
+        self._questions.clear()
         for session in list(self._sessions.values()):
             await self._close_session(session)
         self._sessions.clear()
@@ -175,6 +184,8 @@ class ClaudeBackend(Backend):
             input_data: dict[str, Any],
             context: ToolPermissionContext,
         ) -> PermissionResultAllow | PermissionResultDeny:
+            if tool_name == "AskUserQuestion":
+                return await self._request_question(session_id, input_data, context)
             allowed = await self._request_approval(session_id, tool_name, input_data, context)
             if allowed:
                 return PermissionResultAllow(updated_input=input_data)
@@ -210,6 +221,70 @@ class ClaudeBackend(Backend):
             return await future
         finally:
             self._approvals.pop(token, None)
+
+    async def _request_question(
+        self,
+        session_id: str,
+        input_data: dict[str, Any],
+        context: ToolPermissionContext,
+    ) -> PermissionResultAllow | PermissionResultDeny:
+        """Route Claude's AskUserQuestion tool through the Agentwire question flow.
+
+        The CLI answers the tool itself when the permission callback allows it
+        with ``{"questions": ..., "answers": {question text: label}}``, so the
+        owner's answers travel back inside ``updated_input`` (verified against
+        Claude Code 2.1.220).
+        """
+        raw_questions = [
+            item for item in input_data.get("questions") or () if isinstance(item, dict)
+        ]
+        questions = tuple(
+            self._parse_question(raw, index) for index, raw in enumerate(raw_questions, 1)
+        )
+        if not questions:
+            return PermissionResultDeny(message="the question could not be relayed")
+        token = str(context.tool_use_id or uuid.uuid4())
+        future: asyncio.Future[list[list[str]] | None] = asyncio.get_running_loop().create_future()
+        self._questions[token] = future
+        await self._events.put(
+            BackendEvent(
+                kind="question",
+                backend=self.name,
+                session_id=session_id,
+                turn_id=self._turn_for(session_id),
+                item_id=context.tool_use_id,
+                request_token=token,
+                questions=questions,
+            )
+        )
+        try:
+            answers = await future
+        finally:
+            self._questions.pop(token, None)
+        if answers is None:
+            return PermissionResultDeny(message="the Agentwire owner skipped the question")
+        selected: dict[str, Any] = {}
+        for question, raw, values in zip(questions, raw_questions, answers, strict=False):
+            key = str(raw.get("question") or question.prompt)
+            # Single-select answers are a bare label; multi-select is a list.
+            selected[key] = list(values) if question.multiple else next(iter(values), "")
+        return PermissionResultAllow(
+            updated_input={"questions": raw_questions, "answers": selected}
+        )
+
+    @staticmethod
+    def _parse_question(raw: dict[str, Any], index: int) -> Question:
+        return Question(
+            id=str(index),
+            header=str(raw.get("header") or f"Question {index}"),
+            prompt=str(raw.get("question") or "Input requested"),
+            options=tuple(
+                str(option.get("label"))
+                for option in raw.get("options") or ()
+                if isinstance(option, dict) and option.get("label")
+            ),
+            multiple=bool(raw.get("multiSelect", False)),
+        )
 
     def _turn_for(self, session_id: str) -> str | None:
         session = self._sessions.get(session_id)
@@ -294,8 +369,13 @@ class ClaudeBackend(Backend):
 
     async def _start_tool(self, session: _Session, block: ToolUseBlock) -> None:
         if block.name == "TodoWrite":
-            session.plan_tools.add(block.id)
+            session.hidden_tools.add(block.id)
             await self._emit_plan(session, block.input)
+            return
+        if block.name == "AskUserQuestion":
+            # The question request card comes from the permission callback; a
+            # duplicate raw tool card would only confuse the timeline.
+            session.hidden_tools.add(block.id)
             return
         kind = self._tool_kind(block.name)
         data = self._tool_metadata(block.name, block.input)
@@ -366,8 +446,8 @@ class ClaudeBackend(Backend):
         for block in content:
             if not isinstance(block, ToolResultBlock):
                 continue
-            if block.tool_use_id in session.plan_tools:
-                session.plan_tools.discard(block.tool_use_id)
+            if block.tool_use_id in session.hidden_tools:
+                session.hidden_tools.discard(block.tool_use_id)
                 continue
             entry = session.tools.pop(block.tool_use_id, None)
             if entry is None:
@@ -476,6 +556,17 @@ class ClaudeBackend(Backend):
         elif name == "Task":
             description = field_text("description", "subagent_type")
             data["label"] = safe_one_line(description or name, 160)
+        elif name == "AskUserQuestion":
+            # Only history renders this as a tool card; live turns raise a request.
+            first = next(
+                (
+                    str(item.get("question") or "").strip()
+                    for item in values.get("questions") or ()
+                    if isinstance(item, dict)
+                ),
+                "",
+            )
+            data["label"] = safe_one_line(f"Question: {first}" if first else "Question", 160)
         elif name.startswith("mcp__"):
             parts = [part for part in name.split("__")[1:] if part]
             data["label"] = safe_one_line(" / ".join(parts) or name, 160)
@@ -667,7 +758,12 @@ class ClaudeBackend(Backend):
         questions: Sequence[Question],
         answers: Sequence[Sequence[str]] | None,
     ) -> None:
-        raise BackendError("Claude does not raise answerable questions over Agentwire")
+        future = self._questions.pop(str(request_token), None)
+        if future is None or future.done():
+            raise BackendError("question was already resolved")
+        # None (a skip) denies the AskUserQuestion call; the model sees the
+        # denial message and continues without an answer.
+        future.set_result([list(values) for values in answers] if answers is not None else None)
 
     async def get_last_reply(self, session_id: str) -> str | None:
         session = self._sessions.get(session_id)
@@ -709,24 +805,25 @@ class ClaudeBackend(Backend):
         # turn split across two pages keeps one identity and one ordering.
         turn_ids = self._turn_ids(messages)
         last_of_turn = {turn: index for index, turn in enumerate(turn_ids) if turn}
-        anchor = await self._history_anchor(session_id, cwd, len(messages))
+        times = await self._message_times(session_id, cwd, messages)
         events: list[BackendEvent] = []
         for index in range(start, end):
-            events.extend(
-                self._history_message(
-                    session_id,
-                    messages[index],
-                    turn_ids[index],
-                    anchor + index * 1000,
-                    starts_turn=index == 0 or turn_ids[index] != turn_ids[index - 1],
-                    ends_turn=(
-                        last_of_turn.get(turn_ids[index]) == index
-                        and (
-                            index < len(messages) - 1 or not (session is not None and session.busy)
-                        )
-                    ),
-                )
-            )
+            # Events derived from one message stay inside its window so pages
+            # remain chronologically disjoint whatever the offsets inside are.
+            cap = times[index + 1] if index + 1 < len(messages) else times[index] + 1000
+            for event in self._history_message(
+                session_id,
+                messages[index],
+                turn_ids[index],
+                times[index],
+                starts_turn=index == 0 or turn_ids[index] != turn_ids[index - 1],
+                ends_turn=(
+                    last_of_turn.get(turn_ids[index]) == index
+                    and (index < len(messages) - 1 or not (session is not None and session.busy))
+                ),
+            ):
+                event.at = min(event.at or times[index], cap - 1)
+                events.append(event)
         return HistoryPage(
             events=tuple(events),
             next_cursor=str(offset + (end - start)) if start > 0 else None,
@@ -743,12 +840,75 @@ class ClaudeBackend(Backend):
             turn_ids.append(current)
         return turn_ids
 
-    async def _history_anchor(self, session_id: str, cwd: str | None, count: int) -> int:
-        """Return the millisecond timestamp for the transcript's first message.
+    async def _message_times(
+        self,
+        session_id: str,
+        cwd: str | None,
+        messages: Sequence[Any],
+    ) -> list[int]:
+        """Return one strictly increasing millisecond timestamp per message.
 
-        The SDK does not expose per-message timestamps, so events are spaced one
-        second apart backwards from the session's last-modified time. Anchoring on
-        a stored value rather than the clock keeps `at` identical across pages.
+        The session transcript on disk records an ISO timestamp for every entry
+        even though ``SessionMessage`` drops it, so real times are read straight
+        from the JSONL. Messages without a recorded time fall back to one-second
+        spacing from the session's last-modified anchor, and any non-monotonic
+        value is clamped forward so pages stay chronologically ordered.
+        """
+        recorded = await asyncio.to_thread(self._transcript_times, session_id, cwd)
+        anchor = await self._history_anchor(session_id, cwd, len(messages))
+        times: list[int] = []
+        previous: int | None = None
+        for index, message in enumerate(messages):
+            value = recorded.get(message.uuid, anchor + index * 1000)
+            if previous is not None and value <= previous:
+                value = previous + 1
+            times.append(value)
+            previous = value
+        return times
+
+    @staticmethod
+    def _transcript_times(session_id: str, cwd: str | None) -> dict[str, int]:
+        """Map transcript entry uuid to epoch milliseconds from the on-disk JSONL."""
+        if not session_id or not all(c.isalnum() or c == "-" for c in session_id):
+            return {}
+        config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+        candidates = sorted(
+            (Path(config_dir) / "projects").glob(f"*/{session_id}.jsonl"),
+            key=lambda path: path.name,
+        )
+        for path in candidates:
+            times: dict[str, int] = {}
+            try:
+                with path.open(encoding="utf-8") as handle:
+                    for line in handle:
+                        try:
+                            entry = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(entry, dict):
+                            continue
+                        identifier = entry.get("uuid")
+                        stamp = entry.get("timestamp")
+                        if not isinstance(identifier, str) or not isinstance(stamp, str):
+                            continue
+                        try:
+                            moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                        except ValueError:
+                            continue
+                        times[identifier] = int(moment.timestamp() * 1000)
+            except OSError:
+                continue
+            if times:
+                return times
+        return {}
+
+    async def _history_anchor(self, session_id: str, cwd: str | None, count: int) -> int:
+        """Return the fallback millisecond timestamp for the transcript's start.
+
+        Used only for messages whose on-disk entry lacks a readable timestamp:
+        those are spaced one second apart backwards from the session's
+        last-modified time. Anchoring on a stored value rather than the clock
+        keeps `at` identical across pages.
         """
         try:
             info = await asyncio.to_thread(get_session_info, session_id, cwd)

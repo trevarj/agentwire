@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -289,12 +291,98 @@ async def test_prompt_opens_a_turn_and_steering_requires_an_active_one() -> None
 
 
 @pytest.mark.asyncio
-async def test_unknown_session_and_questions_are_refused() -> None:
+async def test_unknown_sessions_and_unknown_questions_are_refused() -> None:
     harness = backend()
     with pytest.raises(BackendError, match="is not attached"):
         await harness.send_message(SESSION, "hello")
-    with pytest.raises(BackendError, match="does not raise answerable questions"):
+    with pytest.raises(BackendError, match="already resolved"):
         await harness.resolve_question("token", (), None)
+
+
+QUESTION_INPUT = {
+    "questions": [
+        {
+            "question": "Which color do you prefer?",
+            "header": "Color",
+            "options": [{"label": "Red", "description": "warm"}, {"label": "Blue"}],
+            "multiSelect": False,
+        },
+        {
+            "question": "Which sections should I include?",
+            "header": "Sections",
+            "options": [{"label": "Intro"}, {"label": "End"}],
+            "multiSelect": True,
+        },
+    ]
+}
+
+
+@pytest.mark.asyncio
+async def test_ask_user_question_round_trips_answers_through_the_permission_callback() -> None:
+    harness = backend()
+    attached(harness, busy=True)
+    handler = harness._permission_handler(SESSION)
+    pending = asyncio.create_task(
+        handler("AskUserQuestion", QUESTION_INPUT, ToolPermissionContext(tool_use_id="toolu_q"))
+    )
+
+    opened = await harness._events.get()
+    assert opened.kind == "question"
+    assert opened.request_token == "toolu_q"
+    assert opened.session_id == SESSION
+    assert [q.prompt for q in opened.questions] == [
+        "Which color do you prefer?",
+        "Which sections should I include?",
+    ]
+    assert opened.questions[0].options == ("Red", "Blue")
+    assert opened.questions[0].multiple is False
+    assert opened.questions[1].multiple is True
+
+    await harness.resolve_question("toolu_q", opened.questions, (("Red",), ("Intro", "End")))
+    result = await pending
+    assert isinstance(result, PermissionResultAllow)
+    # The CLI answers the tool itself from this exact updated_input shape.
+    assert result.updated_input == {
+        "questions": QUESTION_INPUT["questions"],
+        "answers": {
+            "Which color do you prefer?": "Red",
+            "Which sections should I include?": ["Intro", "End"],
+        },
+    }
+    with pytest.raises(BackendError, match="already resolved"):
+        await harness.resolve_question("toolu_q", opened.questions, None)
+
+
+@pytest.mark.asyncio
+async def test_skipping_a_question_denies_that_single_tool_call() -> None:
+    harness = backend()
+    attached(harness, busy=True)
+    handler = harness._permission_handler(SESSION)
+    pending = asyncio.create_task(
+        handler("AskUserQuestion", QUESTION_INPUT, ToolPermissionContext(tool_use_id="toolu_s"))
+    )
+    opened = await harness._events.get()
+    await harness.resolve_question("toolu_s", opened.questions, None)
+    result = await pending
+    assert isinstance(result, PermissionResultDeny)
+    assert "skipped" in result.message
+
+
+@pytest.mark.asyncio
+async def test_question_tool_blocks_never_render_raw_tool_cards() -> None:
+    harness = backend()
+    session = attached(harness, busy=True)
+    await harness._handle_message(
+        session,
+        assistant(ToolUseBlock(id="toolu_ask", name="AskUserQuestion", input=QUESTION_INPUT)),
+    )
+    await harness._handle_message(
+        session,
+        UserMessage(
+            content=[ToolResultBlock(tool_use_id="toolu_ask", content="answered", is_error=False)]
+        ),
+    )
+    assert drain(harness) == []
 
 
 def transcript() -> list[SessionMessage]:
@@ -454,6 +542,57 @@ async def test_a_turn_split_across_pages_keeps_one_turn_id(
 
 
 @pytest.mark.asyncio
+async def test_history_prefers_recorded_transcript_timestamps(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    stub_transcript(monkeypatch)
+    base = 1_785_000_000_000
+    stamps = {
+        "u1": base,
+        "a1": base + 20,
+        "u2": base + 40,
+        "a2": base + 45,
+        "u3": base + 60_000,
+        "a3": base + 63_000,
+    }
+    project = tmp_path / "projects" / "workspace"
+    project.mkdir(parents=True)
+    lines = [
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": uid,
+                "timestamp": datetime.fromtimestamp(ms / 1000, tz=UTC)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            }
+        )
+        for uid, ms in stamps.items()
+    ]
+    (project / f"{SESSION}.jsonl").write_text("\n".join(lines), encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    harness = backend()
+
+    page = await harness.list_history(SESSION, None, 6)
+    ats = [event.at for event in page.events]
+    assert ats == sorted(ats)
+    prompt = next(e for e in page.events if e.kind == "user_prompt" and e.text == "first prompt")
+    # Real recorded times, not backwards-synthesized spacing from last_modified.
+    assert stamps["u1"] <= prompt.at < stamps["a1"]
+    reply = next(e for e in page.events if e.text == "all done")
+    assert reply.at == stamps["a3"]
+    # Messages milliseconds apart must not leak events into the next message's window.
+    tool_result = next(e for e in page.events if e.kind == "tool_finished")
+    assert stamps["u2"] <= tool_result.at < stamps["a2"]
+
+    newest = await harness.list_history(SESSION, None, 2)
+    older = await harness.list_history(SESSION, newest.next_cursor, 4)
+    assert max(event.at or 0 for event in older.events) < min(
+        event.at or 0 for event in newest.events
+    )
+
+
+@pytest.mark.asyncio
 async def test_sessions_and_last_reply_come_from_the_transcript(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -493,6 +632,10 @@ def test_tool_labels_cover_claude_code_built_ins() -> None:
     )
     assert metadata("mcp__github__list_prs", {})["label"] == "github / list_prs"
     assert metadata("Task", {"description": "review the diff"})["label"] == "review the diff"
+    # Rendered only from history replays; live turns raise a question request.
+    assert metadata("AskUserQuestion", QUESTION_INPUT)["label"] == (
+        "Question: Which color do you prefer?"
+    )
 
 
 def test_claude_channel_requires_its_section_and_a_known_permission_mode(tmp_path) -> None:
