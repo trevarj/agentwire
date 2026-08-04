@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import re
 import secrets
 import time
@@ -12,7 +13,7 @@ from typing import Any
 
 from agentwire.backends.base import Backend, BackendError
 from agentwire.config import Config, ConfigError, resolve_workspace
-from agentwire.irc import IRCClient
+from agentwire.irc import IRCClient, IRCMessage
 from agentwire.models import BackendEvent, ChannelBinding, Question, SessionSummary
 from agentwire.protocol import (
     HISTORY_EVENT_KINDS,
@@ -31,6 +32,10 @@ from agentwire.text import clean_block, clean_text, safe_one_line, truncate_utf8
 
 MAX_CONTENT_BYTES = 64 * 1024
 MAX_PREVIEW_BYTES = 4 * 1024
+MAX_REASON_BYTES = 200
+# Diagnostics name channels, accounts, kinds, and reasons. They never carry
+# prompt text, tool output, tag values, or credentials.
+LOGGER = logging.getLogger("agentwire.bridge")
 _SENSITIVE_QUESTION_RE = re.compile(
     r"\b(?:password|passphrase|secret|api[ _-]?key|access[ _-]?token|"
     r"private[ _-]?key|credential)\b",
@@ -154,42 +159,131 @@ class Bridge:
                 if message.command in {"TOPIC", "332"}:
                     await self._handle_topic(message.channel, message.text)
                     continue
-                runtime = self.channels[message.channel]
-                if runtime.activation is None:
-                    continue
-                if message.account != runtime.activation.account:
-                    continue
                 value = message.tags.get(PROTOCOL_TAG)
                 if not isinstance(value, str):
+                    # Ordinary channel conversation. Reporting it would bury the
+                    # protocol traffic that matters, so it stays silent.
+                    continue
+                runtime = self.channels[message.channel]
+                if runtime.activation is None:
+                    self._log_drop(message, "the channel has no valid activation topic")
+                    continue
+                if message.account != runtime.activation.account:
+                    self._log_drop(
+                        message,
+                        f"sender account {message.account or '<none>'} is not the topic"
+                        f" owner account {runtime.activation.account}",
+                    )
                     continue
                 if "draft/playback" in message.tags or "znc.in/playback" in message.tags:
+                    self._log_drop(message, "it is history playback, which is never replayed")
                     continue
                 envelope = self._reassemblers[message.channel].add(value)
                 if envelope is not None:
                     await self._handle_action(message.channel, envelope)
+                else:
+                    LOGGER.debug(
+                        "%s: holding a fragment until its message is complete", message.channel
+                    )
             except (BackendError, ConfigError, ProtocolError, ValueError) as exc:
                 await self._emit_failure(message.channel, None, str(exc))
             except Exception:
                 await self._emit_failure(message.channel, None, "unexpected bridge failure")
 
+    def _is_own_message(self, message: IRCMessage) -> bool:
+        return message.nick.lower() == self.config.irc.nickname.lower()
+
+    def _log_drop(self, message: IRCMessage, reason: str) -> None:
+        """Report a message that claimed to be protocol traffic and was dropped.
+
+        Only the tag's presence, the sender's identity, and the reason are
+        reported; the tag value is the payload and never reaches the log.
+        """
+
+        if self._is_own_message(message):
+            # echo-message hands the bridge back everything it publishes. That
+            # is expected traffic, not a fault, so it must not warn.
+            LOGGER.debug(
+                "%s: ignored this bridge's own echoed %s", message.channel, message.command
+            )
+            return
+        LOGGER.warning(
+            "%s: dropped a protocol %s from %s (account %s) because %s",
+            message.channel,
+            message.command,
+            message.nick or "<unknown>",
+            message.account or "<none>",
+            reason,
+        )
+
+    @property
+    def _bridge_account(self) -> str:
+        """The account the server confirmed, falling back to the nickname.
+
+        A single-account deployment registers a nickname that is its account, so
+        the fallback keeps that shape working before SASL has been confirmed.
+        """
+
+        return self.irc.account or self.config.irc.nickname.lower()
+
+    async def _suspend(self, channel: str, reason: str) -> None:
+        detail = safe_one_line(reason, MAX_REASON_BYTES)
+        LOGGER.warning("%s: suspended: %s", channel, detail)
+        # Suspension is otherwise invisible: no event can be published to a
+        # channel that has no activation, so the humans in it must be told here.
+        await self.irc.send_notice(channel, f"agentwire suspended: {detail}")
+
     async def _handle_topic(self, channel: str, topic: str) -> None:
         runtime = self.channels[channel]
         # A topic change suspends the channel until the complete new marker validates.
+        was_active = runtime.activation is not None
         runtime.activation = None
-        activation = parse_topic(topic)
-        if activation is None:
-            return
-        if activation.account != self.config.bridge.owner_account:
-            raise ProtocolError("topic account does not match the configured owner account")
-        # Clients trust backend events only from the topic's agent account, so a
-        # topic naming any other account would run the harness while every event
-        # it publishes is rejected. The bridge authenticates with SASL as its
-        # nickname, which is therefore the account its messages are tagged with.
-        if activation.agent != self.config.irc.nickname.lower():
-            raise ProtocolError("topic agent does not match this bridge's account")
-        if activation.backend != runtime.backend:
-            raise ProtocolError("topic backend does not match the configured channel backend")
+        try:
+            activation = parse_topic(topic)
+            if activation is None:
+                # No marker at all. Announce the transition out of an active
+                # channel, because that is a state change operators must see,
+                # but stay quiet for a channel that was already inactive: that
+                # topic is ordinary channel life, and announcing it would post a
+                # notice on every reconnect to a channel nobody has activated.
+                if was_active:
+                    await self._suspend(channel, "the activation topic was removed")
+                else:
+                    LOGGER.info("%s: no activation topic; the channel stays suspended", channel)
+                return
+            if activation.account != self.config.bridge.owner_account:
+                raise ProtocolError(
+                    f"topic account {activation.account} is not the configured owner account "
+                    f"{self.config.bridge.owner_account}"
+                )
+            # Clients trust backend events only from the topic's agent account,
+            # so a topic naming any other account would run the harness while
+            # every event it publishes is rejected. The authority is the account
+            # the server confirmed for this connection, not the configured
+            # nickname: a bridge whose nickname and account differ would
+            # otherwise activate into a channel where nothing it says is
+            # trusted.
+            if activation.agent != self._bridge_account:
+                raise ProtocolError(
+                    f"topic agent {activation.agent} is not this bridge's authenticated "
+                    f"account {self._bridge_account}"
+                )
+            if activation.backend != runtime.backend:
+                raise ProtocolError(
+                    f"topic backend {activation.backend} is not the configured channel backend "
+                    f"{runtime.backend}"
+                )
+        except ProtocolError as exc:
+            await self._suspend(channel, str(exc))
+            raise
         runtime.activation = activation
+        LOGGER.info(
+            "%s: activated for owner %s, agent %s, backend %s",
+            channel,
+            activation.account,
+            activation.agent,
+            activation.backend,
+        )
         if runtime.binding is not None:
             summary = await self.backends[runtime.backend].attach_session(
                 runtime.binding.session_id, runtime.binding.cwd
@@ -272,6 +366,14 @@ class Bridge:
 
     async def _handle_action(self, channel: str, action: Envelope) -> None:
         if action.message_type != "action":
+            # Published events come back through echo-message and are never
+            # commands. Expected traffic, so this stays below warning level.
+            LOGGER.debug(
+                "%s: ignored a %s %s, which is not an action",
+                channel,
+                action.message_type,
+                action.kind,
+            )
             return
         if action.history:
             await self._emit_failure(channel, action.id, "historic actions cannot be executed")
@@ -282,7 +384,8 @@ class Bridge:
         if action.kind != "sync.request" and action.epoch != self.epoch:
             await self._emit_failure(channel, action.id, "stale or missing live epoch")
             return
-        duplicate = await self.state.claim_action(action)
+        LOGGER.info("%s: journaling action %s (%s)", channel, action.kind, action.id)
+        duplicate = await self.state.claim_action(action, channel)
         if duplicate is not None:
             await self._emit(
                 channel,

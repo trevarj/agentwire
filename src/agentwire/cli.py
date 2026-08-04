@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
 from pathlib import Path
@@ -47,8 +48,24 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def configure_logging() -> None:
+    """Send bridge diagnostics to stderr.
+
+    ``AGENTWIRE_LOG_LEVEL`` overrides the default; ``DEBUG`` adds the
+    per-message classifications that are too chatty for normal operation.
+    """
+
+    level = os.environ.get("AGENTWIRE_LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        stream=sys.stderr,
+    )
+
+
 def main() -> None:
     arguments = _parser().parse_args()
+    configure_logging()
     try:
         config = load_config(arguments.config)
         if arguments.command == "run":

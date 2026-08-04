@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import logging
 import random
 import secrets
 import ssl
@@ -13,6 +14,11 @@ from types import MappingProxyType
 from agentwire.config import IRCConfig
 from agentwire.protocol import PROTOCOL_TAG, Envelope, fragment_envelope
 from agentwire.text import clean_text, truncate_utf8
+
+# Diagnostics describe identities, classifications, and lifecycle transitions.
+# They never carry message text, tag values, or credentials: IRC traffic is the
+# payload this bridge is trusted with, and a log file is not a secret store.
+LOGGER = logging.getLogger("agentwire.irc")
 
 
 class IRCError(RuntimeError):
@@ -104,6 +110,10 @@ class IRCClient:
     def __init__(self, config: IRCConfig, password: str) -> None:
         self.config = config
         self.password = password
+        # The account the server confirms for this connection, which is what
+        # tags every message the bridge publishes. It is not necessarily the
+        # configured nickname, so activation validates against this value.
+        self.account = ""
         self._messages: asyncio.Queue[IRCMessage] = asyncio.Queue()
         self._outgoing: asyncio.Queue[_OutgoingMessage] = asyncio.Queue()
         self._ready = asyncio.Event()
@@ -145,6 +155,12 @@ class IRCClient:
             return
         await self._outgoing.put(_OutgoingMessage(target, cleaned))
 
+    async def send_notice(self, target: str, text: str) -> None:
+        cleaned = clean_text(text)
+        if not cleaned:
+            return
+        await self._outgoing.put(_OutgoingMessage(target, cleaned, command="NOTICE"))
+
     async def send_tagmsg(self, target: str, tags: Mapping[str, str]) -> None:
         await self._outgoing.put(_OutgoingMessage(target, tags=tags, command="TAGMSG"))
 
@@ -168,11 +184,21 @@ class IRCClient:
                 delay = 0.5
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
                 self._ready.clear()
                 await self._close_connection()
                 if self._closed:
                     return
+                # Only IRCError text is this module's own wording; any other
+                # exception is reported by class alone so no server or socket
+                # detail is copied into the log.
+                reason = str(exc) if isinstance(exc, IRCError) else ""
+                LOGGER.warning(
+                    "IRC connection failed (%s%s); reconnecting in about %.1fs",
+                    type(exc).__name__,
+                    f": {reason}" if reason else "",
+                    delay,
+                )
                 await asyncio.sleep(delay + random.random() * min(delay, 1))
                 delay = min(delay * 2, 30)
 
@@ -188,6 +214,8 @@ class IRCClient:
         self._caps.clear()
         self._joined.clear()
         self._batches.clear()
+        # The account is re-confirmed by SASL on every connection.
+        self.account = ""
         await self._write_line("CAP LS 302")
         await self._write_line(f"NICK {self.config.nickname}")
         await self._write_line(f"USER {self.config.username} 0 * :{self.config.realname}")
@@ -263,6 +291,11 @@ class IRCClient:
                 if len(payload) % 400 == 0:
                     await self._write_line("AUTHENTICATE +")
                 continue
+            if line.command == "900" and len(line.params) >= 3:
+                # RPL_LOGGEDIN names the account the server actually granted,
+                # which is the account tag every message of ours will carry.
+                self._note_account(line.params[2], "SASL login")
+                continue
             if line.command == "903":
                 sasl_complete = True
                 await self._write_line("CAP END")
@@ -274,6 +307,11 @@ class IRCClient:
                 welcome = True
         if not sasl_complete:
             raise IRCError("IRC registration completed without SASL")
+        LOGGER.info(
+            "IRC registered as nick %s, account %s",
+            self.config.nickname,
+            self.account or "<unconfirmed>",
+        )
         await self._write_line(f"MODE {self.config.nickname} +B")
         for channel in self.config.channels:
             await self._write_line(f"JOIN {channel}")
@@ -282,26 +320,44 @@ class IRCClient:
             if not raw:
                 raise IRCError("IRC disconnected while joining channels")
             line = parse_irc_line(raw.decode("utf-8", errors="replace"))
-            if line.command == "PING":
-                await self._write_line(f"PONG :{line.params[-1]}")
-            elif line.command == "JOIN" and self._nick(line.prefix) == self.config.nickname:
-                channel = line.params[0].lower()
-                if channel in self.config.channels:
-                    self._joined.add(channel)
-                else:
-                    await self._write_line(f"PART {channel} :not a bridge channel")
-            elif line.command in {"403", "405", "471", "473", "474", "475", "477"}:
+            if line.command in {"403", "405", "471", "473", "474", "475", "477"}:
                 raise IRCError(f"IRC could not join a configured channel ({line.command})")
+            # Every other line goes through the normal dispatcher. A server
+            # answers each JOIN with the channel's topic before the next JOIN is
+            # echoed, so consuming lines here without dispatching them silently
+            # discarded the RPL_TOPIC of every channel but the last one to join:
+            # those channels then stayed suspended, with no topic, no error, and
+            # no diagnostic, until somebody happened to change their topic.
+            await self._handle_line(line)
         self._ready.set()
+
+    def _note_account(self, account: str, source: str) -> None:
+        value = account.strip().lower()
+        if not value or value == self.account:
+            return
+        if self.account:
+            LOGGER.warning("IRC account changed from %s to %s (%s)", self.account, value, source)
+        else:
+            LOGGER.info("IRC authenticated account is %s (%s)", value, source)
+        self.account = value
 
     async def _handle_line(self, line: IRCLine) -> None:
         if line.command == "PING":
             await self._write_line(f"PONG :{line.params[-1]}")
             return
         nick = self._nick(line.prefix)
+        if line.command == "900" and len(line.params) >= 3:
+            self._note_account(line.params[2], "SASL login")
+            return
+        if nick.lower() == self.config.nickname.lower():
+            # echo-message returns the bridge's own traffic carrying the account
+            # tag the server attributed it to, which is the identity clients
+            # authenticate events against.
+            self._note_account(str(line.tags.get("account") or ""), "own echoed message")
         if line.command == "KICK" and len(line.params) >= 2:
             channel, target = line.params[:2]
             if target.lower() == self.config.nickname.lower():
+                LOGGER.warning("kicked from %s; rejoining", channel.lower())
                 self._joined.discard(channel.lower())
                 await self._write_line(f"JOIN {channel}")
                 self._ready.clear()
@@ -309,10 +365,12 @@ class IRCClient:
         if line.command == "JOIN" and nick.lower() == self.config.nickname.lower():
             channel = line.params[0].lower()
             if channel in self.config.channels:
+                LOGGER.info("joined %s", channel)
                 self._joined.add(channel)
                 if self._joined == set(self.config.channels):
                     self._ready.set()
             else:
+                LOGGER.info("parting %s: not a configured bridge channel", channel)
                 await self._write_line(f"PART {channel} :not a bridge channel")
             return
         if line.command == "BATCH" and line.params:
@@ -361,6 +419,7 @@ class IRCClient:
             else:
                 return
             if channel in self.config.channels:
+                LOGGER.info("%s: topic reply %s received", channel, line.command)
                 await self._messages.put(
                     IRCMessage(
                         channel,
@@ -378,6 +437,13 @@ class IRCClient:
             return
         channel = line.params[0].lower()
         if channel not in self.config.channels:
+            if PROTOCOL_TAG in line.tags:
+                LOGGER.warning(
+                    "dropped a protocol %s from %s: %s is not a configured bridge channel",
+                    line.command,
+                    nick or "<server>",
+                    channel,
+                )
             return
         account = str(line.tags.get("account") or "").lower()
         message = IRCMessage(
@@ -413,7 +479,13 @@ class IRCClient:
                     lines.append(piece)
                     remaining = remaining[len(piece) :]
                 lines.append(remaining or " ")
-            if len(lines) > 1 and {"batch", "draft/multiline"} <= self._caps:
+            # A multiline batch carries PRIVMSG lines, so only a PRIVMSG may use
+            # it; a NOTICE is always sent as discrete lines.
+            if (
+                len(lines) > 1
+                and message.command == "PRIVMSG"
+                and {"batch", "draft/multiline"} <= self._caps
+            ):
                 batch_id = f"bridge-{secrets.token_hex(4)}"
                 tag_prefix = _format_tags(message.tags) if message.tags else ""
                 await self._write_line(f"{tag_prefix}BATCH +{batch_id} draft/multiline {target}")
@@ -424,7 +496,7 @@ class IRCClient:
             else:
                 for item in lines:
                     tag_prefix = _format_tags(message.tags) if message.tags else ""
-                    await self._write_line(f"{tag_prefix}PRIVMSG {target} :{item}")
+                    await self._write_line(f"{tag_prefix}{message.command} {target} :{item}")
                     await asyncio.sleep(0.15)
 
     async def _write_line(self, line: str) -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from types import MappingProxyType
@@ -35,9 +36,12 @@ from agentwire.protocol import PROTOCOL_TAG, ProtocolError, encode_envelope, new
 
 
 class FakeIRC:
-    def __init__(self) -> None:
+    def __init__(self, account: str = "") -> None:
         self.incoming: asyncio.Queue[Any] = asyncio.Queue()
         self.sent: list[tuple[str, Any, str | None]] = []
+        self.notices: list[tuple[str, str]] = []
+        # The account the server confirmed; empty until SASL reports one.
+        self.account = account
 
     async def start(self) -> None: ...
 
@@ -50,6 +54,9 @@ class FakeIRC:
 
     async def send_protocol(self, channel: str, envelope: Any, preview: str | None = None) -> None:
         self.sent.append((channel, envelope, preview))
+
+    async def send_notice(self, channel: str, text: str) -> None:
+        self.notices.append((channel, text))
 
 
 class FakeBackend(Backend):
@@ -127,8 +134,10 @@ class FakeBackend(Backend):
         return None
 
 
-def make_bridge(tmp_path: Path, owner: str = "trev") -> tuple[Bridge, FakeIRC, FakeBackend]:
-    irc = FakeIRC()
+def make_bridge(
+    tmp_path: Path, owner: str = "trev", account: str = ""
+) -> tuple[Bridge, FakeIRC, FakeBackend]:
+    irc = FakeIRC(account)
     backend = FakeBackend(str(tmp_path))
     config = Config(
         path=tmp_path / "config.toml",
@@ -172,6 +181,118 @@ async def test_topic_activates_harness_and_emits_bootstrap(tmp_path: Path) -> No
             "#codex", "agentwire:v1;account=trev;agent=intruder;backend=codex"
         )
     assert bridge.channels["#codex"].activation is None
+
+
+@pytest.mark.asyncio
+async def test_topic_agent_is_validated_against_the_authenticated_account(tmp_path: Path) -> None:
+    # The server confirmed the account "agentwire" for a connection whose
+    # nickname is "bridge". Events are attributed by account, so the account is
+    # the only identity a topic may name.
+    bridge, irc, _backend = make_bridge(tmp_path, account="agentwire")
+    with pytest.raises(ProtocolError, match="agent bridge is not this bridge's"):
+        await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    assert bridge.channels["#codex"].activation is None
+    assert irc.sent == []
+    assert irc.notices == [
+        (
+            "#codex",
+            "agentwire suspended: topic agent bridge is not this bridge's "
+            "authenticated account agentwire",
+        )
+    ]
+
+    irc.notices.clear()
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=agentwire;backend=codex")
+    assert bridge.channels["#codex"].activation is not None
+    assert irc.notices == []
+
+
+@pytest.mark.asyncio
+async def test_suspension_is_announced_for_every_silent_failure(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    # A channel that was never activated stays quiet: an ordinary topic is not
+    # an event, and announcing it would post a notice on every reconnect.
+    await bridge._handle_topic("#codex", "an ordinary channel topic")
+    assert irc.notices == []
+
+    # A prefixed topic whose field fails validation is announced.
+    with pytest.raises(ProtocolError, match="backend"):
+        await bridge._handle_topic(
+            "#codex", "agentwire:v1;account=trev;agent=bridge;backend=claude"
+        )
+    assert irc.notices == [
+        (
+            "#codex",
+            "agentwire suspended: topic backend claude is not the configured channel backend codex",
+        )
+    ]
+
+    # So is a malformed marker, which never yields an activation to compare.
+    irc.notices.clear()
+    with pytest.raises(ProtocolError):
+        await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=;backend=codex")
+    assert irc.notices[0][0] == "#codex"
+    assert irc.notices[0][1].startswith("agentwire suspended: ")
+
+    # Losing the marker from an active channel is a state change operators must
+    # see, so that transition is announced too.
+    irc.notices.clear()
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    assert irc.notices == []
+    await bridge._handle_topic("#codex", "an ordinary channel topic")
+    assert irc.notices == [("#codex", "agentwire suspended: the activation topic was removed")]
+
+
+@pytest.mark.asyncio
+async def test_dropped_protocol_message_reports_its_reason(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    action = new_envelope("sync.request", "action", "client", device="phone")
+    tags = MappingProxyType({PROTOCOL_TAG: encode_envelope(action)})
+
+    async def pump(message: IRCMessage) -> None:
+        await irc.incoming.put(message)
+        task = asyncio.create_task(bridge._irc_loop())
+        for _ in range(200):
+            if irc.incoming.empty():
+                break
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    with caplog.at_level(logging.DEBUG, logger="agentwire.bridge"):
+        # Ordinary chatter carries no protocol tag and must never be reported.
+        await pump(IRCMessage("#codex", "trev", "trev", "hello everyone"))
+        assert caplog.records == []
+
+        # A suspended channel silently discarded this before; now it says so.
+        await pump(IRCMessage("#codex", "trev", "trev", "", tags, "TAGMSG"))
+        suspended = [record for record in caplog.records if record.levelno == logging.WARNING]
+        assert len(suspended) == 1
+        assert "no valid activation topic" in suspended[0].getMessage()
+
+        caplog.clear()
+        await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+        caplog.clear()
+
+        # A stranger's action names the account that failed the owner check.
+        await pump(IRCMessage("#codex", "mallory", "mallory", "", tags, "TAGMSG"))
+        rejected = [record for record in caplog.records if record.levelno == logging.WARNING]
+        assert len(rejected) == 1
+        assert "sender account mallory is not the topic owner account trev" in (
+            rejected[0].getMessage()
+        )
+
+        # The bridge's own echoed traffic is expected, so it never warns.
+        caplog.clear()
+        await pump(IRCMessage("#codex", "bridge", "bridge", "", tags, "TAGMSG"))
+        assert [record for record in caplog.records if record.levelno >= logging.WARNING] == []
+
+    # No diagnostic ever repeats a tag value or message text.
+    assert all(encode_envelope(action) not in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio

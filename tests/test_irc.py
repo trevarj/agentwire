@@ -73,3 +73,83 @@ async def test_fragment_tail_uses_tagmsg(tmp_path: Path) -> None:
     assert messages[0].command == "PRIVMSG"
     assert len(messages) > 1
     assert all(message.command == "TAGMSG" for message in messages[1:])
+
+
+@pytest.mark.asyncio
+async def test_notice_is_sent_as_a_notice(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    lines: list[str] = []
+
+    async def capture(line: str) -> None:
+        lines.append(line)
+
+    client._write_line = capture  # type: ignore[method-assign]
+    await client.send_notice("#c", "agentwire suspended: reason")
+    task = asyncio.create_task(client._write_messages())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert lines == ["NOTICE #c :agentwire suspended: reason"]
+
+
+CAPABILITIES = (
+    "sasl account-tag message-tags server-time batch draft/multiline labeled-response "
+    "echo-message standard-replies draft/chathistory draft/event-playback extended-join"
+)
+
+
+@pytest.mark.asyncio
+async def test_join_burst_topic_reaches_the_bridge(tmp_path: Path) -> None:
+    """Every channel's topic survives registration, not only the last one's.
+
+    A server answers each JOIN with that channel's topic before it echoes the
+    next JOIN, so a registration loop that consumed lines without dispatching
+    them discarded the topic of every channel but the last. Those channels then
+    stayed suspended with no topic, no error, and no diagnostic.
+    """
+
+    client = IRCClient(
+        IRCConfig(
+            "localhost",
+            6697,
+            "localhost",
+            tmp_path / "ca.pem",
+            "agentwire",
+            "agentwire",
+            "Agentwire",
+            "PASSWORD",
+            MappingProxyType({"#codex": "codex", "#claude": "claude"}),
+        ),
+        "secret",
+    )
+    client._write_line = _discard  # type: ignore[method-assign]
+    reader = asyncio.StreamReader()
+    for line in (
+        f":s CAP * LS :{CAPABILITIES}",
+        f":s CAP * ACK :{CAPABILITIES}",
+        "AUTHENTICATE +",
+        ":s 900 agentwire agentwire!u@h agentwire :You are now logged in as agentwire",
+        ":s 903 agentwire :SASL authentication successful",
+        ":s 001 agentwire :Welcome",
+        ":agentwire!u@h JOIN #codex",
+        ":s 332 agentwire #codex :agentwire:v1;account=trev;agent=agentwire;backend=codex",
+        ":s 353 agentwire = #codex :@agentwire trev",
+        ":s 366 agentwire #codex :End of NAMES",
+        ":agentwire!u@h JOIN #claude",
+    ):
+        reader.feed_data(f"{line}\r\n".encode())
+    reader.feed_eof()
+
+    await client._negotiate(reader)
+
+    # The account the server granted, not the configured nickname, is what
+    # activation validates a topic's agent against.
+    assert client.account == "agentwire"
+    topic = client._messages.get_nowait()
+    assert (topic.command, topic.channel) == ("332", "#codex")
+    assert topic.text == "agentwire:v1;account=trev;agent=agentwire;backend=codex"
+
+
+async def _discard(line: str) -> None:
+    return None

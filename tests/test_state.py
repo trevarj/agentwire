@@ -33,10 +33,14 @@ async def test_sqlite_state_persists_private_bindings_and_action_deduplication(
         id=str(uuid.uuid4()),
         device="phone",
     )
-    assert await store.claim_action(action) is None
-    assert await store.claim_action(action) == "accepted"
+    assert await store.claim_action(action, "#Codex") is None
+    assert await store.claim_action(action, "#codex") == "accepted"
     await store.finish_action(action.id, "succeeded")
-    assert await StateStore(path).claim_action(action) == "succeeded"
+    assert await StateStore(path).claim_action(action, "#codex") == "succeeded"
+    # Forensics start from the journal, so the receiving channel is recorded
+    # rather than left null.
+    with sqlite3.connect(path) as database:
+        assert database.execute("SELECT channel FROM actions").fetchall() == [("#codex",)]
 
 
 @pytest.mark.asyncio
@@ -58,8 +62,8 @@ async def test_queue_is_ordered_editable_and_durable(tmp_path: Path) -> None:
 async def test_interrupted_accepted_action_becomes_uncertain_on_restart(tmp_path: Path) -> None:
     path = tmp_path / "state.sqlite3"
     action = new_envelope("sync.request", "action", "client", device="phone")
-    assert await StateStore(path).claim_action(action) is None
-    assert await StateStore(path).claim_action(action) == "uncertain"
+    assert await StateStore(path).claim_action(action, "#c") is None
+    assert await StateStore(path).claim_action(action, "#c") == "uncertain"
 
 
 @pytest.mark.asyncio

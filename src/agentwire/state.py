@@ -53,11 +53,11 @@ class StateStore:
         async with self._lock:
             await asyncio.to_thread(self._set_binding, channel.lower(), binding)
 
-    async def claim_action(self, envelope: Envelope) -> str | None:
+    async def claim_action(self, envelope: Envelope, channel: str) -> str | None:
         """Insert an action, returning its existing status when it is a duplicate."""
         await self.initialize()
         async with self._lock:
-            return await asyncio.to_thread(self._claim_action, envelope)
+            return await asyncio.to_thread(self._claim_action, envelope, channel.lower())
 
     async def finish_action(self, action_id: str, status: str, detail: str = "") -> None:
         if status not in {"succeeded", "failed", "uncertain"}:
@@ -275,9 +275,10 @@ class StateStore:
                     (channel, binding.backend, binding.session_id, binding.cwd, _now_ms()),
                 )
 
-    def _claim_action(self, envelope: Envelope) -> str | None:
+    def _claim_action(self, envelope: Envelope, channel: str) -> str | None:
         payload = encode_envelope(envelope)
-        channel = envelope.data.get("channel")
+        # The channel is the receiving channel, never a client-supplied field:
+        # forensics need to know where an action actually arrived.
         with self._connect() as database:
             row = database.execute(
                 "SELECT status FROM actions WHERE id = ?", (envelope.id,)

@@ -41,6 +41,10 @@ agentwire:v1;account=agentwire;agent=agentwire;backend=claude | Project title
 Parameter values use UTF-8 percent encoding. Unknown parameters MUST be preserved or ignored.
 ` | ` and everything after it is a human title. Topic removal or an invalid topic immediately
 suspends the harness and pauses queued prompts. It does not cancel a running backend turn.
+A suspended channel can publish no events, so Agentwire announces the suspension as a plain
+`NOTICE` reading `agentwire suspended: <reason>`: once for a marker that fails validation, and
+once for a marker removed from a channel it had activated. A channel that was never activated
+stays quiet, because an ordinary topic on such a channel is not an event.
 
 Clients MUST authenticate both identities by the IRCv3 `account` tag, never by nickname: `account`
 is the identity whose commands the bridge obeys, and `agent` is the identity whose messages a
