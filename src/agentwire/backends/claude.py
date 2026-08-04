@@ -31,6 +31,7 @@ from claude_agent_sdk import (
 )
 
 from agentwire.backends.base import Backend, BackendError
+from agentwire.backends.claude_follow import TranscriptTailer
 from agentwire.config import ClaudeConfig
 from agentwire.models import (
     BackendEvent,
@@ -43,6 +44,13 @@ from agentwire.text import clean_block, safe_one_line, truncate_utf8
 
 _MAX_TOOL_PAYLOAD_BYTES = 32 * 1024
 _RECENT_OUTPUTS = 3
+# Transcript follow cadence: responsive on a phone timeline without spinning.
+_FOLLOW_POLL_SECONDS = 0.5
+# An open turn whose transcript has been silent this long at attach time is
+# treated as abandoned rather than busy, so the channel does not jam forever.
+_FOLLOW_STALE_SECONDS = 300.0
+# Claude Code records terminal interrupts as user text with this prefix.
+_INTERRUPT_PREFIX = "[Request interrupted"
 
 # Claude Code's built-in tool names, mapped onto the vocabulary the bridge and
 # its clients already render for Codex and OpenCode.
@@ -66,11 +74,17 @@ _TOOL_KINDS = {
 
 @dataclass(slots=True)
 class _Session:
-    """One Claude Code session and the CLI subprocess that currently owns it."""
+    """One Claude Code session: a driven CLI subprocess, a followed transcript, or both.
+
+    A session created (or promoted) by this bridge owns a ``client`` whose SDK
+    message stream is authoritative for the turns it drives. A session that was
+    only attached is observe-only: ``client`` is None and ``tailer``/``follower``
+    mirror the transcript that an external process is writing.
+    """
 
     id: str
     cwd: str
-    client: Any
+    client: Any | None = None
     title: str = "untitled"
     updated_at: float = 0.0
     pump: asyncio.Task[None] | None = None
@@ -83,6 +97,12 @@ class _Session:
     # requests) whose raw tool cards and results must stay off the wire.
     hidden_tools: set[str] = field(default_factory=set)
     plan_signature: tuple[Any, ...] | None = None
+    # Follow mode: transcript tailer, its polling task, one lock serializing
+    # tailer access, and the synthesized id of the externally driven open turn.
+    tailer: TranscriptTailer | None = None
+    follower: asyncio.Task[None] | None = None
+    follow_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    follow_turn_id: str | None = None
 
 
 class ClaudeBackend(Backend):
@@ -91,6 +111,10 @@ class ClaudeBackend(Backend):
     Unlike Codex and OpenCode there is no shared long-running server: the SDK
     owns one ``claude`` CLI subprocess per session, so this backend keeps a pool
     of clients and folds every session's message stream into a single queue.
+
+    Sessions the bridge did not create are attached in follow mode: their
+    transcript JSONL is tailed and mapped onto the same event kinds, and no CLI
+    subprocess exists until the owner's first prompt promotes the session.
     """
 
     name = "claude"
@@ -137,13 +161,16 @@ class ClaudeBackend(Backend):
 
     async def _close_session(self, session: _Session) -> None:
         current = asyncio.current_task()
-        if session.pump is not None and session.pump is not current:
-            session.pump.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await session.pump
+        for task in (session.pump, session.follower):
+            if task is not None and task is not current:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         session.pump = None
-        with contextlib.suppress(Exception):
-            await session.client.disconnect()
+        session.follower = None
+        if session.client is not None:
+            with contextlib.suppress(Exception):
+                await session.client.disconnect()
 
     def events(self) -> AsyncIterator[BackendEvent]:
         async def iterate() -> AsyncIterator[BackendEvent]:
@@ -297,17 +324,22 @@ class ClaudeBackend(Backend):
         return session
 
     async def _connect(self, session_id: str, cwd: str, resume: bool) -> _Session:
-        client = ClaudeSDKClient(options=self._options(session_id, cwd, resume))
+        session = _Session(id=session_id, cwd=cwd, updated_at=time.time())
+        await self._start_client(session, resume)
+        self._sessions[session_id] = session
+        return session
+
+    async def _start_client(self, session: _Session, resume: bool) -> None:
+        """Spawn the CLI subprocess that drives this session and pump its stream."""
+        client = ClaudeSDKClient(options=self._options(session.id, session.cwd, resume))
         try:
             await client.connect()
         except (ClaudeSDKError, OSError, TimeoutError) as exc:
             with contextlib.suppress(Exception):
                 await client.disconnect()
             raise BackendError(f"Claude session could not start: {exc}") from exc
-        session = _Session(id=session_id, cwd=cwd, client=client, updated_at=time.time())
-        self._sessions[session_id] = session
-        session.pump = asyncio.create_task(self._pump(session), name=f"claude-{session_id}")
-        return session
+        session.client = client
+        session.pump = asyncio.create_task(self._pump(session), name=f"claude-{session.id}")
 
     async def _pump(self, session: _Session) -> None:
         try:
@@ -393,6 +425,12 @@ class ClaudeBackend(Backend):
         )
 
     async def _emit_plan(self, session: _Session, payload: Any) -> None:
+        for event in self._plan_events(session, payload, session.turn_id):
+            await self._events.put(event)
+
+    def _plan_events(
+        self, session: _Session, payload: Any, turn_id: str | None
+    ) -> list[BackendEvent]:
         summary, data = self._plan_update(payload)
         signature = (
             summary,
@@ -401,18 +439,18 @@ class ClaudeBackend(Backend):
             data["totalSteps"],
         )
         if session.plan_signature == signature:
-            return
+            return []
         session.plan_signature = signature
-        await self._events.put(
+        return [
             BackendEvent(
                 kind="progress",
                 backend=self.name,
                 session_id=session.id,
-                turn_id=session.turn_id,
+                turn_id=turn_id,
                 text=summary,
                 data=data,
             )
-        )
+        ]
 
     @staticmethod
     def _plan_update(payload: Any) -> tuple[str, dict[str, Any]]:
@@ -479,6 +517,11 @@ class ClaudeBackend(Backend):
         session.final_text = ""
         session.plan_signature = None
         session.updated_at = time.time()
+        if session.tailer is not None:
+            # The SDK stream just relayed this driven turn; drop its transcript
+            # echo so the resumed follower does not emit the turn a second time.
+            async with session.follow_lock:
+                await asyncio.to_thread(session.tailer.discard_pending)
         if message.is_error:
             detail = safe_one_line(
                 str(message.result or message.subtype or "Claude turn failed"), 180
@@ -512,6 +555,279 @@ class ClaudeBackend(Backend):
                 turn_id=turn_id,
             )
         )
+
+    # ------------------------------------------------------------------
+    # follow mode: mirror an externally driven session's transcript
+    # ------------------------------------------------------------------
+
+    async def _follow_session(self, session_id: str, cwd: str, path: Path) -> _Session:
+        """Attach observe-only: tail the transcript instead of resuming the CLI.
+
+        No subprocess is spawned, so an interactive `claude` running in a
+        terminal keeps sole ownership of the session; the bridge only mirrors
+        what that process writes. The first owner prompt promotes the session
+        to a driven one via ``send_message``.
+        """
+        session = _Session(id=session_id, cwd=cwd, updated_at=time.time())
+        session.tailer = TranscriptTailer(path)
+        entries = await asyncio.to_thread(session.tailer.prime)
+        self._prime_follow_state(session, entries)
+        self._sessions[session_id] = session
+        session.follower = asyncio.create_task(
+            self._follow_loop(session), name=f"claude-follow-{session_id}"
+        )
+        return session
+
+    def _prime_follow_state(self, session: _Session, entries: list[dict[str, Any]]) -> None:
+        """Rebuild in-flight turn and tool state from the existing transcript.
+
+        The mapped events are discarded: everything before attach is history,
+        served only through history.request, so live follow never re-emits it.
+        Only the resulting state (open turn, pending tool cards, busyness)
+        carries forward.
+        """
+        last_at = 0.0
+        for entry in entries:
+            self._follow_events(session, entry)
+            last_at = self._entry_seconds(entry) or last_at
+        session.updated_at = last_at or time.time()
+        if session.busy and time.time() - last_at > _FOLLOW_STALE_SECONDS:
+            # A turn abandoned long ago (crash, kill) has no closing marker;
+            # reporting it busy would queue owner prompts forever.
+            session.busy = False
+
+    async def _follow_loop(self, session: _Session) -> None:
+        try:
+            while not self._closed:
+                await asyncio.sleep(_FOLLOW_POLL_SECONDS)
+                if session.client is not None and session.busy:
+                    # The SDK stream is relaying this driven turn live; its
+                    # transcript echo is discarded when the turn finishes.
+                    continue
+                await self._follow_emit(session)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if self._closed:
+                return
+            await self._events.put(
+                BackendEvent(
+                    kind="disconnected",
+                    backend=self.name,
+                    session_id=session.id,
+                    text=safe_one_line(f"Claude transcript follow ended: {exc}", 180),
+                )
+            )
+
+    async def _follow_emit(self, session: _Session) -> None:
+        if session.tailer is None:
+            return
+        async with session.follow_lock:
+            entries = await asyncio.to_thread(session.tailer.poll)
+            for entry in entries:
+                for event in self._follow_events(session, entry):
+                    await self._events.put(event)
+
+    def _follow_events(self, session: _Session, entry: dict[str, Any]) -> list[BackendEvent]:
+        """Map one raw transcript entry onto the live backend event vocabulary.
+
+        Only conversation entries have a protocol shape: user prompts, tool
+        results, assistant text and tool calls, and the ``turn_duration``
+        marker that closes a turn. Sidechain (subagent), meta, compaction, and
+        bookkeeping entries are dropped rather than given an invented shape.
+        """
+        if entry.get("isSidechain"):
+            return []
+        kind = entry.get("type")
+        if kind == "system":
+            if entry.get("subtype") == "turn_duration":
+                return self._follow_boundary(session)
+            return []
+        if kind not in {"user", "assistant"}:
+            return []
+        if entry.get("isMeta") or entry.get("isCompactSummary"):
+            return []
+        message = entry.get("message")
+        payload = message if isinstance(message, dict) else {}
+        entry_id = str(entry.get("uuid") or "") or None
+        if kind == "user":
+            return self._follow_user(session, payload, entry_id)
+        return self._follow_assistant(session, payload, entry_id)
+
+    def _follow_user(
+        self, session: _Session, payload: dict[str, Any], entry_id: str | None
+    ) -> list[BackendEvent]:
+        events: list[BackendEvent] = []
+        blocks = payload.get("content")
+        for item in blocks if isinstance(blocks, list) else ():
+            if not isinstance(item, dict) or item.get("type") != "tool_result":
+                continue
+            item_id = str(item.get("tool_use_id") or "")
+            if not item_id:
+                continue
+            if item_id in session.hidden_tools:
+                session.hidden_tools.discard(item_id)
+                continue
+            tool_kind, started = session.tools.pop(item_id, ("tool", {}))
+            data = dict(started)
+            failed = bool(item.get("is_error"))
+            data["status"] = "error" if failed else "completed"
+            output = self._result_text(item.get("content"))
+            if output:
+                data["output"] = truncate_utf8(clean_block(output), _MAX_TOOL_PAYLOAD_BYTES)
+            events.append(
+                BackendEvent(
+                    kind="tool_finished",
+                    backend=self.name,
+                    session_id=session.id,
+                    turn_id=session.follow_turn_id,
+                    item_id=item_id,
+                    tool_kind=tool_kind,
+                    success=not failed,
+                    data=data,
+                )
+            )
+        if events:
+            return events
+        text = self._message_text(payload)
+        if not text:
+            return []
+        if text.startswith(_INTERRUPT_PREFIX):
+            # The terminal user interrupted; the turn ends without a result.
+            return self._follow_boundary(session)
+        if text.startswith(("<command-", "<local-command-")):
+            # Slash-command bookkeeping, not a prompt.
+            return []
+        # A dangling turn without a recorded boundary ends at the next prompt.
+        events = self._follow_boundary(session)
+        turn_id = self._identifier(entry_id or str(uuid.uuid4()), "turn")
+        session.follow_turn_id = turn_id
+        session.busy = True
+        session.plan_signature = None
+        session.updated_at = time.time()
+        events.append(
+            BackendEvent(
+                kind="turn_started",
+                backend=self.name,
+                session_id=session.id,
+                turn_id=turn_id,
+            )
+        )
+        events.append(
+            BackendEvent(
+                kind="user_prompt",
+                backend=self.name,
+                session_id=session.id,
+                turn_id=turn_id,
+                item_id=entry_id,
+                text=text,
+            )
+        )
+        return events
+
+    def _follow_assistant(
+        self, session: _Session, payload: dict[str, Any], entry_id: str | None
+    ) -> list[BackendEvent]:
+        blocks = payload.get("content")
+        items = blocks if isinstance(blocks, list) else []
+        tools = [
+            item
+            for item in items
+            if isinstance(item, dict) and item.get("type") == "tool_use" and item.get("id")
+        ]
+        events: list[BackendEvent] = []
+        text = self._message_text({"content": items})
+        stop_reason = payload.get("stop_reason")
+        if text:
+            # The CLI writes one entry per content block, so narration and its
+            # tool calls arrive separately; stop_reason tells them apart.
+            narration = bool(tools) or stop_reason == "tool_use"
+            events.append(
+                BackendEvent(
+                    kind="progress" if narration else "assistant",
+                    backend=self.name,
+                    session_id=session.id,
+                    turn_id=session.follow_turn_id,
+                    item_id=entry_id,
+                    text=text,
+                )
+            )
+            if not narration:
+                session.last_reply = text
+                if stop_reason in {"end_turn", "stop_sequence"}:
+                    # The final text of a turn carries end_turn; interactive
+                    # sessions also write a turn_duration marker afterwards,
+                    # but print-mode resumes never do, so the reply itself is
+                    # the reliable completion signal.
+                    events.extend(self._follow_boundary(session))
+        for item in tools:
+            item_id = str(item["id"])
+            name = str(item.get("name") or "tool")
+            if name == "TodoWrite":
+                session.hidden_tools.add(item_id)
+                events.extend(self._plan_events(session, item.get("input"), session.follow_turn_id))
+                continue
+            # AskUserQuestion has no live request here (no permission callback
+            # runs in an external process), so it renders as a labeled tool
+            # card exactly like history replay does.
+            tool_kind = self._tool_kind(name)
+            data = self._tool_metadata(name, item.get("input"))
+            session.tools[item_id] = (tool_kind, data)
+            events.append(
+                BackendEvent(
+                    kind="tool_started",
+                    backend=self.name,
+                    session_id=session.id,
+                    turn_id=session.follow_turn_id,
+                    item_id=item_id,
+                    tool_kind=tool_kind,
+                    data=data,
+                )
+            )
+        return events
+
+    def _follow_boundary(self, session: _Session) -> list[BackendEvent]:
+        turn_id = session.follow_turn_id
+        if turn_id is None:
+            return []
+        session.follow_turn_id = None
+        session.plan_signature = None
+        session.busy = False
+        session.updated_at = time.time()
+        return [
+            BackendEvent(
+                kind="turn_done",
+                backend=self.name,
+                session_id=session.id,
+                turn_id=turn_id,
+            )
+        ]
+
+    @staticmethod
+    def _transcript_path(session_id: str) -> Path | None:
+        """Locate the session's on-disk transcript, newest project dir first."""
+        if not session_id or not all(c.isalnum() or c == "-" for c in session_id):
+            return None
+        config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+        candidates = list((Path(config_dir) / "projects").glob(f"*/{session_id}.jsonl"))
+
+        def modified(path: Path) -> float:
+            try:
+                return path.stat().st_mtime
+            except OSError:
+                return 0.0
+
+        return max(candidates, key=modified) if candidates else None
+
+    @staticmethod
+    def _entry_seconds(entry: dict[str, Any]) -> float:
+        stamp = entry.get("timestamp")
+        if not isinstance(stamp, str):
+            return 0.0
+        try:
+            return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0.0
 
     # ------------------------------------------------------------------
     # tool presentation
@@ -599,8 +915,9 @@ class ClaudeBackend(Backend):
         return [self._summary(info, cwd) for info in infos]
 
     async def list_running_sessions(self) -> list[SessionSummary]:
-        # Claude has no shared daemon, so only sessions this bridge started can
-        # still be running a turn.
+        # Claude has no shared daemon to enumerate: a session shows as live
+        # when this bridge drives a turn or observes one through its followed
+        # transcript.
         return [self._live_summary(session) for session in self._sessions.values() if session.busy]
 
     async def create_session(self, cwd: str) -> SessionSummary:
@@ -618,10 +935,18 @@ class ClaudeBackend(Backend):
         workspace = cwd or (info.cwd if info is not None else None)
         if not workspace:
             raise BackendError(f"Claude session {session_id} has no recorded workspace")
-        session = await self._connect(session_id, workspace, resume=True)
+        path = self._transcript_path(session_id)
+        if path is None:
+            # No transcript to tail means no external writer either; only then
+            # is resuming a CLI subprocess the way to observe the session.
+            session = await self._connect(session_id, workspace, resume=True)
+        else:
+            # Observe without resuming: a second CLI on the same session id
+            # would race a live terminal process and bypass its approval gate.
+            session = await self._follow_session(session_id, workspace, path)
         if info is not None:
             session.title = self._title(info)
-            session.updated_at = self._seconds(info.last_modified)
+            session.updated_at = max(session.updated_at, self._seconds(info.last_modified))
         return await self._resumed_summary(session)
 
     async def _resumed_summary(self, session: _Session) -> SessionSummary:
@@ -634,7 +959,7 @@ class ClaudeBackend(Backend):
             title=session.title,
             updated_at=session.updated_at,
             busy=session.busy,
-            active_turn_id=session.turn_id,
+            active_turn_id=session.turn_id or session.follow_turn_id,
             last_output=outputs[-1].text if outputs else None,
             last_reply=session.last_reply,
             recent_outputs=tuple(outputs),
@@ -668,7 +993,7 @@ class ClaudeBackend(Backend):
             title=session.title,
             updated_at=session.updated_at,
             busy=session.busy,
-            active_turn_id=session.turn_id,
+            active_turn_id=session.turn_id or session.follow_turn_id,
             last_reply=session.last_reply,
         )
 
@@ -680,7 +1005,7 @@ class ClaudeBackend(Backend):
             title=self._title(info),
             updated_at=self._seconds(info.last_modified),
             busy=bool(live and live.busy),
-            active_turn_id=live.turn_id if live else None,
+            active_turn_id=(live.turn_id or live.follow_turn_id) if live else None,
         )
 
     @staticmethod
@@ -702,6 +1027,18 @@ class ClaudeBackend(Backend):
 
     async def send_message(self, session_id: str, text: str) -> str | None:
         session = self._require(session_id)
+        if session.client is None:
+            # Promotion: relay whatever the external process wrote before the
+            # owner took a turn, then bring up the resumed CLI client. From
+            # here the SDK stream drives events and the follower stays quiet
+            # until the driven turn completes.
+            await self._follow_emit(session)
+            if session.busy:
+                # Resuming now would put a second writer behind a turn another
+                # process is still running; the bridge queues prompts while
+                # busy, so this only triggers on a race or stale state.
+                raise BackendError("Claude session is running a turn in another process")
+            await self._start_client(session, resume=True)
         turn_id = str(uuid.uuid4())
         session.turn_id = turn_id
         session.busy = True
@@ -727,6 +1064,10 @@ class ClaudeBackend(Backend):
 
     async def steer(self, session_id: str, turn_id: str | None, text: str) -> None:
         session = self._require(session_id)
+        if session.client is None:
+            raise BackendError(
+                "Claude session is observed only; its turn belongs to another process"
+            )
         if not session.busy:
             raise BackendError("Claude has no active turn to steer")
         try:
@@ -737,6 +1078,15 @@ class ClaudeBackend(Backend):
 
     async def cancel(self, session_id: str, turn_id: str | None) -> None:
         session = self._require(session_id)
+        if session.client is None:
+            if session.follow_turn_id is None:
+                raise BackendError("Claude has no active turn to cancel")
+            # The bridge cannot interrupt a turn another process owns; clear
+            # the observed turn so the channel is not stuck busy for it. The
+            # external process keeps running regardless.
+            for event in self._follow_boundary(session):
+                await self._events.put(event)
+            return
         if not session.busy:
             raise BackendError("Claude has no active turn to cancel")
         try:

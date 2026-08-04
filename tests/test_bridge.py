@@ -703,6 +703,38 @@ async def test_secret_assistant_message_is_wholly_omitted(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_followed_user_prompt_is_relayed_through_the_same_redaction(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    bridge.channels["#codex"].binding = ChannelBinding("codex", "s1", str(tmp_path))
+    await bridge._handle_backend_event(
+        "#codex",
+        BackendEvent(
+            "user_prompt",
+            "codex",
+            session_id="s1",
+            turn_id="t1",
+            item_id="u1",
+            text="please fix the bug",
+        ),
+    )
+    channel, event, preview = irc.sent[-1]
+    assert event.kind == "user.prompt"
+    assert event.data["content"] == "please fix the bug"
+    # The typed original never hit IRC, so the mirrored prompt is readable.
+    assert preview == "please fix the bug"
+
+    await bridge._handle_backend_event(
+        "#codex",
+        BackendEvent("user_prompt", "codex", session_id="s1", text="API_TOKEN=abcdefghijklmno"),
+    )
+    event = irc.sent[-1][1]
+    assert event.kind == "user.prompt"
+    assert event.data["omitted"] is True
+    assert "API_TOKEN" not in str(event.to_dict())
+
+
+@pytest.mark.asyncio
 async def test_plan_progress_preserves_completion_state(tmp_path: Path) -> None:
     bridge, irc, _backend = make_bridge(tmp_path)
     await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")

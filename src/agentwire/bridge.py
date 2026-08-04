@@ -763,6 +763,23 @@ class Bridge:
                     "flags": list(event.data.get("active_flags") or ()),
                 },
             )
+        elif event.kind == "user_prompt":
+            # Only follow mode relays prompts through the backend: prompts the
+            # owner sends over IRC are emitted by the action path and never
+            # come back this way, so this cannot double-render them.
+            prompt = self._safe_user_prompt(event.text)
+            content = prompt.get("content")
+            await self._emit(
+                channel,
+                "user.prompt",
+                session_id=event.session_id,
+                turn_id=event.turn_id,
+                item_id=event.item_id,
+                data=prompt,
+                # Unlike an owner prompt, the typed original is not in the
+                # channel, so give the mirrored prompt a readable preview.
+                preview=self._preview(content) if isinstance(content, str) else None,
+            )
         elif event.kind == "progress":
             data: dict[str, Any] = {"summary": self._safe_content(event.text, 32 * 1024)}
             if event.data.get("plan") is True:

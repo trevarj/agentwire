@@ -186,9 +186,11 @@ Agentwire can identify that exact top-level thread in a live TUI. Subagent and g
 not attachable discovery results. `data.cursor` echoes the page cursor or is null for the first page.
 If `data.next` is non-null, clients request the next page by returning it as
 `session.list.request.data.cursor`; cursors are opaque to clients.
-For Claude, live-scope discovery reports only sessions this Agentwire is running: the Claude Agent
-SDK owns one CLI subprocess per session and has no shared server to enumerate, so an interactive
-`claude` session elsewhere on the machine appears in workspace discovery but never as live.
+For Claude, live-scope discovery reports only sessions this Agentwire is running or observing: the
+Claude Agent SDK owns one CLI subprocess per session and has no shared server to enumerate. An
+interactive `claude` session elsewhere on the machine appears in workspace discovery; once attached,
+Agentwire follows its transcript and mirrors it live without resuming a competing CLI process, and
+the first owner prompt promotes the binding to a driven session.
 
 Safe settings are `model`, `effort`, `collaboration`, `delivery`, and `approvalReviewer`.
 `collaboration` is `default` or `plan` and requires an explicit model. `delivery` is `queue` or
