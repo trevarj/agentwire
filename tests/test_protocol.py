@@ -23,16 +23,36 @@ from agentwire.protocol import (
 
 
 def test_topic_activation_is_exact_and_percent_decoded() -> None:
-    topic = build_topic("Trev", "codex local", "Agent workspace")
-    assert topic == "agentwire:v1;account=trev;backend=codex%20local | Agent workspace"
+    topic = build_topic("Trev", "codex local", "Agent workspace", agent="AgentWire")
+    assert topic == (
+        "agentwire:v1;account=trev;agent=agentwire;backend=codex%20local | Agent workspace"
+    )
     activation = parse_topic(topic)
     assert activation is not None
-    assert (activation.account, activation.backend, activation.title) == (
+    assert (activation.account, activation.agent, activation.backend, activation.title) == (
         "trev",
+        "agentwire",
         "codex local",
         "Agent workspace",
     )
-    assert parse_topic("chat agentwire:v1;account=trev;backend=codex") is None
+    assert parse_topic("chat agentwire:v1;account=trev;agent=agentwire;backend=codex") is None
+    # The agent account is the client's trust root for events, so a topic
+    # without it must not activate anything.
+    with pytest.raises(ProtocolError, match="agent"):
+        parse_topic("agentwire:v1;account=trev;backend=codex")
+
+
+def test_single_account_topics_are_first_class() -> None:
+    # One SASL account for controller and bot, separated by channel, is a
+    # supported deployment: agent defaults to account and parses back equal.
+    topic = build_topic("AgentWire", "claude")
+    assert topic == "agentwire:v1;account=agentwire;agent=agentwire;backend=claude"
+    activation = parse_topic(topic)
+    assert activation is not None
+    assert activation.account == activation.agent == "agentwire"
+    explicit = parse_topic("agentwire:v1;account=agentwire;agent=agentwire;backend=claude")
+    assert explicit is not None
+    assert explicit.account == explicit.agent == "agentwire"
 
 
 def test_envelope_round_trip_is_minified_and_validated() -> None:

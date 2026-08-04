@@ -184,6 +184,7 @@ def run_jsonl(input_stream: TextIO, output_stream: TextIO) -> int:
                     "activation": (
                         {
                             "account": activation.account,
+                            "agent": activation.agent,
                             "backend": activation.backend,
                             "title": activation.title,
                         }

@@ -9,7 +9,7 @@ from agentwire.reference_client import ProtocolClient, run_jsonl
 
 def test_reference_client_reduces_events_to_render_state() -> None:
     client = ProtocolClient(device="phone", instance="client")
-    client.set_topic("agentwire:v1;account=trev;backend=codex | Test")
+    client.set_topic("agentwire:v1;account=trev;agent=agentwire;backend=codex | Test")
     hello = new_envelope("agent.hello", "event", "agent", epoch="live", data={"backend": "codex"})
     snapshot = new_envelope(
         "channel.snapshot",
@@ -56,13 +56,14 @@ def test_reference_client_replaces_timeline_context_on_binding_change() -> None:
 
 def test_jsonl_cli_emits_action_wire_messages() -> None:
     input_stream = io.StringIO(
-        '{"op":"topic","topic":"agentwire:v1;account=trev;backend=codex"}\n'
+        '{"op":"topic","topic":"agentwire:v1;account=trev;agent=agentwire;backend=codex"}\n'
         '{"op":"action","kind":"sync.request"}\n'
     )
     output_stream = io.StringIO()
     assert run_jsonl(input_stream, output_stream) == 0
     responses = [json.loads(line) for line in output_stream.getvalue().splitlines()]
     assert responses[0]["activation"]["backend"] == "codex"
+    assert responses[0]["activation"]["agent"] == "agentwire"
     assert responses[1]["messages"][0]["command"] == "TAGMSG"
 
 

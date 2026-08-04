@@ -128,6 +128,10 @@ class ProtocolError(ValueError):
 @dataclass(slots=True, frozen=True)
 class TopicActivation:
     account: str
+    # The controller (`account`) authorizes actions; the agent account is the
+    # separate identity trusted to publish backend state. Clients authenticate
+    # events against `agent`, so a topic without it cannot activate a harness.
+    agent: str
     backend: str
     title: str = ""
     options: dict[str, str] = field(default_factory=dict)
@@ -285,17 +289,32 @@ def parse_topic(topic: str) -> TopicActivation | None:
             raise ProtocolError(f"duplicate Agentwire topic parameter: {key}")
         options[key] = urllib.parse.unquote(value)
     account = options.get("account", "").lower()
+    agent = options.get("agent", "").lower()
     backend = options.get("backend", "")
-    if not account or not backend:
-        raise ProtocolError("Agentwire topic requires account and backend")
-    return TopicActivation(account, backend, title if separator else "", options)
+    if not account or not agent or not backend:
+        raise ProtocolError("Agentwire topic requires account, agent, and backend")
+    return TopicActivation(account, agent, backend, title if separator else "", options)
 
 
-def build_topic(account: str, backend: str, title: str = "") -> str:
+def build_topic(account: str, backend: str, title: str = "", *, agent: str | None = None) -> str:
+    """Build an activation topic.
+
+    ``account`` and ``agent`` are IRC account names, never engine names:
+    ``account`` is the owner whose commands the bridge obeys and ``agent`` is
+    the bot account whose messages clients trust as backend state. Only
+    ``backend`` names the engine (``codex``, ``opencode``, or ``claude``);
+    ``agent="claude"`` would mean an IRC account literally named claude.
+    ``agent`` defaults to ``account``: the supported single-account deployment
+    shape, where one SASL identity both issues commands and publishes state.
+    """
+
     def quote(value: str) -> str:
         return urllib.parse.quote(value, safe="-._~")
 
-    topic = f"{TOPIC_PREFIX}account={quote(account.lower())};backend={quote(backend)}"
+    topic = (
+        f"{TOPIC_PREFIX}account={quote(account.lower())};"
+        f"agent={quote((agent or account).lower())};backend={quote(backend)}"
+    )
     return f"{topic} | {title}" if title else topic
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from types import MappingProxyType
@@ -20,6 +21,7 @@ from agentwire.config import (
     SecretsConfig,
     StackConfig,
 )
+from agentwire.irc import IRCMessage
 from agentwire.models import (
     BackendEvent,
     ChannelBinding,
@@ -29,7 +31,7 @@ from agentwire.models import (
     SessionOutput,
     SessionSummary,
 )
-from agentwire.protocol import new_envelope
+from agentwire.protocol import PROTOCOL_TAG, ProtocolError, encode_envelope, new_envelope
 
 
 class FakeIRC:
@@ -125,12 +127,12 @@ class FakeBackend(Backend):
         return None
 
 
-def make_bridge(tmp_path: Path) -> tuple[Bridge, FakeIRC, FakeBackend]:
+def make_bridge(tmp_path: Path, owner: str = "trev") -> tuple[Bridge, FakeIRC, FakeBackend]:
     irc = FakeIRC()
     backend = FakeBackend(str(tmp_path))
     config = Config(
         path=tmp_path / "config.toml",
-        bridge=BridgeConfig("trev", (tmp_path,), tmp_path / "state.sqlite3", 2),
+        bridge=BridgeConfig(owner, (tmp_path,), tmp_path / "state.sqlite3", 2),
         secrets=SecretsConfig(tmp_path / "secrets.env"),
         irc=IRCConfig(
             "127.0.0.1",
@@ -155,12 +157,74 @@ def make_bridge(tmp_path: Path) -> tuple[Bridge, FakeIRC, FakeBackend]:
 @pytest.mark.asyncio
 async def test_topic_activates_harness_and_emits_bootstrap(tmp_path: Path) -> None:
     bridge, irc, _backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex | Workspace")
+    await bridge._handle_topic(
+        "#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex | Workspace"
+    )
     assert bridge.channels["#codex"].activation is not None
     assert [item[1].kind for item in irc.sent] == ["agent.hello", "channel.snapshot"]
     assert irc.sent[0][1].data["settingOptions"]["model"][0]["value"] == "gpt-test"
     await bridge._handle_topic("#codex", "ordinary channel")
     assert bridge.channels["#codex"].activation is None
+    # Clients trust events only from the topic agent, so a topic naming another
+    # account must suspend the channel instead of running an untrusted harness.
+    with pytest.raises(ProtocolError, match="agent"):
+        await bridge._handle_topic(
+            "#codex", "agentwire:v1;account=trev;agent=intruder;backend=codex"
+        )
+    assert bridge.channels["#codex"].activation is None
+
+
+@pytest.mark.asyncio
+async def test_single_account_bridge_never_consumes_its_own_events(tmp_path: Path) -> None:
+    # The supported single-account shape: owner_account equals the bridge's own
+    # nickname, and the topic names that one account as both account and agent.
+    bridge, irc, backend = make_bridge(tmp_path, owner="bridge")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=bridge;agent=bridge;backend=codex")
+    assert bridge.channels["#codex"].activation is not None
+    own_event = encode_envelope(irc.sent[0][1])
+    irc.sent.clear()
+
+    loop_task = asyncio.create_task(bridge._irc_loop())
+    try:
+        # Its own published hello, echoed back with its own account tag, must
+        # never be treated as a command.
+        await irc.incoming.put(
+            IRCMessage(
+                "#codex",
+                "bridge",
+                "bridge",
+                "",
+                MappingProxyType({PROTOCOL_TAG: own_event}),
+                "TAGMSG",
+            )
+        )
+        # A genuine action from the same shared account must still execute.
+        action = new_envelope("sync.request", "action", "client", device="phone")
+        await irc.incoming.put(
+            IRCMessage(
+                "#codex",
+                "bridge",
+                "bridge",
+                "",
+                MappingProxyType({PROTOCOL_TAG: encode_envelope(action)}),
+                "TAGMSG",
+            )
+        )
+        for _ in range(200):
+            if any(item[1].kind == "action.succeeded" for item in irc.sent):
+                break
+            await asyncio.sleep(0.005)
+    finally:
+        loop_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await loop_task
+    kinds = [item[1].kind for item in irc.sent]
+    # Exactly one acknowledged action: the echoed event produced no
+    # acknowledgement, no failure, and no backend work.
+    assert kinds.count("action.accepted") == 1
+    assert "action.failed" not in kinds and "action.uncertain" not in kinds
+    assert "agent.hello" in kinds
+    assert backend.sent == []
 
 
 @pytest.mark.asyncio
@@ -169,7 +233,7 @@ async def test_only_replayable_events_are_journaled(tmp_path: Path) -> None:
     append_event = AsyncMock()
     bridge.state.append_event = append_event
 
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     append_event.assert_not_awaited()
 
     await bridge._emit("#codex", "turn.started")
@@ -182,7 +246,7 @@ async def test_workspace_pages_browse_allowlisted_directories(tmp_path: Path) ->
     (tmp_path / "project-a").mkdir()
     (tmp_path / ".hidden").mkdir()
     bridge, irc, _backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     irc.sent.clear()
 
     root_action = new_envelope(
@@ -217,7 +281,7 @@ async def test_session_pages_echo_workspace_and_continue_with_cursor(tmp_path: P
     backend.sessions = [
         SessionSummary(f"s{index}", str(tmp_path), f"Session {index}") for index in range(101)
     ]
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     irc.sent.clear()
 
     first = new_envelope(
@@ -255,7 +319,7 @@ async def test_session_pages_echo_workspace_and_continue_with_cursor(tmp_path: P
 @pytest.mark.asyncio
 async def test_live_session_page_is_explicitly_scoped(tmp_path: Path) -> None:
     bridge, irc, _backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     irc.sent.clear()
 
     action = new_envelope(
@@ -276,7 +340,7 @@ async def test_live_session_page_is_explicitly_scoped(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_history_is_scoped_to_binding_and_echoes_backend_cursor(tmp_path: Path) -> None:
     bridge, irc, backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     await bridge._set_binding("#codex", SessionSummary("s1", str(tmp_path), "session"))
     backend.list_history = AsyncMock(  # type: ignore[method-assign]
         return_value=HistoryPage(
@@ -335,7 +399,7 @@ async def test_history_is_scoped_to_binding_and_echoes_backend_cursor(tmp_path: 
 @pytest.mark.asyncio
 async def test_settings_are_isolated_per_bound_session(tmp_path: Path) -> None:
     bridge, irc, backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     await bridge._set_binding("#codex", SessionSummary("s1", str(tmp_path), "First"))
     update = new_envelope(
         "settings.update",
@@ -361,7 +425,7 @@ async def test_settings_are_isolated_per_bound_session(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_binding_emits_redacted_recent_session_context(tmp_path: Path) -> None:
     bridge, irc, _backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     irc.sent.clear()
 
     await bridge._set_binding(
@@ -432,7 +496,7 @@ async def test_binding_emits_redacted_recent_session_context(tmp_path: Path) -> 
 @pytest.mark.asyncio
 async def test_attach_defers_live_events_until_after_the_session_snapshot(tmp_path: Path) -> None:
     bridge, irc, backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     irc.sent.clear()
 
     async def attach(session_id: str, cwd: str | None = None) -> SessionSummary:
@@ -473,7 +537,7 @@ async def test_attach_defers_live_events_until_after_the_session_snapshot(tmp_pa
 @pytest.mark.asyncio
 async def test_stale_session_action_cannot_target_new_binding(tmp_path: Path) -> None:
     bridge, irc, backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     await bridge._set_binding("#codex", SessionSummary("s2", str(tmp_path), "Second"))
     irc.sent.clear()
     stale = new_envelope(
@@ -495,7 +559,7 @@ async def test_stale_session_action_cannot_target_new_binding(tmp_path: Path) ->
 @pytest.mark.asyncio
 async def test_sync_returns_correlated_hello_and_snapshot(tmp_path: Path) -> None:
     bridge, irc, _backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     irc.sent.clear()
     action = new_envelope("sync.request", "action", "client", device="phone")
     await bridge._handle_action("#codex", action)
@@ -512,7 +576,7 @@ async def test_sync_returns_correlated_hello_and_snapshot(tmp_path: Path) -> Non
 @pytest.mark.asyncio
 async def test_live_prompt_is_acknowledged_and_deduplicated(tmp_path: Path) -> None:
     bridge, irc, backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     bridge.channels["#codex"].binding = ChannelBinding("codex", "s1", str(tmp_path))
     irc.sent.clear()
     action = new_envelope(
@@ -541,7 +605,7 @@ async def test_live_prompt_is_acknowledged_and_deduplicated(tmp_path: Path) -> N
 @pytest.mark.asyncio
 async def test_stale_epoch_is_rejected_before_backend_dispatch(tmp_path: Path) -> None:
     bridge, irc, backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     irc.sent.clear()
     action = new_envelope(
         "turn.prompt",
@@ -560,7 +624,7 @@ async def test_stale_epoch_is_rejected_before_backend_dispatch(tmp_path: Path) -
 @pytest.mark.asyncio
 async def test_historic_action_is_explicitly_rejected(tmp_path: Path) -> None:
     bridge, irc, backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     irc.sent.clear()
     action = new_envelope(
         "turn.prompt",
@@ -580,7 +644,7 @@ async def test_historic_action_is_explicitly_rejected(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_busy_prompt_queues_and_completion_drains_it(tmp_path: Path) -> None:
     bridge, irc, backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     runtime = bridge.channels["#codex"]
     runtime.binding = ChannelBinding("codex", "s1", str(tmp_path))
     runtime.busy = True
@@ -616,7 +680,7 @@ async def test_topic_reactivation_reconciles_idle_backend_and_drains_queue(
 
     await bridge._handle_topic("#codex", "ordinary topic")
     assert runtime.activation is None
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
 
     assert runtime.busy is True
     assert backend.sent == [("s1", "after restore")]
@@ -626,7 +690,7 @@ async def test_topic_reactivation_reconciles_idle_backend_and_drains_queue(
 @pytest.mark.asyncio
 async def test_secret_assistant_message_is_wholly_omitted(tmp_path: Path) -> None:
     bridge, irc, _backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     bridge.channels["#codex"].binding = ChannelBinding("codex", "s1", str(tmp_path))
     await bridge._handle_backend_event(
         "#codex",
@@ -641,7 +705,7 @@ async def test_secret_assistant_message_is_wholly_omitted(tmp_path: Path) -> Non
 @pytest.mark.asyncio
 async def test_plan_progress_preserves_completion_state(tmp_path: Path) -> None:
     bridge, irc, _backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     bridge.channels["#codex"].binding = ChannelBinding("codex", "s1", str(tmp_path))
 
     await bridge._handle_backend_event(
@@ -677,7 +741,7 @@ async def test_plan_progress_preserves_completion_state(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_tool_preview_omits_only_sensitive_fields(tmp_path: Path) -> None:
     bridge, irc, _backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     bridge.channels["#codex"].binding = ChannelBinding("codex", "s1", str(tmp_path))
 
     await bridge._handle_backend_event(
@@ -711,7 +775,7 @@ async def test_tool_preview_omits_only_sensitive_fields(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_sensitive_question_is_redacted_even_without_backend_flag(tmp_path: Path) -> None:
     bridge, irc, _backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     bridge.channels["#codex"].binding = ChannelBinding("codex", "s1", str(tmp_path))
 
     await bridge._handle_backend_event(
@@ -740,7 +804,7 @@ async def test_sensitive_question_is_redacted_even_without_backend_flag(tmp_path
 @pytest.mark.asyncio
 async def test_request_preserves_zero_json_rpc_token(tmp_path: Path) -> None:
     bridge, _irc, _backend = make_bridge(tmp_path)
-    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;backend=codex")
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
     bridge.channels["#codex"].binding = ChannelBinding("codex", "s1", str(tmp_path))
 
     await bridge._handle_backend_event(

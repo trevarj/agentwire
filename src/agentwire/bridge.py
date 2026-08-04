@@ -181,6 +181,12 @@ class Bridge:
             return
         if activation.account != self.config.bridge.owner_account:
             raise ProtocolError("topic account does not match the configured owner account")
+        # Clients trust backend events only from the topic's agent account, so a
+        # topic naming any other account would run the harness while every event
+        # it publishes is rejected. The bridge authenticates with SASL as its
+        # nickname, which is therefore the account its messages are tagged with.
+        if activation.agent != self.config.irc.nickname.lower():
+            raise ProtocolError("topic agent does not match this bridge's account")
         if activation.backend != runtime.backend:
             raise ProtocolError("topic backend does not match the configured channel backend")
         runtime.activation = activation
