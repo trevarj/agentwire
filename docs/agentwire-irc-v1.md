@@ -19,18 +19,37 @@ is `agentwire.reference_client` and its JSONL executable is `agentwire-protocol-
 The first byte of the channel topic MUST begin this exact, case-sensitive prefix:
 
 ```text
-agentwire:v1;account=agentwire;backend=codex | Human-readable title
+agentwire:v1;account=trev;agent=agentwire;backend=codex | Human-readable title
 ```
 
-`account` and `backend` are required. `backend` is `codex`, `opencode`, or `claude`, and MUST match
-the backend the deployment has assigned to that channel. Parameter values use UTF-8 percent encoding. Unknown
-parameters MUST be preserved or ignored. ` | ` and everything after it is a human title. Topic
-removal or an invalid topic immediately suspends the harness and pauses queued prompts. It does
-not cancel a running backend turn.
+`account`, `agent`, and `backend` are required, and they answer three different questions:
 
-Clients MUST authenticate the controller by the IRCv3 `account` tag, never by nickname. The
-topic account identifies the controller account; the Agentwire bot MUST use a distinct account.
-Agentwire additionally requires the topic account to equal its configured owner.
+- `backend=` — which engine runs the session: `codex`, `opencode`, or `claude`.
+- `account=` — the IRC account whose commands the bridge obeys (the owner).
+- `agent=` — the IRC account whose messages a client trusts as authoritative backend state
+  (the bot).
+
+`account` and `agent` hold IRC account names, never engine names: `agent=claude` would mean "an
+IRC account literally named claude", not "the Claude backend". Only `backend` selects the engine,
+and it MUST match the backend the deployment has assigned to that channel. A single-account
+deployment therefore looks like:
+
+```text
+agentwire:v1;account=agentwire;agent=agentwire;backend=claude | Project title
+```
+
+Parameter values use UTF-8 percent encoding. Unknown parameters MUST be preserved or ignored.
+` | ` and everything after it is a human title. Topic removal or an invalid topic immediately
+suspends the harness and pauses queued prompts. It does not cancel a running backend turn.
+
+Clients MUST authenticate both identities by the IRCv3 `account` tag, never by nickname: `account`
+is the identity whose commands the bridge obeys, and `agent` is the identity whose messages a
+client trusts as authoritative backend state. The two MAY be the same account — a single-account
+deployment that separates projects by channel is fully supported — at the cost that a compromised
+bot credential can then also issue owner commands; separate accounts are RECOMMENDED where that
+tradeoff matters. Both fields are required either way. Agentwire additionally requires the topic
+account to equal its configured owner and the topic agent to equal its own SASL account, and it
+never consumes its own published events as actions.
 
 ## Required IRC behavior
 
@@ -167,6 +186,9 @@ Agentwire can identify that exact top-level thread in a live TUI. Subagent and g
 not attachable discovery results. `data.cursor` echoes the page cursor or is null for the first page.
 If `data.next` is non-null, clients request the next page by returning it as
 `session.list.request.data.cursor`; cursors are opaque to clients.
+For Claude, live-scope discovery reports only sessions this Agentwire is running: the Claude Agent
+SDK owns one CLI subprocess per session and has no shared server to enumerate, so an interactive
+`claude` session elsewhere on the machine appears in workspace discovery but never as live.
 
 Safe settings are `model`, `effort`, `collaboration`, `delivery`, and `approvalReviewer`.
 `collaboration` is `default` or `plan` and requires an explicit model. `delivery` is `queue` or
@@ -182,6 +204,11 @@ across a session switch.
 settings UI from that list rather than from the full safe-setting vocabulary. Codex advertises all
 five; OpenCode and Claude advertise `delivery` alone, and Claude takes its model from deployment
 configuration rather than from `settings.update`.
+
+Claude maps its `AskUserQuestion` tool onto question requests: the owner's answers return to the
+CLI through the permission callback, and a skip denies that one tool call so the turn continues
+unanswered. Claude has no attachable TUI, so a question the bridge redacts as sensitive can only
+be skipped.
 
 `agent.hello.data.settingOptions` MAY advertise backend-sourced picker metadata for those safe
 settings. Its `model` member is an array of
@@ -258,7 +285,8 @@ approval may still be allowed or denied, with a client warning. A sensitive ques
 skipped over IRC but answered only in an attached local TUI. There is no per-message wire override.
 
 Agentwire's SQLite database and directory are mode 0600 and 0700 respectively. Deployments MUST
-use TLS, SASL, separate controller and bot accounts, and private channel membership.
+use TLS, SASL, and private channel membership; separate controller and bot accounts are
+RECOMMENDED as described under channel activation.
 
 ## Reference client JSONL interface
 

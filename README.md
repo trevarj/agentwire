@@ -35,7 +35,9 @@ as a mode-0600 `.legacy-json` backup.
 The foreground stack starts the SSH tunnel, Codex app-server, and bridge. It starts OpenCode only
 when an OpenCode-backed channel is configured. Claude needs no server here: when a Claude-backed
 channel is configured, the bridge starts one `claude` CLI subprocess per session through the
-Claude Agent SDK and stops it with the session.
+Claude Agent SDK and stops it with the session. Because there is no shared Claude server, live
+session discovery only sees sessions this bridge is running; `agentwire doctor` verifies the
+`claude` binary and its credentials (`claude auth status`, or the configured `api_key_env`).
 
 ```console
 nix run .#stack
@@ -50,15 +52,26 @@ history, a 30-day channel retention period, and stored `TAGMSG` values for
 Set a channel topic to activate the harness only after testing:
 
 ```text
-agentwire:v1;account=your-account;backend=codex | Project title
+agentwire:v1;account=your-account;agent=bot-account;backend=codex | Project title
 ```
 
-`backend` is `codex`, `opencode`, or `claude`, and must match the backend that
-[`config.example.toml`](config.example.toml) assigns to that channel.
+The three parameters answer three different questions. `backend` picks the engine (`codex`,
+`opencode`, or `claude`) and must match what [`config.example.toml`](config.example.toml) assigns
+to that channel. `account` and `agent` are IRC account names, never engine names: `account` is
+the controller allowed to issue actions, and `agent` is the bot account whose messages clients
+trust as backend state. `agent=claude` would mean an IRC account literally named "claude" — the
+engine is chosen only by `backend`. The single-account form is:
 
-The owner account comes from the IRCv3 `account` tag, not the nickname. Use a separate SASL
-account for the bot. Removing the prefix suspends the harness and pauses queue dispatch without
-canceling active backend work.
+```text
+agentwire:v1;account=agentwire;agent=agentwire;backend=claude | Project title
+```
+
+Both accounts come from the IRCv3 `account` tag, not the nickname, and `agent` must be the
+bridge's own account (its configured nickname). Running one SASL account for both — separating
+projects by channel — is supported: set `account` and `agent` to the same name and make
+`owner_account` match the bridge nickname. Separate accounts remain the safer split, since one
+shared credential can both publish state and issue owner commands. Removing the prefix suspends
+the harness and pauses queue dispatch without canceling active backend work.
 
 ## Reference client
 
@@ -73,7 +86,7 @@ nix develop -c sh -c 'PYTHONPATH=src python -m agentwire.reference_client'
 Example input:
 
 ```json
-{"op":"topic","topic":"agentwire:v1;account=trev;backend=codex | Test"}
+{"op":"topic","topic":"agentwire:v1;account=trev;agent=agentwire;backend=codex | Test"}
 {"op":"ingest","tag":"{\"at\":1785400000000,...}"}
 {"op":"action","kind":"sync.request"}
 {"op":"state"}
