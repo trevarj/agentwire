@@ -1015,3 +1015,40 @@ async def test_request_preserves_zero_json_rpc_token(tmp_path: Path) -> None:
 
     pending = next(iter(bridge.channels["#codex"].requests.values()))
     assert pending.token == 0
+
+
+@pytest.mark.asyncio
+async def test_a_configured_channel_that_never_activates_is_announced(tmp_path: Path) -> None:
+    """The silence that makes a topicless channel look like a working one."""
+
+    bridge, irc, _backend = make_bridge(tmp_path)
+    # An unregistered channel that emptied comes back with no topic at all, which is
+    # exactly the ordinary-topic case the per-topic rule stays quiet about.
+    bridge._topics_evaluated.add("#codex")
+    await bridge._handle_topic("#codex", "")
+    assert irc.notices == []
+
+    await bridge._report_inert_channels()
+
+    channel, text = irc.notices[0]
+    assert channel == "#codex"
+    assert "no activation topic" in text
+    # The repair is pasteable and built from this deployment's own configuration.
+    assert "set: agentwire:v1;account=trev;agent=bridge;backend=codex" in text
+
+    # Announced once per process, not on every reconnect.
+    irc.notices.clear()
+    await bridge._report_inert_channels()
+    assert irc.notices == []
+
+
+@pytest.mark.asyncio
+async def test_an_activated_channel_is_not_announced_as_inert(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    bridge._topics_evaluated.add("#codex")
+    irc.notices.clear()
+
+    await bridge._report_inert_channels()
+
+    assert irc.notices == []

@@ -22,6 +22,7 @@ from agentwire.protocol import (
     ProtocolError,
     Reassembler,
     TopicActivation,
+    build_topic,
     decode_envelope,
     new_envelope,
     parse_topic,
@@ -92,6 +93,10 @@ class Bridge:
         self._reassemblers = {channel: Reassembler() for channel in self.channels}
         self._tasks: list[asyncio.Task[None]] = []
         self._closed = False
+        # Configured channels whose topic reply has been evaluated at least once, and whether
+        # the post-registration summary has already been announced for this process.
+        self._topics_evaluated: set[str] = set()
+        self._inert_announced = False
 
     async def run(self) -> None:
         try:
@@ -163,7 +168,13 @@ class Bridge:
                 # what turns an unset topic into a stated fact rather than an
                 # absence indistinguishable from a reply that never arrived.
                 if message.command in {"TOPIC", "331", "332"}:
-                    await self._handle_topic(message.channel, message.text)
+                    self._topics_evaluated.add(message.channel)
+                    try:
+                        await self._handle_topic(message.channel, message.text)
+                    finally:
+                        # Runs even when validation raised, so a channel that failed for one
+                        # reason still counts toward the summary of what never came up.
+                        await self._report_inert_channels()
                     continue
                 value = message.tags.get(PROTOCOL_TAG)
                 if not isinstance(value, str):
@@ -247,6 +258,51 @@ class Bridge:
         # Suspension is otherwise invisible: no event can be published to a
         # channel that has no activation, so the humans in it must be told here.
         await self.irc.send_notice(channel, f"agentwire suspended: {detail}")
+
+    async def _report_inert_channels(self) -> None:
+        """Name every configured channel that answered a topic reply without activating.
+
+        A channel named in this bridge's own configuration is meant to run an agent, so
+        staying quiet about one that never came up is a defect rather than discretion. The
+        per-topic rule above deliberately says nothing for a channel that was never active,
+        because an ordinary topic on an unconfigured channel is not an event; that rule
+        leaves a configured channel whose topic was never set, or whose topic Ergo discarded
+        when an unregistered channel emptied, indistinguishable from one that is working.
+        The bridge then silently drops every action a client sends it, which is only
+        visible as a client that syncs forever.
+
+        Announced once per process: the operator needs to be told, not nagged on every
+        reconnect.
+        """
+
+        if self._inert_announced or not self._topics_evaluated >= set(self.config.irc.channels):
+            return
+        self._inert_announced = True
+        inert = sorted(
+            channel for channel, runtime in self.channels.items() if runtime.activation is None
+        )
+        if not inert:
+            LOGGER.info("every configured channel activated")
+            return
+        LOGGER.warning(
+            "configured channels that did not activate: %s; they will drop every action they "
+            "receive until their topic is repaired",
+            ", ".join(inert),
+        )
+        for channel in inert:
+            runtime = self.channels[channel]
+            if runtime.suspended_reason is not None:
+                # Already announced with its own reason and pasteable repair line.
+                continue
+            await self._suspend(
+                channel,
+                "this channel is configured for an agent but has no activation topic",
+                build_topic(
+                    self.config.bridge.owner_account,
+                    runtime.backend,
+                    agent=self._bridge_account,
+                ),
+            )
 
     async def _handle_topic(self, channel: str, topic: str) -> None:
         runtime = self.channels[channel]

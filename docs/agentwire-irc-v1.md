@@ -44,7 +44,15 @@ suspends the harness and pauses queued prompts. It does not cancel a running bac
 A suspended channel can publish no events, so Agentwire announces the suspension as a plain
 `NOTICE` reading `agentwire suspended: <reason>`: once for a marker that fails validation, and
 once for a marker removed from a channel it had activated. A channel that was never activated
-stays quiet, because an ordinary topic on such a channel is not an event. A marker that was
+stays quiet per topic reply, because an ordinary topic on such a channel is not an event.
+
+Once every configured channel has answered its topic query, Agentwire announces the ones that
+did not activate — once per process, and only for channels its own configuration names. A
+configured channel is meant to run an agent, so a topic that was never set, or one the server
+discarded when an unregistered channel emptied, would otherwise be indistinguishable from a
+working channel: the bridge drops every action it receives, and the only visible symptom is a
+client that synchronizes forever. Deployments SHOULD register their agent channels so the topic
+survives the channel emptying. A marker that was
 meant to activate a channel also gets `; set: <topic>`, the corrected topic built from the
 deployment's own owner account, authenticated account, and channel backend, preserving any
 title, so a topic predating the required `agent` field is repaired by pasting one line.
