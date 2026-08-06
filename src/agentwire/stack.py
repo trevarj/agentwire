@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
+import random
 import secrets
 import shutil
 import signal
@@ -12,6 +14,7 @@ import ssl
 import stat
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +28,8 @@ from agentwire.bridge import Bridge
 from agentwire.config import ClaudeConfig, Config, install_secret_env
 from agentwire.irc import IRCClient
 
+LOGGER = logging.getLogger("agentwire.stack")
+
 
 class StackError(RuntimeError):
     pass
@@ -32,6 +37,11 @@ class StackError(RuntimeError):
 
 _MAX_WEBSOCKET_MESSAGE_BYTES = 8 * 1024 * 1024
 _TRANSPORT_CLOSE_TIMEOUT = 5
+_RESTART_MIN_DELAY = 0.5
+_RESTART_MAX_DELAY = 30.0
+# A helper that stayed up this long counts as healthy again, so an outage hours
+# after the last one starts from a short delay instead of the capped one.
+_HEALTHY_RUNTIME = 60.0
 
 
 class _CodexTuiRelayTracker:
@@ -206,6 +216,85 @@ async def run_bridge(config: Config) -> None:
     await bridge.run()
 
 
+@dataclass(slots=True)
+class _Helper:
+    name: str
+    command: list[str]
+    # Whether the rest of the stack can ride out this process dying. Only the
+    # peers that reconnect on their own may be restarted underneath the bridge;
+    # for the others a restart would leave a connection nothing re-establishes.
+    restart: bool
+
+
+class _Supervisor:
+    """Own one helper process for the lifetime of the stack.
+
+    An ssh tunnel dies whenever the network or the far end blinks, and the
+    bridge is built to ride that out: the IRC client reconnects forever, and so
+    does the OpenCode event stream. Failing the whole stack for a blip turned a
+    recoverable outage into a manual restart, so a helper whose peers reconnect
+    is restarted in place instead, with the same backoff shape the IRC client
+    uses. A helper that is not restartable still stops the stack, loudly.
+    """
+
+    def __init__(self, helper: _Helper) -> None:
+        self.helper = helper
+        self.process: asyncio.subprocess.Process | None = None
+
+    async def start(self) -> None:
+        """Start the process once. A failure here is a setup error, not an outage."""
+        process = await self._spawn()
+        await asyncio.sleep(0)
+        if process.returncode is not None:
+            raise StackError(f"{self.helper.name} exited immediately with {process.returncode}")
+        print(f"started: {self.helper.name} (pid {process.pid})", flush=True)
+
+    async def run(self) -> int:
+        """Keep the process alive, returning its status once it may not be restarted."""
+        delay = _RESTART_MIN_DELAY
+        loop = asyncio.get_running_loop()
+        process = self.process
+        while True:
+            if process is None:
+                try:
+                    process = await self._spawn()
+                except OSError as exc:
+                    LOGGER.warning(
+                        "cannot restart %s (%s); retrying in about %.1fs",
+                        self.helper.name,
+                        type(exc).__name__,
+                        delay,
+                    )
+                    await self._backoff(delay)
+                    delay = min(delay * 2, _RESTART_MAX_DELAY)
+                    continue
+                LOGGER.warning("restarted %s (pid %d)", self.helper.name, process.pid)
+            started = loop.time()
+            status = await process.wait()
+            # Forget the exited process so shutdown has nothing stale to signal.
+            process = self.process = None
+            if not self.helper.restart:
+                return status
+            if loop.time() - started >= _HEALTHY_RUNTIME:
+                delay = _RESTART_MIN_DELAY
+            LOGGER.warning(
+                "%s exited with %d; restarting in about %.1fs", self.helper.name, status, delay
+            )
+            await self._backoff(delay)
+            delay = min(delay * 2, _RESTART_MAX_DELAY)
+
+    async def _spawn(self) -> asyncio.subprocess.Process:
+        self.process = await asyncio.create_subprocess_exec(
+            *self.helper.command,
+            start_new_session=True,
+        )
+        return self.process
+
+    @staticmethod
+    async def _backoff(delay: float) -> None:
+        await asyncio.sleep(delay + random.random() * min(delay, 1))
+
+
 async def run_stack(config: Config) -> None:
     checks = doctor(config)
     for check in checks:
@@ -213,8 +302,8 @@ async def run_stack(config: Config) -> None:
     _prepare_runtime(config)
     ssh = _binary(config.stack.ssh_binary)
     codex = _binary(config.codex.binary)
-    commands = [
-        (
+    helpers = [
+        _Helper(
             "ssh tunnel",
             [
                 ssh,
@@ -230,8 +319,11 @@ async def run_stack(config: Config) -> None:
                 f"127.0.0.1:{config.stack.local_port}:{config.stack.remote_host}:{config.stack.remote_port}",
                 config.stack.ssh_host,
             ],
+            # The IRC client reconnects for as long as the bridge runs, so a
+            # tunnel that dies with the network is an outage, not a shutdown.
+            restart=True,
         ),
-        (
+        _Helper(
             "Codex app-server",
             [
                 codex,
@@ -239,11 +331,16 @@ async def run_stack(config: Config) -> None:
                 "--listen",
                 f"unix://{config.codex.socket_path}",
             ],
+            # CodexBackend holds one JSON-RPC websocket it never re-establishes,
+            # and a resumed thread only reaches a subscribed client. Restarting
+            # the server under it would leave every Codex channel silently
+            # eventless, so this exit still stops the stack.
+            restart=False,
         ),
     ]
     if config.opencode is not None:
-        commands.append(
-            (
+        helpers.append(
+            _Helper(
                 "OpenCode server",
                 [
                     _binary(config.opencode.binary),
@@ -253,26 +350,25 @@ async def run_stack(config: Config) -> None:
                     "--port",
                     str(config.stack.opencode_port),
                 ],
+                # The OpenCode backend reconnects its event stream on its own and
+                # its requests carry no server-side connection state.
+                restart=True,
             )
         )
     # Claude deliberately starts no process here: the Agent SDK owns one `claude`
     # CLI subprocess per session, created and torn down by ClaudeBackend itself.
-    processes: list[tuple[str, asyncio.subprocess.Process]] = []
+    supervisors = [_Supervisor(helper) for helper in helpers]
+    bridge_task: asyncio.Task[None] | None = None
+    watchers: dict[asyncio.Task[int], _Supervisor] = {}
     try:
-        for name, command in commands:
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                start_new_session=True,
-            )
-            processes.append((name, process))
-            await asyncio.sleep(0)
-            if process.returncode is not None:
-                raise StackError(f"{name} exited immediately with {process.returncode}")
-            print(f"started: {name} (pid {process.pid})", flush=True)
+        for supervisor in supervisors:
+            await supervisor.start()
         bridge_task = asyncio.create_task(run_bridge(config), name="bridge")
-        watchers: dict[asyncio.Task[int], str] = {
-            asyncio.create_task(process.wait(), name=f"wait-{name}"): name
-            for name, process in processes
+        watchers = {
+            asyncio.create_task(supervisor.run(), name=f"supervise-{supervisor.helper.name}"): (
+                supervisor
+            )
+            for supervisor in supervisors
         }
         done, pending = await asyncio.wait(
             [bridge_task, *watchers], return_when=asyncio.FIRST_COMPLETED
@@ -286,13 +382,21 @@ async def run_stack(config: Config) -> None:
                 raise exception
             raise StackError("bridge stopped unexpectedly")
         finished = next(task for task in done if task in watchers)
-        raise StackError(f"{watchers[finished]} exited with {finished.result()}")
+        raise StackError(f"{watchers[finished].helper.name} exited with {finished.result()}")
     finally:
-        if "bridge_task" in locals() and not bridge_task.done():
-            bridge_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await bridge_task
-        await _stop_processes(processes)
+        running = [
+            task for task in (bridge_task, *watchers) if task is not None and not task.done()
+        ]
+        for task in running:
+            task.cancel()
+        await asyncio.gather(*running, return_exceptions=True)
+        await _stop_processes(
+            [
+                (supervisor.helper.name, supervisor.process)
+                for supervisor in supervisors
+                if supervisor.process is not None
+            ]
+        )
 
 
 async def _stop_processes(

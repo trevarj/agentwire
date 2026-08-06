@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -13,7 +14,7 @@ from aiohttp import web
 
 from agentwire.backends.codex import CodexTuiSessionPresence
 from agentwire.config import CodexConfig
-from agentwire.stack import _run_codex_tui, _stop_processes
+from agentwire.stack import _Helper, _run_codex_tui, _stop_processes, _Supervisor
 
 
 @pytest.mark.asyncio
@@ -118,6 +119,53 @@ async def test_stop_processes_lets_parent_reap_children() -> None:
 
     assert process.terminated
     assert process.returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_supervisor_restarts_a_helper_the_stack_can_ride_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agentwire import stack
+
+    monkeypatch.setattr(stack, "_RESTART_MIN_DELAY", 0.01)
+    monkeypatch.setattr(stack, "_RESTART_MAX_DELAY", 0.01)
+    starts = tmp_path / "starts"
+    # An ssh tunnel that dies with the network must not take the stack with it:
+    # the process is replaced, and the bridge behind it reconnects on its own.
+    supervisor = _Supervisor(
+        _Helper(
+            "ssh tunnel",
+            [sys.executable, "-c", f"open({str(starts)!r}, 'a').write('.')"],
+            restart=True,
+        )
+    )
+
+    await supervisor.start()
+    task = asyncio.create_task(supervisor.run())
+    try:
+        for _ in range(500):
+            if starts.exists() and starts.read_text(encoding="utf-8").count(".") >= 3:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert starts.read_text(encoding="utf-8").count(".") >= 3
+
+
+@pytest.mark.asyncio
+async def test_supervisor_reports_a_helper_that_cannot_be_restarted() -> None:
+    # Restarting the Codex app-server would strand the bridge's JSON-RPC socket,
+    # so its exit is still reported instead of being papered over.
+    supervisor = _Supervisor(
+        _Helper("Codex app-server", [sys.executable, "-c", "raise SystemExit(3)"], restart=False)
+    )
+
+    await supervisor.start()
+    assert await supervisor.run() == 3
+    assert supervisor.process is None
 
 
 def test_claude_credentials_check_reads_auth_status(monkeypatch: pytest.MonkeyPatch) -> None:
