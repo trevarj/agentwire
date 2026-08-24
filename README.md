@@ -39,6 +39,12 @@ Claude Agent SDK and stops it with the session. Because there is no shared Claud
 session discovery only sees sessions this bridge is running; `agentwire doctor` verifies the
 `claude` binary and its credentials (`claude auth status`, or the configured `api_key_env`).
 
+pi likewise needs no server: a running pi TUI serves a local socket through its Agentwire
+extension (see [`docs/pi-socket.md`](docs/pi-socket.md)), which the bridge discovers and drives
+live, and sessions nobody is running are created or resumed by a bridge-owned `pi --mode rpc`
+subprocess speaking the same protocol. Live TUI sessions answer their own extension dialogs in
+the terminal; only bridge-spawned sessions relay dialogs as Agentwire questions and approvals.
+
 ```console
 nix run .#stack
 ```
@@ -56,7 +62,7 @@ agentwire:v1;account=your-account;agent=bot-account;backend=codex | Project titl
 ```
 
 The three parameters answer three different questions. `backend` picks the engine (`codex`,
-`opencode`, or `claude`) and must match what [`config.example.toml`](config.example.toml) assigns
+`opencode`, `claude`, or `pi`) and must match what [`config.example.toml`](config.example.toml) assigns
 to that channel. `account` and `agent` are IRC account names, never engine names: `account` is
 the controller allowed to issue actions, and `agent` is the bot account whose messages clients
 trust as backend state. `agent=claude` would mean an IRC account literally named "claude" — the

@@ -24,7 +24,7 @@ agentwire:v1;account=trev;agent=agentwire;backend=codex | Human-readable title
 
 `account`, `agent`, and `backend` are required, and they answer three different questions:
 
-- `backend=` — which engine runs the session: `codex`, `opencode`, or `claude`.
+- `backend=` — which engine runs the session: `codex`, `opencode`, `claude`, or `pi`.
 - `account=` — the IRC account whose commands the bridge obeys (the owner).
 - `agent=` — the IRC account whose messages a client trusts as authoritative backend state
   (the bot).

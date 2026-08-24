@@ -157,9 +157,18 @@ def test_committed_fixtures_decode_with_reference_codec() -> None:
     # Claude advertises no model picker, so delivery is its only safe setting.
     assert claude_hello.data["settings"] == ["delivery"]
 
+    pi_topic = parse_topic((fixtures / "pi-topic.txt").read_text(encoding="utf-8").strip())
+    assert pi_topic is not None
+    assert pi_topic.backend == "pi"
+    pi_hello = decode_envelope((fixtures / "pi-hello.json").read_text(encoding="utf-8"))
+    assert pi_hello.kind == "agent.hello"
+    assert pi_hello.data["backend"] == "pi"
+    # pi exposes its model catalog and thinking level through the bridge.
+    assert pi_hello.data["settings"] == ["model", "effort", "delivery"]
+
 
 def test_every_committed_envelope_fixture_re_encodes_byte_for_byte() -> None:
     fixtures = Path(__file__).parents[1] / "protocol" / "fixtures"
-    for name in ("hello.json", "prompt-action.json", "claude-hello.json"):
+    for name in ("hello.json", "prompt-action.json", "claude-hello.json", "pi-hello.json"):
         raw = (fixtures / name).read_text(encoding="utf-8").strip()
         assert encode_envelope(decode_envelope(raw)) == raw

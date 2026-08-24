@@ -24,6 +24,7 @@ from aiohttp import web
 from agentwire.backends.claude import ClaudeBackend
 from agentwire.backends.codex import CodexBackend, CodexTuiSessionPresence
 from agentwire.backends.opencode import OpenCodeBackend
+from agentwire.backends.pi import PiBackend
 from agentwire.bridge import Bridge
 from agentwire.config import ClaudeConfig, Config, install_secret_env
 from agentwire.irc import IRCClient
@@ -142,9 +143,14 @@ def doctor(config: Config) -> list[str]:
         checks["opencode"] = config.opencode.binary
     if config.claude is not None:
         checks["claude"] = config.claude.binary
+    if config.pi is not None:
+        checks["pi"] = config.pi.binary
     results = [f"{label}: {_binary(binary)}" for label, binary in checks.items()]
     if config.claude is not None:
         results.append(f"claude auth: {_claude_credentials(config.claude)}")
+    if config.pi is not None:
+        sockets = len(list(config.pi.socket_dir.glob("*.sock")))
+        results.append(f"pi sockets: {sockets} live in {config.pi.socket_dir}")
     return results
 
 
@@ -212,6 +218,8 @@ async def run_bridge(config: Config) -> None:
             os.environ[config.claude.api_key_env] if config.claude.api_key_env is not None else None
         )
         backends["claude"] = ClaudeBackend(config.claude, api_key)
+    if config.pi is not None:
+        backends["pi"] = PiBackend(config.pi)
     bridge = Bridge(config, IRCClient(config.irc, irc_password), backends)
     await bridge.run()
 
@@ -357,6 +365,8 @@ async def run_stack(config: Config) -> None:
         )
     # Claude deliberately starts no process here: the Agent SDK owns one `claude`
     # CLI subprocess per session, created and torn down by ClaudeBackend itself.
+    # pi likewise: live TUI sessions serve their own extension sockets, and
+    # PiBackend owns any `pi --mode rpc` subprocess it spawns.
     supervisors = [_Supervisor(helper) for helper in helpers]
     bridge_task: asyncio.Task[None] | None = None
     watchers: dict[asyncio.Task[int], _Supervisor] = {}

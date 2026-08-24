@@ -144,3 +144,30 @@ def test_opencode_channel_still_requires_opencode_table(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, '{ "#opencode" = "opencode" }')
     with pytest.raises(ConfigError, match=r"missing \[opencode\] table"):
         load_config(config_path)
+
+
+def test_pi_channel_requires_pi_table_and_loads_defaults(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, '{ "#pi" = "pi" }')
+    with pytest.raises(ConfigError, match=r"missing \[pi\] table"):
+        load_config(config_path)
+
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write('\n[pi]\nbinary = "pi"\n')
+    config = load_config(config_path)
+    assert config.pi is not None
+    assert config.pi.binary == "pi"
+    assert config.pi.socket_dir.name == "pi"
+    assert config.pi.socket_dir.parent.name == "agentwire"
+    assert config.pi.session_root == Path("~/.pi/agent/sessions").expanduser().resolve(strict=False)
+
+
+def test_codex_only_config_ignores_pi_table_and_rejects_unknown_backend(
+    tmp_path: Path,
+) -> None:
+    config_path = _write_config(tmp_path, '{ "#codex" = "codex" }')
+    config = load_config(config_path)
+    assert config.pi is None
+
+    bad = _write_config(tmp_path, '{ "#other" = "gemini" }')
+    with pytest.raises(ConfigError, match="unsupported backend"):
+        load_config(bad)

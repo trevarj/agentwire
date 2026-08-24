@@ -18,7 +18,7 @@ nickname = "agentwire"
 username = "agentwire"
 realname = "Agentwire agent bridge"
 password_env = "AGENTWIRE_IRC_PASSWORD"
-# Each channel names the backend that owns it: codex, opencode, or claude.
+# Each channel names the backend that owns it: codex, opencode, claude, or pi.
 channels = { "#codex" = "codex" }
 
 [codex]
@@ -38,6 +38,16 @@ permission_mode = "default"
 # credential (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN). Omit this to reuse
 # the credentials the claude CLI already stores. Never put a value here.
 api_key_env = "AGENTWIRE_CLAUDE_API_KEY"
+
+# Only read when a channel above is bound to the "pi" backend, for example
+# channels = { "#codex" = "codex", "#pi" = "pi" }
+[pi]
+binary = "pi"
+# Where running pi TUIs serve their Agentwire extension sockets. Defaults to
+# $XDG_RUNTIME_DIR/agentwire/pi, matching the extension.
+# socket_dir = "$XDG_RUNTIME_DIR/agentwire/pi"
+# Where pi stores session JSONL files. Defaults to ~/.pi/agent/sessions.
+# session_root = "~/.pi/agent/sessions"
 
 [stack]
 ssh_binary = "ssh"

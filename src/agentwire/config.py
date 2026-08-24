@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+import tempfile
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -100,6 +101,13 @@ class ClaudeConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class PiConfig:
+    binary: str
+    socket_dir: Path
+    session_root: Path
+
+
+@dataclass(slots=True, frozen=True)
 class StackConfig:
     ssh_binary: str
     ssh_host: str
@@ -123,10 +131,18 @@ class Config:
     # Trails the required sections so existing positional construction keeps
     # working for deployments and tests that never enable Claude.
     claude: ClaudeConfig | None = None
+    pi: PiConfig | None = None
 
 
 # Only the modes that keep Agentwire's approval routing meaningful are accepted.
 CLAUDE_PERMISSION_MODES = frozenset({"default", "acceptEdits", "plan", "bypassPermissions"})
+
+
+def _default_pi_socket_dir() -> str:
+    """Match the pi extension's socket location: runtime dir, tmp fallback."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    base = runtime if runtime and runtime.startswith("/") else tempfile.gettempdir()
+    return str(Path(base) / "agentwire" / "pi")
 
 
 def load_config(path: str | Path) -> Config:
@@ -158,13 +174,14 @@ def load_config(path: str | Path) -> Config:
     for channel, backend in channels_raw.items():
         if not isinstance(channel, str) or not channel.startswith("#"):
             raise ConfigError(f"invalid IRC channel: {channel!r}")
-        if backend not in {"codex", "opencode", "claude"}:
+        if backend not in {"codex", "opencode", "claude", "pi"}:
             raise ConfigError(f"unsupported backend {backend!r} for {channel}")
         channels[channel.lower()] = backend
 
     codex = _table(raw, "codex")
     opencode = _table(raw, "opencode") if "opencode" in channels.values() else None
     claude = _table(raw, "claude") if "claude" in channels.values() else None
+    pi = _table(raw, "pi") if "pi" in channels.values() else None
     stack = _table(raw, "stack")
     permission_mode = "default"
     if claude is not None:
@@ -217,6 +234,17 @@ def load_config(path: str | Path) -> Config:
                 api_key_env=_optional_str(claude, "api_key_env", "claude"),
             )
             if claude is not None
+            else None
+        ),
+        pi=(
+            PiConfig(
+                binary=_required_str(pi, "binary", "pi"),
+                socket_dir=_path(_optional_str(pi, "socket_dir", "pi") or _default_pi_socket_dir()),
+                session_root=_path(
+                    _optional_str(pi, "session_root", "pi") or "~/.pi/agent/sessions"
+                ),
+            )
+            if pi is not None
             else None
         ),
         stack=StackConfig(

@@ -431,6 +431,8 @@ class Bridge:
             "settings": (
                 ["model", "effort", "collaboration", "delivery", "approvalReviewer"]
                 if runtime.backend == "codex"
+                else ["model", "effort", "delivery"]
+                if runtime.backend == "pi"
                 else ["delivery"]
             ),
         }
