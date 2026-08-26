@@ -135,7 +135,10 @@ class FakeBackend(Backend):
 
 
 def make_bridge(
-    tmp_path: Path, owner: str = "trev", account: str = ""
+    tmp_path: Path,
+    owner: str = "trev",
+    account: str = "",
+    channels: Mapping[str, str] | None = None,
 ) -> tuple[Bridge, FakeIRC, FakeBackend]:
     irc = FakeIRC(account)
     backend = FakeBackend(str(tmp_path))
@@ -152,7 +155,7 @@ def make_bridge(
             "bridge",
             "bridge",
             "IRC_PASSWORD",
-            MappingProxyType({"#codex": "codex"}),
+            MappingProxyType(dict(channels or {"#codex": "codex"})),
         ),
         codex=CodexConfig(tmp_path / "codex.sock", "codex"),
         opencode=OpenCodeConfig(
@@ -1052,3 +1055,112 @@ async def test_an_activated_channel_is_not_announced_as_inert(tmp_path: Path) ->
     await bridge._report_inert_channels()
 
     assert irc.notices == []
+
+
+@pytest.mark.asyncio
+async def test_status_of_an_unbound_session_reaches_every_channel_on_that_backend(
+    tmp_path: Path,
+) -> None:
+    """A session drawer renders sessions no channel is bound to.
+
+    Routing by ownership would drop those events, so a status fans out across
+    the backend while the bound timeline stays untouched.
+    """
+
+    bridge, irc, backend = make_bridge(tmp_path, channels={"#codex": "codex", "#second": "codex"})
+    for channel in ("#codex", "#second"):
+        await bridge._handle_topic(channel, "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    bridge.channels["#codex"].binding = ChannelBinding("codex", "s1", str(tmp_path))
+    irc.sent.clear()
+
+    task = asyncio.create_task(bridge._backend_loop(backend))
+    await backend._events.put(
+        BackendEvent(
+            "status_changed",
+            "codex",
+            session_id="s9",
+            data={"busy": True, "active_flags": ["waiting"], "cwd": "/w", "tui": True},
+        )
+    )
+    for _ in range(200):
+        if len(irc.sent) >= 2:
+            break
+        await asyncio.sleep(0)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert [(channel, event.kind, event.session_id) for channel, event, _ in irc.sent] == [
+        ("#codex", "session.status", "s9"),
+        ("#second", "session.status", "s9"),
+    ]
+    assert irc.sent[0][1].data == {
+        "busy": True,
+        "flags": ["waiting"],
+        "cwd": "/w",
+        "tuiAttached": True,
+    }
+    # The bound session is untouched: no busy flip, no binding change.
+    assert bridge.channels["#codex"].busy is False
+    assert bridge.channels["#codex"].binding == ChannelBinding("codex", "s1", str(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_observed_session_status_is_coalesced_per_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    bridge.channels["#codex"].binding = ChannelBinding("codex", "s1", str(tmp_path))
+    irc.sent.clear()
+    # A short real window keeps the trailing flush observable without slow tests.
+    monkeypatch.setattr("agentwire.bridge.OBSERVED_STATUS_SECONDS", 0.2)
+
+    async def status(sid: str, busy: bool, flags: list[str] | None = None) -> None:
+        await bridge._handle_backend_event(
+            "#codex",
+            BackendEvent(
+                "status_changed",
+                "codex",
+                session_id=sid,
+                data={"busy": busy, "active_flags": flags or []},
+            ),
+        )
+
+    def sent() -> list[tuple[str | None, bool, list[str]]]:
+        return [
+            (event.session_id, event.data["busy"], event.data["flags"]) for _, event, _ in irc.sent
+        ]
+
+    await status("s9", True)
+    assert sent() == [("s9", True, [])]
+
+    # Repeating what the client already knows says nothing.
+    await status("s9", True)
+    assert len(irc.sent) == 1
+
+    # A change inside the window is held, then delivered when the window closes:
+    # the newest state always reaches the drawer, never a stranded busy flag.
+    await status("s9", False)
+    assert len(irc.sent) == 1
+    await asyncio.sleep(0.3)
+    assert sent() == [("s9", True, []), ("s9", False, [])]
+
+    # Two changes inside one window cancel out to the already-visible state.
+    await status("s9", True)
+    await status("s9", False)
+    await asyncio.sleep(0.3)
+    assert len(irc.sent) == 2
+
+    # Newest pending payload wins when the flush fires.
+    await status("s9", True)
+    assert len(irc.sent) == 3
+    await status("s9", False)
+    await status("s9", False, ["waiting"])
+    await asyncio.sleep(0.3)
+    assert sent()[-1] == ("s9", False, ["waiting"])
+    assert len(irc.sent) == 4
+
+    # Coalescing is per session: another session is not held back by the first.
+    await status("s8", True)
+    assert sent()[-1] == ("s8", True, [])

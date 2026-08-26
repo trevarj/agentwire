@@ -324,7 +324,29 @@ class PiBackend(Backend):
         )
         self._sessions[session_id] = session
         session.pump = asyncio.create_task(self._pump(session), name=f"pi-{session_id}")
+        # The first status a client sees for this session; the queue is unbounded,
+        # so a synchronous registration never blocks on it.
+        self._events.put_nowait(self._status_event(session))
         return session
+
+    def _status_event(self, session: _Session) -> BackendEvent:
+        """One session's liveness, for the client session drawer.
+
+        pi pushes state changes, so status is reported where those arrive rather
+        than polled.
+        """
+        waiting = any(owner is session for owner, _ in self._ui_requests.values())
+        return BackendEvent(
+            kind="status_changed",
+            backend=self.name,
+            session_id=session.id,
+            data={
+                "busy": session.busy,
+                "active_flags": ["waiting"] if waiting else [],
+                "cwd": session.cwd,
+                "tui": session.tui,
+            },
+        )
 
     # ------------------------------------------------------------------
     # event pump and translation
@@ -386,6 +408,7 @@ class PiBackend(Backend):
         elif kind == "agent_start":
             session.busy = True
             session.updated_at = time.time()
+            await self._events.put(self._status_event(session))
         elif kind == "agent_settled":
             await self._settle_turn(session)
         elif kind == "message_end":
@@ -417,6 +440,7 @@ class PiBackend(Backend):
             session.expected_prompts = 0
             self._sessions[stem] = session
         session.updated_at = time.time()
+        await self._events.put(self._status_event(session))
 
     def _open_turn(self, session: _Session) -> tuple[str, list[BackendEvent]]:
         if session.turn_id is not None:
@@ -436,6 +460,9 @@ class PiBackend(Backend):
     async def _settle_turn(self, session: _Session) -> None:
         session.busy = False
         session.updated_at = time.time()
+        # Reported before the early return: settling with no open turn is still
+        # the moment this session went idle.
+        await self._events.put(self._status_event(session))
         turn_id = session.turn_id
         if turn_id is None:
             return

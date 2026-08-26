@@ -35,6 +35,8 @@ from agentwire.text import clean_block, clean_text, safe_one_line, truncate_utf8
 MAX_CONTENT_BYTES = 64 * 1024
 MAX_PREVIEW_BYTES = 4 * 1024
 MAX_REASON_BYTES = 200
+# Shortest gap between two `session.status` events for the same unbound session.
+OBSERVED_STATUS_SECONDS = 2.0
 # Diagnostics name channels, accounts, kinds, and reasons. They never carry
 # prompt text, tool output, tag values, or credentials.
 LOGGER = logging.getLogger("agentwire.bridge")
@@ -69,6 +71,14 @@ class ChannelRuntime:
     # The reason last announced, so a repeated topic reply does not repeat it.
     suspended_reason: str | None = None
     observed_sessions: set[str] = field(default_factory=set)
+    # Last `session.status` published per unbound sid: the payload and the
+    # monotonic reading that coalesces repeats.
+    observed_status: dict[str, tuple[dict[str, Any], float]] = field(default_factory=dict)
+    # A changed payload that arrived inside the coalescing window, with the
+    # flush task that will deliver it; newest payload wins, one task per sid.
+    observed_status_pending: dict[str, tuple[dict[str, Any], asyncio.Task[None]]] = field(
+        default_factory=dict
+    )
     attaching_session: str | None = None
     deferred_events: list[BackendEvent] = field(default_factory=list)
 
@@ -128,6 +138,10 @@ class Bridge:
             return
         self._closed = True
         current = asyncio.current_task()
+        for runtime in self.channels.values():
+            for _payload, pending in runtime.observed_status_pending.values():
+                pending.cancel()
+            runtime.observed_status_pending.clear()
         for task in self._tasks:
             if task is not current:
                 task.cancel()
@@ -905,8 +919,22 @@ class Bridge:
 
     async def _backend_loop(self, backend: Backend) -> None:
         async for event in backend.events():
-            channel = self._channel_for(event.backend, event.session_id)
-            if channel:
+            # A status describes one session's liveness rather than the bound
+            # timeline, so it reaches every channel running that backend. Every
+            # other kind stays with the channel that owns the session.
+            if event.kind == "status_changed" and event.session_id:
+                channels = [
+                    channel
+                    for channel, runtime in self.channels.items()
+                    if runtime.backend == event.backend
+                ]
+            else:
+                channels = [
+                    channel
+                    for channel in (self._channel_for(event.backend, event.session_id),)
+                    if channel
+                ]
+            for channel in channels:
                 with contextlib.suppress(Exception):
                     await self._handle_backend_event(channel, event)
 
@@ -921,6 +949,8 @@ class Bridge:
         if not selected:
             if event.kind in {"approval", "question"}:
                 await self._open_request(channel, event, inactive=True)
+            elif event.kind == "status_changed" and event.session_id:
+                await self._emit_observed_status(channel, runtime, event)
             return
         if event.kind == "turn_started":
             runtime.busy = True
@@ -1230,6 +1260,66 @@ class Bridge:
             await self.state.append_event(channel, envelope)
         await self.irc.send_protocol(channel, envelope, preview)
         return envelope
+
+    async def _emit_observed_status(
+        self, channel: str, runtime: ChannelRuntime, event: BackendEvent
+    ) -> None:
+        """Publish a status for a session this channel is not bound to.
+
+        Feeds a client session drawer, so it carries liveness only and never
+        touches the channel's binding, busy flag, or timeline.
+        """
+        sid = event.session_id or ""
+        data: dict[str, Any] = {
+            "busy": bool(event.data.get("busy")),
+            "flags": [str(flag) for flag in event.data.get("active_flags") or ()],
+        }
+        cwd = event.data.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            data["cwd"] = cwd
+        tui = event.data.get("tui")
+        if isinstance(tui, bool):
+            data["tuiAttached"] = tui
+        now = time.monotonic()
+        last = runtime.observed_status.get(sid)
+        pending = runtime.observed_status_pending.get(sid)
+        # A drawer only needs the newest state, so compare against what the
+        # client will see: the pending payload if one waits, else the last emit.
+        visible = pending[0] if pending is not None else (last[0] if last is not None else None)
+        if visible == data:
+            return
+        if pending is not None:
+            if last is not None and last[0] == data:
+                # The change cancelled itself out; the client is already right.
+                pending[1].cancel()
+                runtime.observed_status_pending.pop(sid, None)
+            else:
+                # Newest payload wins; the scheduled flush keeps its deadline.
+                runtime.observed_status_pending[sid] = (data, pending[1])
+            return
+        if last is not None and now - last[1] < OBSERVED_STATUS_SECONDS:
+            # Inside the window: hold the newest state and deliver it when the
+            # window closes, so a short turn never strands a stale busy flag.
+            delay = OBSERVED_STATUS_SECONDS - (now - last[1])
+            task = asyncio.create_task(
+                self._flush_observed_status(channel, runtime, sid, delay),
+                name=f"observed-status-{channel}-{sid}",
+            )
+            runtime.observed_status_pending[sid] = (data, task)
+            return
+        runtime.observed_status[sid] = (data, now)
+        await self._emit(channel, "session.status", session_id=sid, data=data)
+
+    async def _flush_observed_status(
+        self, channel: str, runtime: ChannelRuntime, sid: str, delay: float
+    ) -> None:
+        await asyncio.sleep(delay)
+        pending = runtime.observed_status_pending.pop(sid, None)
+        if pending is None:
+            return
+        runtime.observed_status[sid] = (pending[0], time.monotonic())
+        with contextlib.suppress(Exception):
+            await self._emit(channel, "session.status", session_id=sid, data=pending[0])
 
     def _channel_for(self, backend: str, session_id: str | None) -> str | None:
         if not session_id:

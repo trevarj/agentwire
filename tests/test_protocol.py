@@ -166,9 +166,26 @@ def test_committed_fixtures_decode_with_reference_codec() -> None:
     # pi exposes its model catalog and thinking level through the bridge.
     assert pi_hello.data["settings"] == ["model", "effort", "delivery"]
 
+    # A status for a session no channel is bound to: liveness only, no timeline.
+    observed = decode_envelope((fixtures / "observed-status.json").read_text(encoding="utf-8"))
+    assert observed.kind == "session.status"
+    assert observed.session_id == "observed-example"
+    assert observed.data == {
+        "busy": True,
+        "cwd": "/home/example/project",
+        "flags": ["waiting"],
+        "tuiAttached": True,
+    }
+
 
 def test_every_committed_envelope_fixture_re_encodes_byte_for_byte() -> None:
     fixtures = Path(__file__).parents[1] / "protocol" / "fixtures"
-    for name in ("hello.json", "prompt-action.json", "claude-hello.json", "pi-hello.json"):
+    for name in (
+        "hello.json",
+        "prompt-action.json",
+        "claude-hello.json",
+        "pi-hello.json",
+        "observed-status.json",
+    ):
         raw = (fixtures / name).read_text(encoding="utf-8").strip()
         assert encode_envelope(decode_envelope(raw)) == raw

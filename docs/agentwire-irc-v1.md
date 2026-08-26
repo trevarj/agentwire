@@ -273,6 +273,18 @@ the backend, but its activity is not rendered in the channel's main timeline. A 
 the session list as a paged sheet and can reattach when Agentwire reports an inactive-session
 request out of band.
 
+`session.status` is the one session-owned event that MAY carry the sid of a live or observed
+session other than the bound one, so a client can render a session drawer without polling.
+Such an event feeds a client-side session status registry only: it MUST NOT alter the bound
+session's timeline, busy state, settings, or binding. Its data fields are `busy` and `flags`,
+plus `cwd` and `tuiAttached` when the backend knows them; other members are absent rather than
+null. `session.status` for the bound sid keeps its existing meaning and MAY also update the
+registry entry for that sid. Agentwire coalesces these events per sid to at most one update
+every 2 seconds, suppressing unchanged payloads and always delivering the newest state once the
+window closes, so a client MUST treat the registry as an eventually consistent hint rather than
+a turn-accurate signal. Clients that predate this rule
+ignore an unknown-sid status event, which is why the extension is additive within v1.
+
 After a successful `session.create` or `session.attach`, Agentwire emits `binding.changed`, then a
 `session.snapshot`, then `channel.snapshot`. Clients MUST treat `binding.changed` as a timeline
 boundary and clear activity from the previous binding. For Codex, `session.snapshot.data` contains

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import stat
 import sys
 import time
@@ -149,6 +150,12 @@ async def test_external_prompt_opens_turn_and_settle_closes_it(tmp_path: Path) -
     await harness._handle_frame(session, {"type": "agent_settled"})
 
     events = drain(harness)
+    # Status brackets the turn for the session drawer; the turn itself is the rest.
+    assert [event.data["busy"] for event in events if event.kind == "status_changed"] == [
+        True,
+        False,
+    ]
+    events = [event for event in events if event.kind != "status_changed"]
     kinds = [event.kind for event in events]
     assert kinds == [
         "turn_started",
@@ -351,7 +358,9 @@ def fake_pi(tmp_path: Path, session_file: Path) -> str:
     payload = tmp_path / "fake-pi.py"
     payload.write_text(FAKE_PI, encoding="utf-8")
     script = tmp_path / "fake-pi"
-    script.write_text(f'#!/bin/sh\nexec {sys.executable} {payload} "$@"\n', encoding="utf-8")
+    # Resolve sh from PATH: sandboxed environments may lack /bin entirely.
+    sh = shutil.which("sh") or "/bin/sh"
+    script.write_text(f'#!{sh}\nexec {sys.executable} {payload} "$@"\n', encoding="utf-8")
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
     os.environ["FAKE_PI_SESSION_FILE"] = str(session_file)
     return str(script)
@@ -384,7 +393,8 @@ async def test_spawned_rpc_session_resumes_prompts_and_reads_history(tmp_path: P
 
         turn_id = await harness.send_message(STEM, "continue please")
         assert turn_id is not None
-        assert [event.kind for event in drain(harness)] == ["turn_started"]
+        # Registration reports the spawned session's liveness before the turn opens.
+        assert [event.kind for event in drain(harness)] == ["status_changed", "turn_started"]
 
         history = await harness.list_history(STEM, None, 10)
         kinds = [event.kind for event in history.events]
@@ -652,5 +662,50 @@ async def test_session_changed_rekeys_live_session(tmp_path: Path) -> None:
     assert STEM not in harness._sessions
     assert harness._sessions[new_stem] is session
     assert session.title == "fresh"
-    # The dangling turn of the old session closed.
-    assert [event.kind for event in drain(harness)] == ["turn_done"]
+    # The dangling turn of the old session closed, and the rekeyed session
+    # reports its own status under the new id.
+    events = drain(harness)
+    assert [event.kind for event in events] == ["status_changed", "turn_done", "status_changed"]
+    assert events[-1].session_id == new_stem
+
+
+@pytest.mark.asyncio
+async def test_registration_and_turn_edges_report_session_status(tmp_path: Path) -> None:
+    """pi pushes state, so the drawer is fed at registration and turn edges."""
+
+    harness = backend(tmp_path)
+    session = harness._register(
+        {"sessionFile": f"/s/{STEM}.jsonl", "cwd": CWD, "sessionName": "live"},
+        _Transport(asyncio.StreamReader(), FakeWriter()),
+        tui=True,
+    )
+    assert session is not None
+    session.pump.cancel()
+
+    hello = drain(harness)
+    assert [event.kind for event in hello] == ["status_changed"]
+    assert hello[0].session_id == STEM
+    assert hello[0].data == {"busy": False, "active_flags": [], "cwd": CWD, "tui": True}
+
+    await harness._handle_frame(session, {"type": "agent_start"})
+    started = drain(harness)
+    assert [event.kind for event in started] == ["status_changed"]
+    assert started[0].data["busy"] is True
+
+    # An open extension dialog is the one flag pi can state today.
+    await harness._handle_frame(
+        session,
+        {"type": "extension_ui_request", "id": "u1", "method": "confirm", "title": "Run it?"},
+    )
+    drain(harness)
+    await harness._handle_frame(session, {"type": "agent_settled"})
+    settled = drain(harness)
+    assert [event.kind for event in settled] == ["status_changed"]
+    assert settled[0].data["busy"] is False
+    assert settled[0].data["active_flags"] == ["waiting"]
+
+    await harness.resolve_approval("u1", True)
+    await harness._handle_frame(session, {"type": "session_changed", "sessionName": "renamed"})
+    changed = drain(harness)
+    assert [event.kind for event in changed] == ["status_changed"]
+    assert changed[0].data["active_flags"] == []
