@@ -473,6 +473,108 @@ async def test_extension_ui_dialogs_relay_and_resolve(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_plan_mode_questionnaire_round_trip(tmp_path: Path) -> None:
+    """Replay the frames pi-workflow's plan_mode_question emits through pi-tui-kit."""
+    harness = backend(tmp_path)
+    session = attached(harness, busy=True, tui=False)
+    writer = session.transport.writer
+    select_options = [
+        "1. Radio rows \u2014 match the settings picker",
+        "2. Filter chips \u2014 keep the current look",
+        "3. Other (free-form)",
+    ]
+
+    async def ask(token: str, method: str, **extra: Any) -> Any:
+        await harness._handle_frame(
+            session,
+            {"type": "extension_ui_request", "id": token, "method": method, **extra},
+        )
+        events = drain(harness)
+        assert [event.kind for event in events] == ["question"]
+        return events[0]
+
+    # (a) the questionnaire select splits its title and hides the free-form row.
+    event = await ask(
+        "s1", "select", title="Option UI: How should options render?", options=select_options
+    )
+    question = event.questions[0]
+    assert (question.header, question.prompt) == ("Option UI", "How should options render?")
+    assert question.options == tuple(select_options[:2])
+    assert question.custom is True
+
+    # (b) a listed option answers verbatim.
+    await harness.resolve_question("s1", event.questions, [[select_options[1]]])
+    assert writer.frames[-1] == {
+        "type": "extension_ui_response",
+        "id": "s1",
+        "value": select_options[1],
+    }
+
+    # (c) typed text answers through the free-form row, then the editor follow-up
+    #     carries the real text.
+    event = await ask(
+        "s2", "select", title="Option UI: How should options render?", options=select_options
+    )
+    await harness.resolve_question("s2", event.questions, [["segmented buttons"]])
+    assert writer.frames[-1] == {
+        "type": "extension_ui_response",
+        "id": "s2",
+        "value": select_options[2],
+    }
+    event = await ask("e1", "editor", title="How should options render?")
+    question = event.questions[0]
+    assert question.options == ()
+    assert question.custom is True
+    assert (question.header, question.prompt) == (
+        "How should options render?",
+        "How should options render?",
+    )
+    await harness.resolve_question("e1", event.questions, [["segmented buttons"]])
+    assert writer.frames[-1] == {
+        "type": "extension_ui_response",
+        "id": "e1",
+        "value": "segmented buttons",
+    }
+
+    # (d) a title without a short header prefix stays whole, custom row absent.
+    event = await ask("s3", "select", title="Pick one", options=["a", "b"])
+    question = event.questions[0]
+    assert (question.header, question.prompt) == ("Pick one", "Pick one")
+    assert question.options == ("a", "b")
+    assert question.custom is False
+    await harness.resolve_question("s3", event.questions, [["typed instead"]])
+    assert writer.frames[-1] == {
+        "type": "extension_ui_response",
+        "id": "s3",
+        "value": "typed instead",
+    }
+
+    # (e) cancelling closes the questionnaire.
+    event = await ask(
+        "s4", "select", title="Option UI: How should options render?", options=select_options
+    )
+    await harness.resolve_question("s4", event.questions, None)
+    assert writer.frames[-1] == {"type": "extension_ui_response", "id": "s4", "cancelled": True}
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("Option UI: How should options render?", ("Option UI", "How should options render?")),
+        ("Pick one", ("Pick one", "Pick one")),
+        # A long leading segment is prose, not a header.
+        (
+            "A header segment far past the limit: tail",
+            ("A header segment far past the limit: tail",) * 2,
+        ),
+        (": nothing", (": nothing", ": nothing")),
+    ],
+)
+def test_split_title(title: str, expected: tuple[str, str]) -> None:
+    assert PiBackend._split_title(title) == expected
+
+
+@pytest.mark.asyncio
 async def test_history_pages_from_disk_with_cursor(tmp_path: Path) -> None:
     harness = backend(tmp_path)
     write_session_file(

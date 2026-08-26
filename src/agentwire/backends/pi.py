@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
@@ -28,6 +29,10 @@ _COMMAND_TIMEOUT = 30.0
 # Socket discovery cadence: a new TUI shows up within a phone tap's patience.
 _DISCOVER_SECONDS = 2.0
 _SESSION_LIST_LIMIT = 20
+# pi-tui-kit renders questionnaire titles as "<header>: <prompt>" and appends a
+# synthetic free-form row to every select; both are undone for the clients.
+_UI_HEADER_MAX = 24
+_UI_CUSTOM_ROW = re.compile(r"^\d+\. Other \(free-form\)$")
 
 # pi's built-in tool names, mapped onto the vocabulary the bridge and its
 # clients already render for the other backends.
@@ -195,7 +200,9 @@ class PiBackend(Backend):
         self._discover: asyncio.Task[None] | None = None
         # Extension UI dialogs from spawned sessions relayed as questions and
         # approvals; the value carries what the JSONL response needs.
-        self._ui_requests: dict[str, tuple[_Session, dict[str, Any]]] = {}
+        # The third slot keeps the stripped "Other (free-form)" row so a typed
+        # answer can be routed back through it.
+        self._ui_requests: dict[str, tuple[_Session, dict[str, Any], str | None]] = {}
         self._setting_options: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
@@ -335,7 +342,7 @@ class PiBackend(Backend):
         pi pushes state changes, so status is reported where those arrive rather
         than polled.
         """
-        waiting = any(owner is session for owner, _ in self._ui_requests.values())
+        waiting = any(owner is session for owner, *_ in self._ui_requests.values())
         return BackendEvent(
             kind="status_changed",
             backend=self.name,
@@ -625,8 +632,8 @@ class PiBackend(Backend):
             # Fire-and-forget methods (notify, setStatus, ...) render nothing.
             return
         title = safe_one_line(str(frame.get("title") or "pi extension request"), 160)
-        self._ui_requests[token] = (session, frame)
         if method == "confirm":
+            self._ui_requests[token] = (session, frame, None)
             message = safe_one_line(str(frame.get("message") or ""), 160)
             await self._events.put(
                 BackendEvent(
@@ -640,6 +647,13 @@ class PiBackend(Backend):
             )
             return
         options = tuple(str(option) for option in frame.get("options") or () if str(option).strip())
+        custom_row: str | None = None
+        if method == "select" and options and _UI_CUSTOM_ROW.match(options[-1]):
+            # The free-form row is an input affordance, not a real choice.
+            custom_row = options[-1]
+            options = options[:-1]
+        header, prompt = self._split_title(title)
+        self._ui_requests[token] = (session, frame, custom_row)
         await self._events.put(
             BackendEvent(
                 kind="question",
@@ -650,10 +664,10 @@ class PiBackend(Backend):
                 questions=(
                     Question(
                         id="1",
-                        header=title,
-                        prompt=title,
+                        header=header,
+                        prompt=prompt,
                         options=options,
-                        custom=method != "select",
+                        custom=method != "select" or custom_row is not None,
                     ),
                 ),
             )
@@ -663,10 +677,18 @@ class PiBackend(Backend):
         entry = self._ui_requests.pop(str(request_token), None)
         if entry is None:
             raise BackendError("approval was already resolved")
-        session, frame = entry
+        session, frame, _ = entry
         await session.transport.write(
             {"type": "extension_ui_response", "id": frame.get("id"), "confirmed": allow}
         )
+
+    @staticmethod
+    def _split_title(title: str) -> tuple[str, str]:
+        """Split a pi-tui-kit "<header>: <prompt>" title, else reuse the title."""
+        header, sep, prompt = title.partition(": ")
+        if sep and prompt.strip() and header.strip() and len(header) <= _UI_HEADER_MAX:
+            return header, prompt
+        return title, title
 
     async def resolve_question(
         self,
@@ -677,13 +699,19 @@ class PiBackend(Backend):
         entry = self._ui_requests.pop(str(request_token), None)
         if entry is None:
             raise BackendError("question was already resolved")
-        session, frame = entry
+        session, frame, custom_row = entry
         response: dict[str, Any] = {"type": "extension_ui_response", "id": frame.get("id")}
         first = next(iter(answers or ()), ())
         value = next(iter(first), None)
         if answers is None or value is None:
             response["cancelled"] = True
         else:
+            if custom_row is not None and value not in {
+                str(option) for option in frame.get("options") or ()
+            }:
+                # Typed text: pick the free-form row so pi-tui-kit follows up
+                # with the editor request that carries the real answer.
+                value = custom_row
             response["value"] = value
         await session.transport.write(response)
 
