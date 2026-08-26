@@ -200,7 +200,9 @@ session is no longer attached; it must never redirect a delayed action to a newe
 `workspace.list.request` without data lists configured allowlisted roots. Supplying an absolute
 allowlisted directory as `data.parent` lists its immediate non-hidden child directories.
 `workspace.page.data.parent` echoes that directory or is null for the root page; every item has
-`path`, `name`, and `hasChildren`. Clients SHOULD lazy-load children when a directory expands and
+`path`, `name`, and `hasChildren`. An item MAY also carry `sessionCount`, the number of sessions
+directly in that directory as known by the backend; the key is absent when the backend cannot
+answer cheaply. Clients SHOULD lazy-load children when a directory expands and
 MAY use any returned path as `session.create.data.cwd` or `session.list.request.data.cwd`.
 `session.list.request.data.scope` is `workspace` or `live`; older `cwd=null` live discovery remains
 valid. `session.page.data.scope` echoes the resolved scope and `data.cwd` echoes the requested

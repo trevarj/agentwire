@@ -41,6 +41,13 @@ class Backend(abc.ABC):
     async def session_busy(self, session_id: str) -> bool | None:
         return None
 
+    def count_sessions(self, cwd: str) -> int | None:
+        """Return how many sessions live directly in cwd, or None when unknown.
+
+        Called off the event loop, so a cheap directory scan is acceptable.
+        """
+        return None
+
     async def list_history(
         self,
         session_id: str,

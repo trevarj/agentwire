@@ -576,6 +576,21 @@ async def test_list_sessions_reads_titles_and_marks_live(tmp_path: Path) -> None
     assert session.id == STEM
 
 
+def test_count_sessions_counts_jsonl_files(tmp_path: Path) -> None:
+    harness = backend(tmp_path)
+    assert harness.count_sessions(CWD) == 0
+
+    directory = harness.config.session_root / _cwd_dir_name(CWD)
+    directory.mkdir(parents=True)
+    assert harness.count_sessions(CWD) == 0
+
+    write_session_file(harness.config.session_root, CWD, STEM, [])
+    other_stem = "2026-08-23T10-00-00-000Z_22222222-2222-7222-8222-222222222222"
+    write_session_file(harness.config.session_root, CWD, other_stem, [])
+    (directory / "notes.txt").write_text("ignored", encoding="utf-8")
+    assert harness.count_sessions(CWD) == 2
+
+
 @pytest.mark.asyncio
 async def test_steer_cancel_and_settings_round_trip(tmp_path: Path) -> None:
     harness = backend(tmp_path)

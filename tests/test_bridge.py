@@ -68,7 +68,11 @@ class FakeBackend(Backend):
         self.steered: list[tuple[str, str]] = []
         self.settings: dict[str, Any] = {}
         self.sessions: list[SessionSummary] | None = None
+        self.session_counts: dict[str, int] = {}
         self._events: asyncio.Queue[BackendEvent] = asyncio.Queue()
+
+    def count_sessions(self, cwd: str) -> int | None:
+        return self.session_counts.get(cwd)
 
     async def start(self) -> None: ...
 
@@ -439,6 +443,30 @@ async def test_workspace_pages_browse_allowlisted_directories(tmp_path: Path) ->
     child_page = next(item[1] for item in irc.sent if item[1].kind == "workspace.page")
     assert [item["name"] for item in child_page.data["items"]] == ["project-a", "project-b"]
     assert child_page.data["parent"] == str(tmp_path)
+    assert all("sessionCount" not in item for item in child_page.data["items"])
+
+
+@pytest.mark.asyncio
+async def test_workspace_pages_carry_backend_session_counts(tmp_path: Path) -> None:
+    (tmp_path / "project-a").mkdir()
+    (tmp_path / "project-b").mkdir()
+    bridge, irc, backend = make_bridge(tmp_path)
+    backend.session_counts = {str(tmp_path / "project-a"): 3}
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    irc.sent.clear()
+
+    action = new_envelope(
+        "workspace.list.request",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        data={"parent": str(tmp_path)},
+    )
+    await bridge._handle_action("#codex", action)
+    page = next(item[1] for item in irc.sent if item[1].kind == "workspace.page")
+    assert [item.get("sessionCount") for item in page.data["items"]] == [3, None]
+    assert "sessionCount" not in page.data["items"][1]
 
 
 @pytest.mark.asyncio

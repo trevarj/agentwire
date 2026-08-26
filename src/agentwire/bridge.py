@@ -549,14 +549,20 @@ class Bridge:
             directories = self._workspace_children(parent)
         else:
             raise ProtocolError("workspace parent must be a string")
-        items = [
-            {
+        backend = self.backends[self.channels[channel].backend]
+        counts = await asyncio.to_thread(
+            lambda: [backend.count_sessions(str(directory)) for directory in directories]
+        )
+        items = []
+        for directory, count in zip(directories, counts, strict=True):
+            item: dict[str, Any] = {
                 "path": str(directory),
                 "name": directory.name,
                 "hasChildren": bool(self._workspace_children(directory, limit=1)),
             }
-            for directory in directories
-        ]
+            if count is not None:
+                item["sessionCount"] = count
+            items.append(item)
         await self._emit(
             channel,
             "workspace.page",

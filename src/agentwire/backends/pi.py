@@ -762,6 +762,13 @@ class PiBackend(Backend):
             summaries.append(await asyncio.to_thread(self._file_summary, path, cwd))
         return summaries
 
+    def count_sessions(self, cwd: str) -> int | None:
+        directory = self.config.session_root / _cwd_dir_name(cwd)
+        try:
+            return sum(1 for path in directory.iterdir() if path.suffix == ".jsonl")
+        except OSError:
+            return 0
+
     @staticmethod
     def _mtime(path: Path) -> float:
         try:
