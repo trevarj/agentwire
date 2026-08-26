@@ -1192,3 +1192,83 @@ async def test_observed_session_status_is_coalesced_per_session(
     # Coalescing is per session: another session is not held back by the first.
     await status("s8", True)
     assert sent()[-1] == ("s8", True, [])
+
+
+@pytest.mark.asyncio
+async def test_subagent_updates_are_bound_session_state_and_coalesced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    bridge.channels["#codex"].binding = ChannelBinding("codex", "s1", str(tmp_path))
+    irc.sent.clear()
+    # A short real window keeps the trailing flush observable without slow tests.
+    monkeypatch.setattr("agentwire.bridge.SUBAGENT_UPDATE_SECONDS", 0.2)
+
+    async def update(sid: str, *ids: str) -> None:
+        await bridge._handle_backend_event(
+            "#codex",
+            BackendEvent(
+                "subagent_update",
+                "codex",
+                session_id=sid,
+                data={
+                    "agents": [
+                        {
+                            "id": agent_id,
+                            "type": "Terra",
+                            "description": "d",
+                            "status": "running",
+                            "isBackground": False,
+                        }
+                        for agent_id in ids
+                    ]
+                },
+            ),
+        )
+
+    def sent() -> list[tuple[str, list[str]]]:
+        return [
+            (event.kind, [agent["id"] for agent in event.data["agents"]])
+            for _, event, _ in irc.sent
+        ]
+
+    await update("s1", "a1")
+    assert sent() == [("subagent.updated", ["a1"])]
+
+    # Repeating the visible list says nothing.
+    await update("s1", "a1")
+    assert len(irc.sent) == 1
+
+    # A change inside the window is held and delivered when the window closes.
+    await update("s1", "a1", "a2")
+    assert len(irc.sent) == 1
+    await asyncio.sleep(0.3)
+    assert sent() == [("subagent.updated", ["a1"]), ("subagent.updated", ["a1", "a2"])]
+
+    # Two changes inside one window cancel out to the already-visible list.
+    await update("s1", "a3")
+    await update("s1", "a1", "a2")
+    await asyncio.sleep(0.3)
+    assert len(irc.sent) == 2
+
+    # Newest list wins when the flush fires.
+    await update("s1")
+    assert len(irc.sent) == 3
+    await update("s1", "a4")
+    await update("s1", "a5")
+    await asyncio.sleep(0.3)
+    assert sent()[-1] == ("subagent.updated", ["a5"])
+    assert len(irc.sent) == 4
+
+    # Session-owned: another session's agents never reach this channel.
+    await update("s9", "other")
+    assert len(irc.sent) == 4
+    assert bridge.channels["#codex"].subagents is not None
+
+    # Rebinding forgets the reading, so the new session's list is never suppressed.
+    bridge._reset_subagents(bridge.channels["#codex"])
+    assert bridge.channels["#codex"].subagents is None
+    await update("s1", "a5")
+    assert sent()[-1] == ("subagent.updated", ["a5"])
+    assert len(irc.sent) == 5

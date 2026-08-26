@@ -37,6 +37,8 @@ MAX_PREVIEW_BYTES = 4 * 1024
 MAX_REASON_BYTES = 200
 # Shortest gap between two `session.status` events for the same unbound session.
 OBSERVED_STATUS_SECONDS = 2.0
+# A fleet of agents can churn faster than a phone can usefully render.
+SUBAGENT_UPDATE_SECONDS = 1.0
 # Diagnostics name channels, accounts, kinds, and reasons. They never carry
 # prompt text, tool output, tag values, or credentials.
 LOGGER = logging.getLogger("agentwire.bridge")
@@ -79,6 +81,10 @@ class ChannelRuntime:
     observed_status_pending: dict[str, tuple[dict[str, Any], asyncio.Task[None]]] = field(
         default_factory=dict
     )
+    # `subagent.updated` is bound-session state, so one reading and one pending
+    # flush per channel is enough; same newest-wins rule as observed status.
+    subagents: tuple[dict[str, Any], float] | None = None
+    subagents_pending: tuple[dict[str, Any], asyncio.Task[None]] | None = None
     attaching_session: str | None = None
     deferred_events: list[BackendEvent] = field(default_factory=list)
 
@@ -142,6 +148,9 @@ class Bridge:
             for _payload, pending in runtime.observed_status_pending.values():
                 pending.cancel()
             runtime.observed_status_pending.clear()
+            if runtime.subagents_pending is not None:
+                runtime.subagents_pending[1].cancel()
+                runtime.subagents_pending = None
         for task in self._tasks:
             if task is not current:
                 task.cancel()
@@ -746,6 +755,7 @@ class Bridge:
         runtime = self.channels[channel]
         previous = self._require_binding(runtime, action)
         runtime.binding = None
+        self._reset_subagents(runtime)
         runtime.busy = False
         runtime.active_turn = None
         runtime.settings = {"delivery": "queue", "approvalReviewer": "manual"}
@@ -1051,6 +1061,8 @@ class Bridge:
                 item_id=event.item_id,
                 data=self._safe_tool_data(event),
             )
+        elif event.kind == "subagent_update":
+            await self._emit_subagents(channel, runtime, event)
         elif event.kind in {"approval", "question"}:
             await self._open_request(channel, event)
         elif event.kind == "request_resolved":
@@ -1157,6 +1169,9 @@ class Bridge:
             runtime.observed_sessions.add(previous.session_id)
         runtime.observed_sessions.add(summary.id)
         runtime.binding = binding
+        # Clients clear this list on `binding.changed`, so the coalescer must
+        # forget its reading or an identical list for the new session is dropped.
+        self._reset_subagents(runtime)
         runtime.settings = dict(
             runtime.session_settings.get(
                 summary.id,
@@ -1326,6 +1341,63 @@ class Bridge:
         runtime.observed_status[sid] = (pending[0], time.monotonic())
         with contextlib.suppress(Exception):
             await self._emit(channel, "session.status", session_id=sid, data=pending[0])
+
+    @staticmethod
+    def _reset_subagents(runtime: ChannelRuntime) -> None:
+        if runtime.subagents_pending is not None:
+            runtime.subagents_pending[1].cancel()
+            runtime.subagents_pending = None
+        runtime.subagents = None
+
+    async def _emit_subagents(
+        self, channel: str, runtime: ChannelRuntime, event: BackendEvent
+    ) -> None:
+        """Publish the bound session's subagent list, coalesced to at most 1/s.
+
+        The list replaces rather than merges, so only the newest one matters and
+        an unchanged list is dropped. Mirrors `_emit_observed_status`, keyed by
+        channel because this state only ever describes the bound session.
+        """
+        agents = event.data.get("agents")
+        data: dict[str, Any] = {"agents": list(agents) if isinstance(agents, list) else []}
+        now = time.monotonic()
+        last = runtime.subagents
+        pending = runtime.subagents_pending
+        # Compare against what the client will end up seeing, not what it last saw.
+        visible = pending[0] if pending is not None else (last[0] if last is not None else None)
+        if visible == data:
+            return
+        if pending is not None:
+            if last is not None and last[0] == data:
+                # The change cancelled itself out; the client is already right.
+                pending[1].cancel()
+                runtime.subagents_pending = None
+            else:
+                # Newest list wins; the scheduled flush keeps its deadline.
+                runtime.subagents_pending = (data, pending[1])
+            return
+        if last is not None and now - last[1] < SUBAGENT_UPDATE_SECONDS:
+            delay = SUBAGENT_UPDATE_SECONDS - (now - last[1])
+            task = asyncio.create_task(
+                self._flush_subagents(channel, runtime, event.session_id, delay),
+                name=f"subagents-{channel}",
+            )
+            runtime.subagents_pending = (data, task)
+            return
+        runtime.subagents = (data, now)
+        await self._emit(channel, "subagent.updated", session_id=event.session_id, data=data)
+
+    async def _flush_subagents(
+        self, channel: str, runtime: ChannelRuntime, sid: str | None, delay: float
+    ) -> None:
+        await asyncio.sleep(delay)
+        pending = runtime.subagents_pending
+        if pending is None:
+            return
+        runtime.subagents_pending = None
+        runtime.subagents = (pending[0], time.monotonic())
+        with contextlib.suppress(Exception):
+            await self._emit(channel, "subagent.updated", session_id=sid, data=pending[0])
 
     def _channel_for(self, backend: str, session_id: str | None) -> str | None:
         if not session_id:

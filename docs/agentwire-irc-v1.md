@@ -260,7 +260,7 @@ Harness activity:
   `queue.item.removed`
 - `turn.started`, `turn.completed`, `turn.failed`
 - `assistant.delta`, `assistant.completed`, `plan.updated`
-- `tool.started`, `tool.updated`, `tool.completed`, `usage.updated`
+- `tool.started`, `tool.updated`, `tool.completed`, `usage.updated`, `subagent.updated`
 - `request.opened`, `request.resolved`, `approval.review.started`,
   `approval.review.completed`
 
@@ -286,6 +286,17 @@ every 2 seconds, suppressing unchanged payloads and always delivering the newest
 window closes, so a client MUST treat the registry as an eventually consistent hint rather than
 a turn-accurate signal. Clients that predate this rule
 ignore an unknown-sid status event, which is why the extension is additive within v1.
+
+`subagent.updated` is session-owned `TAGMSG` state reporting the autonomous subagents the bound
+session is running. Its `data.agents` is the full current list and replaces the client's previous
+one rather than merging into it, so an empty list means no agents are tracked. Each entry carries
+`id`, `type`, `description` (200 bytes), `status` (`queued`, `running`, `completed`, or `failed`),
+and `isBackground`, plus numeric `toolUses`, `durationMs`, and `tokens` when a finished agent
+reported them. Agentwire coalesces the event to at most one emission per second per channel,
+suppressing an unchanged list and delivering the newest one once the window closes, and clients
+MUST clear the list on `binding.changed` because it describes the bound session only. For the pi
+backend this is limited to live TUI sessions, since a bridge-spawned RPC session cannot receive
+extension events; other backends and bridge-spawned sessions simply never emit it.
 
 After a successful `session.create` or `session.attach`, Agentwire emits `binding.changed`, then a
 `session.snapshot`, then `channel.snapshot`. Clients MUST treat `binding.changed` as a timeline

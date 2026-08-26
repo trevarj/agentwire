@@ -18,6 +18,7 @@ EventKind = Literal[
     "approval",
     "question",
     "request_resolved",
+    "subagent_update",
 ]
 
 

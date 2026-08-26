@@ -77,6 +77,7 @@ EVENT_KINDS = frozenset(
         "tool.updated",
         "tool.completed",
         "usage.updated",
+        "subagent.updated",
         "request.opened",
         "request.resolved",
         "approval.review.started",

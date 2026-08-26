@@ -177,6 +177,21 @@ def test_committed_fixtures_decode_with_reference_codec() -> None:
         "tuiAttached": True,
     }
 
+    # Subagent state is session-owned and replaces the client's whole list.
+    subagents = decode_envelope((fixtures / "subagent-update.json").read_text(encoding="utf-8"))
+    assert subagents.kind == "subagent.updated"
+    assert subagents.session_id == "session-example"
+    agents = subagents.data["agents"]
+    assert [agent["status"] for agent in agents] == ["running", "completed"]
+    assert agents[0] == {
+        "id": "agent-1",
+        "type": "Explore",
+        "description": "map the repository",
+        "status": "running",
+        "isBackground": True,
+    }
+    assert (agents[1]["toolUses"], agents[1]["durationMs"], agents[1]["tokens"]) == (7, 4200, 1234)
+
 
 def test_every_committed_envelope_fixture_re_encodes_byte_for_byte() -> None:
     fixtures = Path(__file__).parents[1] / "protocol" / "fixtures"
@@ -186,6 +201,7 @@ def test_every_committed_envelope_fixture_re_encodes_byte_for_byte() -> None:
         "claude-hello.json",
         "pi-hello.json",
         "observed-status.json",
+        "subagent-update.json",
     ):
         raw = (fixtures / name).read_text(encoding="utf-8").strip()
         assert encode_envelope(decode_envelope(raw)) == raw

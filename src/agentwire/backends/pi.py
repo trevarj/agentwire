@@ -33,6 +33,10 @@ _SESSION_LIST_LIMIT = 20
 # synthetic free-form row to every select; both are undone for the clients.
 _UI_HEADER_MAX = 24
 _UI_CUSTOM_ROW = re.compile(r"^\d+\. Other \(free-form\)$")
+# Subagent rows the extension reports; the registry is already bounded there, so
+# the bridge only has to keep the shape safe.
+_SUBAGENT_STATUSES = frozenset({"queued", "running", "completed", "failed"})
+_SUBAGENT_METRICS = ("toolUses", "durationMs", "tokens")
 
 # pi's built-in tool names, mapped onto the vocabulary the bridge and its
 # clients already render for the other backends.
@@ -62,6 +66,43 @@ def _session_stem(session_file: str | None) -> str | None:
 def _cwd_dir_name(cwd: str) -> str:
     """Map a workspace path onto pi's per-directory session folder name."""
     return f"--{cwd.strip('/').replace('/', '-')}--"
+
+
+def _subagent_event(backend: str, session_id: str, frame: Mapping[str, Any]) -> BackendEvent | None:
+    """Translate one extension `subagent_update` frame into a backend event.
+
+    The extension is trusted for bounds but not for shape: only the allowlisted
+    members survive, so a future field cannot reach a client unreviewed.
+    """
+    raw = frame.get("agents")
+    if not isinstance(raw, list):
+        return None
+    agents: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        identifier = str(item.get("id") or "")
+        status = str(item.get("status") or "")
+        if not identifier or status not in _SUBAGENT_STATUSES:
+            continue
+        agent: dict[str, Any] = {
+            "id": safe_one_line(identifier, 200),
+            "type": safe_one_line(str(item.get("type") or "agent"), 200),
+            "description": safe_one_line(str(item.get("description") or ""), 200),
+            "status": status,
+            "isBackground": bool(item.get("isBackground")),
+        }
+        for key in _SUBAGENT_METRICS:
+            value = item.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                agent[key] = value
+        agents.append(agent)
+    return BackendEvent(
+        kind="subagent_update",
+        backend=backend,
+        session_id=session_id,
+        data={"agents": agents},
+    )
 
 
 def _entry_millis(entry: Mapping[str, Any]) -> int:
@@ -300,6 +341,10 @@ class PiBackend(Backend):
             await transport.close()
             raise BackendError(f"unexpected first frame from {path}")
         session = self._register(hello, transport, tui=True)
+        if session is not None:
+            # `hello` carries the current list, so a reconnect does not have to
+            # wait for the next lifecycle event to repopulate the client.
+            self._queue_subagents(session, hello)
         if session is None:
             # Another connection already serves this session; keep the path
             # marked known so discovery does not reconnect every sweep.
@@ -426,6 +471,10 @@ class PiBackend(Backend):
             await self._handle_tool_end(session, frame)
         elif kind == "extension_ui_request":
             await self._handle_ui_request(session, frame)
+        elif kind == "subagent_update":
+            event = _subagent_event(self.name, session.id, frame)
+            if event is not None:
+                await self._events.put(event)
         # message_start/message_update (RPC streaming) and fire-and-forget UI
         # methods carry nothing the bridge renders; they are dropped here.
 
@@ -448,6 +497,15 @@ class PiBackend(Backend):
             self._sessions[stem] = session
         session.updated_at = time.time()
         await self._events.put(self._status_event(session))
+        self._queue_subagents(session, frame)
+
+    def _queue_subagents(self, session: _Session, state: Mapping[str, Any]) -> None:
+        """Publish the subagent list a state payload carries, when it carries one."""
+        if "subagents" not in state:
+            return
+        event = _subagent_event(self.name, session.id, {"agents": state["subagents"]})
+        if event is not None:
+            self._events.put_nowait(event)
 
     def _open_turn(self, session: _Session) -> tuple[str, list[BackendEvent]]:
         if session.turn_id is not None:

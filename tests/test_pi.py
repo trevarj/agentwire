@@ -826,3 +826,92 @@ async def test_registration_and_turn_edges_report_session_status(tmp_path: Path)
     changed = drain(harness)
     assert [event.kind for event in changed] == ["status_changed"]
     assert changed[0].data["active_flags"] == []
+
+
+@pytest.mark.asyncio
+async def test_subagent_frames_and_state_payloads_are_sanitized(tmp_path: Path) -> None:
+    """The extension bounds the registry; the backend still allowlists the shape."""
+
+    harness = backend(tmp_path)
+    session = attached(harness)
+    await harness._handle_frame(
+        session,
+        {
+            "type": "subagent_update",
+            "agents": [
+                {
+                    "id": "a1",
+                    "type": "Explore",
+                    "description": "map  the\nrepository",
+                    "status": "running",
+                    "isBackground": True,
+                    "secret": "must not survive",
+                },
+                {
+                    "id": "a2",
+                    "type": "Terra",
+                    "description": "x" * 400,
+                    "status": "completed",
+                    "isBackground": False,
+                    "toolUses": 7,
+                    "durationMs": 4200,
+                    "tokens": {"input": 5},
+                },
+                # Dropped: no id, and an unknown status.
+                {"type": "Terra", "status": "running"},
+                {"id": "a3", "status": "cancelled"},
+            ],
+        },
+    )
+    events = drain(harness)
+    assert [event.kind for event in events] == ["subagent_update"]
+    agents = events[0].data["agents"]
+    assert events[0].session_id == STEM
+    assert agents[0] == {
+        "id": "a1",
+        "type": "Explore",
+        "description": "map the repository",
+        "status": "running",
+        "isBackground": True,
+    }
+    assert len(agents) == 2
+    assert agents[1]["toolUses"] == 7
+    assert agents[1]["durationMs"] == 4200
+    # A non-numeric `tokens` is dropped rather than forwarded.
+    assert "tokens" not in agents[1]
+    assert len(agents[1]["description"].encode("utf-8")) <= 200
+
+    # A frame without a usable list produces nothing at all.
+    await harness._handle_frame(session, {"type": "subagent_update", "agents": "nope"})
+    assert drain(harness) == []
+
+
+@pytest.mark.asyncio
+async def test_hello_and_session_changed_carry_the_current_subagents(tmp_path: Path) -> None:
+    harness = backend(tmp_path)
+    hello = {
+        "sessionFile": f"/s/{STEM}.jsonl",
+        "cwd": CWD,
+        "sessionName": "live",
+        "subagents": [{"id": "a1", "type": "Terra", "description": "d", "status": "queued"}],
+    }
+    session = harness._register(hello, _Transport(asyncio.StreamReader(), FakeWriter()), tui=True)
+    assert session is not None
+    session.pump.cancel()
+    # `_register` reports liveness; the hello list follows it on connect, so a
+    # client that attaches mid-run does not wait for the next lifecycle event.
+    harness._queue_subagents(session, hello)
+    registered = drain(harness)
+    assert [event.kind for event in registered] == ["status_changed", "subagent_update"]
+    assert registered[1].data["agents"][0]["id"] == "a1"
+
+    await harness._handle_frame(
+        session, {"type": "session_changed", "sessionName": "renamed", "subagents": []}
+    )
+    changed = drain(harness)
+    assert [event.kind for event in changed] == ["status_changed", "subagent_update"]
+    assert changed[1].data == {"agents": []}
+
+    # A state payload with no `subagents` member says nothing about the list.
+    await harness._handle_frame(session, {"type": "session_changed", "sessionName": "again"})
+    assert [event.kind for event in drain(harness)] == ["status_changed"]

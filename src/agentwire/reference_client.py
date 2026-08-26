@@ -34,6 +34,8 @@ class HarnessState:
     assistant: list[dict[str, Any]] = field(default_factory=list)
     tools: dict[str, dict[str, Any]] = field(default_factory=dict)
     plan: dict[str, Any] | None = None
+    # Replace-not-merge: every `subagent.updated` carries the full current list.
+    subagents: list[dict[str, Any]] = field(default_factory=list)
 
     def apply(self, event: Envelope) -> None:
         if event.message_type != "event":
@@ -67,6 +69,7 @@ class HarnessState:
             self.assistant.clear()
             self.tools.clear()
             self.plan = None
+            self.subagents = []
         elif event.kind in {"session.snapshot", "session.status"}:
             self.settings.update(event.data.get("settings") or {})
             if "busy" in event.data:
@@ -87,6 +90,10 @@ class HarnessState:
             self.assistant.append({"iid": event.item_id, **event.data})
         elif event.kind == "plan.updated":
             self.plan = dict(event.data)
+        elif event.kind == "subagent.updated":
+            self.subagents = [
+                dict(agent) for agent in event.data.get("agents") or [] if isinstance(agent, dict)
+            ]
         elif event.kind.startswith("tool.") and event.item_id:
             self.tools[event.item_id] = {"kind": event.kind, **event.data}
         elif event.kind == "request.opened" and event.request_id:
@@ -119,6 +126,7 @@ class HarnessState:
             "assistant": self.assistant,
             "tools": self.tools,
             "plan": self.plan,
+            "subagents": self.subagents,
         }
 
 
