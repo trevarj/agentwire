@@ -18,13 +18,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import aiohttp
-from aiohttp import web
-
-from agentwire.backends.claude import ClaudeBackend
-from agentwire.backends.codex import CodexBackend, CodexTuiSessionPresence
-from agentwire.backends.opencode import OpenCodeBackend
-from agentwire.backends.pi import PiBackend
 from agentwire.bridge import Bridge
 from agentwire.config import ClaudeConfig, Config, install_secret_env
 from agentwire.irc import IRCClient
@@ -50,7 +43,7 @@ class _CodexTuiRelayTracker:
 
     _THREAD_METHODS = {"thread/start", "thread/resume", "thread/fork"}
 
-    def __init__(self, presence: CodexTuiSessionPresence) -> None:
+    def __init__(self, presence: Any) -> None:
         self.presence = presence
         self.current_session: str | None = None
         self.pending: dict[str | int, tuple[str, str | None]] = {}
@@ -135,10 +128,9 @@ def doctor(config: Config) -> list[str]:
         ssl.create_default_context(cafile=str(config.irc.ca_file))
     except (OSError, ssl.SSLError) as exc:
         raise StackError(f"invalid IRC CA file {config.irc.ca_file}: {exc}") from exc
-    checks = {
-        "ssh": config.stack.ssh_binary,
-        "codex": config.codex.binary,
-    }
+    checks = {"ssh": config.stack.ssh_binary}
+    if config.codex is not None:
+        checks["codex"] = config.codex.binary
     if config.opencode is not None:
         checks["opencode"] = config.opencode.binary
     if config.claude is not None:
@@ -146,6 +138,7 @@ def doctor(config: Config) -> list[str]:
     if config.pi is not None:
         checks["pi"] = config.pi.binary
     results = [f"{label}: {_binary(binary)}" for label, binary in checks.items()]
+    results.append("ergo fakelag: disable privately or exempt bot with nofakelag-only oper class")
     if config.claude is not None:
         results.append(f"claude auth: {_claude_credentials(config.claude)}")
     if config.pi is not None:
@@ -183,6 +176,8 @@ def _claude_credentials(claude: ClaudeConfig) -> str:
 
 
 def _prepare_runtime(config: Config) -> None:
+    if config.codex is None:
+        return
     socket_path = config.codex.socket_path
     socket_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(socket_path.parent, 0o700)
@@ -209,16 +204,26 @@ def _prepare_runtime(config: Config) -> None:
 async def run_bridge(config: Config) -> None:
     install_secret_env(config)
     irc_password = os.environ[config.irc.password_env]
-    backends = {"codex": CodexBackend(config.codex)}
+    backends = {}
+    if config.codex is not None:
+        from agentwire.backends.codex import CodexBackend
+
+        backends["codex"] = CodexBackend(config.codex)
     if config.opencode is not None:
+        from agentwire.backends.opencode import OpenCodeBackend
+
         opencode_password = os.environ[config.opencode.password_env]
         backends["opencode"] = OpenCodeBackend(config.opencode, opencode_password)
     if config.claude is not None:
+        from agentwire.backends.claude import ClaudeBackend
+
         api_key = (
             os.environ[config.claude.api_key_env] if config.claude.api_key_env is not None else None
         )
         backends["claude"] = ClaudeBackend(config.claude, api_key)
     if config.pi is not None:
+        from agentwire.backends.pi import PiBackend
+
         backends["pi"] = PiBackend(config.pi)
     bridge = Bridge(config, IRCClient(config.irc, irc_password), backends)
     await bridge.run()
@@ -309,7 +314,6 @@ async def run_stack(config: Config) -> None:
         print(f"doctor: {check}", flush=True)
     _prepare_runtime(config)
     ssh = _binary(config.stack.ssh_binary)
-    codex = _binary(config.codex.binary)
     helpers = [
         _Helper(
             "ssh tunnel",
@@ -330,22 +334,23 @@ async def run_stack(config: Config) -> None:
             # The IRC client reconnects for as long as the bridge runs, so a
             # tunnel that dies with the network is an outage, not a shutdown.
             restart=True,
-        ),
-        _Helper(
-            "Codex app-server",
-            [
-                codex,
-                "app-server",
-                "--listen",
-                f"unix://{config.codex.socket_path}",
-            ],
-            # CodexBackend holds one JSON-RPC websocket it never re-establishes,
-            # and a resumed thread only reaches a subscribed client. Restarting
-            # the server under it would leave every Codex channel silently
-            # eventless, so this exit still stops the stack.
-            restart=False,
-        ),
+        )
     ]
+    if config.codex is not None:
+        helpers.append(
+            _Helper(
+                "Codex app-server",
+                [
+                    _binary(config.codex.binary),
+                    "app-server",
+                    "--listen",
+                    f"unix://{config.codex.socket_path}",
+                ],
+                # CodexBackend holds one JSON-RPC websocket it never re-establishes,
+                # so this exit still stops the stack.
+                restart=False,
+            )
+        )
     if config.opencode is not None:
         helpers.append(
             _Helper(
@@ -459,11 +464,9 @@ def sync_certificate(config: Config) -> None:
             temp.unlink()
 
 
-async def _relay_websocket_frames(
-    source: aiohttp.ClientWebSocketResponse | web.WebSocketResponse,
-    destination: aiohttp.ClientWebSocketResponse | web.WebSocketResponse,
-    observe: Any,
-) -> None:
+async def _relay_websocket_frames(source: Any, destination: Any, observe: Any) -> None:
+    import aiohttp
+
     async for frame in source:
         if frame.type == aiohttp.WSMsgType.TEXT:
             observe(frame.data)
@@ -479,6 +482,13 @@ async def _relay_websocket_frames(
 
 
 async def _run_codex_tui(config: Config, binary: str) -> int:
+    import aiohttp
+    from aiohttp import web
+
+    from agentwire.backends.codex import CodexTuiSessionPresence
+
+    if config.codex is None:
+        raise StackError("Codex is not enabled by any configured IRC channel")
     runtime = config.codex.socket_path.parent
     runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(runtime, 0o700)
@@ -592,6 +602,8 @@ async def _run_codex_tui(config: Config, binary: str) -> int:
 
 def codex_tui(config: Config) -> None:
     install_secret_env(config)
+    if config.codex is None:
+        raise StackError("Codex is not enabled by any configured IRC channel")
     binary = _binary(config.codex.binary)
     return_code = asyncio.run(_run_codex_tui(config, binary))
     if return_code:

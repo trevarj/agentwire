@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
 import json
+import random
 import uuid
+import zlib
 from pathlib import Path
 
 import pytest
@@ -87,13 +90,27 @@ def test_envelope_round_trip_is_minified_and_validated() -> None:
 
 
 def test_checked_fragment_round_trip_and_conflict_rejection() -> None:
-    envelope = new_envelope(
+    compressed = new_envelope(
         "assistant.completed",
         "event",
         "agent",
         id=str(uuid.uuid4()),
         epoch="live",
         data={"content": "🙂" * 3000},
+    )
+    compressed_fragments = fragment_envelope(compressed, max_tag_bytes=700)
+    assert len(compressed_fragments) == 1
+    assert json.loads(compressed_fragments[0])["encoding"] == "zlib"
+    assert Reassembler().add(compressed_fragments[0]) == compressed
+
+    random_text = random.Random(0).randbytes(6000).hex()
+    envelope = new_envelope(
+        "assistant.completed",
+        "event",
+        "agent",
+        id=str(uuid.uuid4()),
+        epoch="live",
+        data={"content": random_text},
     )
     fragments = fragment_envelope(envelope, max_tag_bytes=700)
     assert 1 < len(fragments) <= 64
@@ -109,6 +126,17 @@ def test_checked_fragment_round_trip_and_conflict_rejection() -> None:
     conflicting["b64"] += "A"
     with pytest.raises(ProtocolError, match="conflicting"):
         reassembler.add(json.dumps(conflicting, separators=(",", ":")))
+
+
+def test_compressed_fragments_reject_oversized_output() -> None:
+    envelope = new_envelope(
+        "assistant.completed", "event", "agent", data={"content": "compress me" * 1000}
+    )
+    fragment = json.loads(fragment_envelope(envelope, max_tag_bytes=700)[0])
+    fragment["bytes"] = 1
+    fragment["b64"] = base64.urlsafe_b64encode(zlib.compress(b"too large")).decode().rstrip("=")
+    with pytest.raises(ProtocolError, match="compressed fragment size"):
+        Reassembler().add(json.dumps(fragment, separators=(",", ":")))
 
 
 def test_fragmentation_uses_escaped_irc_tag_size() -> None:

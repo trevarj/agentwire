@@ -44,8 +44,9 @@ from agentwire.text import clean_block, safe_one_line, truncate_utf8
 
 _MAX_TOOL_PAYLOAD_BYTES = 32 * 1024
 _RECENT_OUTPUTS = 3
-# Transcript follow cadence: responsive on a phone timeline without spinning.
-_FOLLOW_POLL_SECONDS = 0.5
+# Transcript follow cadence: one cheap stat per observed session keeps phone
+# timelines responsive without busy-waiting.
+_FOLLOW_POLL_SECONDS = 0.25
 # An open turn whose transcript has been silent this long at attach time is
 # treated as abandoned rather than busy, so the channel does not jam forever.
 _FOLLOW_STALE_SECONDS = 300.0

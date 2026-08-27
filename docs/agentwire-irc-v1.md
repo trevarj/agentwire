@@ -81,12 +81,17 @@ Agentwire queries `TOPIC` for every configured channel after joining and treats 
 complete only once each has answered `331` or `332`. A server sends `RPL_TOPIC` unsolicited only
 when a topic is set, so a channel with no topic is otherwise indistinguishable from one whose
 topic has not arrived: both are silence, and the harness would wait for a line that is never
-coming.
+coming. Topic activation itself publishes no bootstrap events; clients issue `sync.request` once
+active and receive one correlated hello and snapshot pair.
 
 Deployments target Ergo 2.19.0 or newer. They SHOULD use persistent SQLite history, retain the
 channel for 30 days, and allow the client-only tag `+trevarj.github.io/agentwire` on `TAGMSG` in
-the server history configuration. An IRC network that strips client tags or account tags is not
-an Agentwire transport.
+the server history configuration. Agentwire pages and fragmented payloads legitimately exceed
+Ergo's default five-command burst, so the bot connection MUST be exempt from fakelag or use an
+equivalent high-burst profile. A shared server SHOULD define a dedicated oper class containing
+only `nofakelag`; granting general operator capabilities to the bot is forbidden. An IRC network
+that strips client tags or account tags is not an Agentwire transport. The bridge verifies that
+`echo-message` is offered for clients but does not enable it on its own connection.
 
 ## Wire representation
 
@@ -132,18 +137,21 @@ arrival order, reconciling from snapshots.
 ## Fragmentation
 
 If the encoded tag name, separator, and escaped value fit IRCv3's 4094-byte tag-section limit,
-the envelope is sent directly. Larger values are UTF-8 encoded, base64url encoded without
-padding, and split into checked fragments:
+the envelope is sent directly. Larger values are UTF-8 encoded and tested with zlib level-1
+compression. Compression is used only when it reduces the number of IRC commands. The selected
+bytes are base64url encoded without padding and split into checked fragments:
 
 ```json
-{"v":1,"k":"fragment","id":"...","of":"assistant.completed","t":"event","epoch":"...","sid":"...","part":0,"parts":3,"bytes":9000,"sha256":"...","b64":"..."}
+{"v":1,"k":"fragment","id":"...","of":"assistant.completed","t":"event","epoch":"...","sid":"...","part":0,"parts":2,"bytes":9000,"sha256":"...","encoding":"zlib","b64":"..."}
 ```
 
 The first fragment follows the original message visibility rule. Remaining fragments are
-`TAGMSG`. A receiver MUST verify uniform metadata, the reconstructed byte count, SHA-256, UTF-8,
-and the decoded envelope ID. Limits are 128 KiB reconstructed data, 64 fragments, 16 concurrent
-messages, 2 MiB aggregate declared bytes, and 30 seconds from first fragment. Conflicting
-duplicates invalidate the message. Exact duplicate fragments are harmless.
+`TAGMSG`. Compression can produce one fragment even though the original envelope did not fit
+directly. A receiver MUST bound decompression by the declared reconstructed size, then verify
+uniform metadata, byte count, SHA-256, UTF-8, and decoded envelope ID. Limits are 128 KiB
+reconstructed data, 64 fragments, 16 concurrent messages, 2 MiB aggregate declared bytes, and
+30 seconds from first fragment. Conflicting duplicates invalidate the message. Exact duplicate
+fragments are harmless.
 
 ## Liveness, acknowledgements, and replay
 
@@ -152,11 +160,12 @@ duplicates invalidate the message. Exact duplicate fragments are harmless.
 it also rejects `hist:true` actions and playback-tagged messages. Reconnecting clients begin with
 `sync.request`, learn the new epoch, then issue new actions.
 
-Agentwire emits `action.accepted` before invoking a backend and exactly one of
+Mutating actions emit `action.accepted` before invoking a backend and exactly one of
 `action.succeeded`, `action.failed`, or `action.uncertain` afterward. Each carries the action UUID
-in `reply`. Clients MUST NOT automatically retry merely because an acknowledgement is missing.
-Actions are deduplicated durably by UUID; a duplicate produces the known status without invoking
-the backend again.
+in `reply`, and mutations are deduplicated durably by UUID. Read actions (`sync.request`, workspace
+and session listing, and history) are safe to repeat and return only their reply-correlated data;
+`history.end` terminates a history response. Any action can still return `action.failed`. Clients
+MUST NOT automatically retry a mutation merely because an acknowledgement is missing.
 
 `history.request` targets the currently attached session using the envelope `sid`; older clients
 that omit it target the current binding. A supplied `sid` that differs from the binding is rejected.
@@ -167,8 +176,11 @@ messages. It replays only transcript and request lifecycle events: user prompt, 
 plan, tool, usage, request, and approval-review events.
 Sync snapshots, discovery pages, action acknowledgements, queue events, and binding/status events are
 live state and MUST NOT appear in history pages. A page is bounded by 200 events, 512 KiB, and 30 days
-and is enclosed by `history.begin` and `history.end`. Replayed events
-carry `hist:true`, the requested `sid`, and the request UUID in `reply`. `data.cursor` and
+and is enclosed by `history.begin` and `history.end`. To avoid one IRC command per small event,
+`history.chunk.data.events` carries arrays of complete event envelopes; chunks are capped below
+the common payload limit and use normal checked compression and fragmentation. Agent hello
+advertises `compressedFragments` and `historyChunks` capabilities. Replayed nested events carry
+`hist:true`, the requested `sid`, and the request UUID in `reply`. `data.cursor` and
 `data.next` are opaque backend cursors. IRC message edits affect only readable transcript text; harness state and
 Agentwire journal records are immutable.
 
@@ -251,7 +263,7 @@ discovery metadata only and does not change the strings accepted by `settings.up
 Bootstrap and state:
 
 - `agent.hello`, `channel.snapshot`, `binding.changed`, `session.snapshot`, `session.status`
-- `workspace.page`, `session.page`, `history.begin`, `history.end`
+- `workspace.page`, `session.page`, `history.begin`, `history.chunk`, `history.end`
 - `action.accepted`, `action.succeeded`, `action.failed`, `action.uncertain`
 
 Harness activity:
@@ -281,8 +293,8 @@ Such an event feeds a client-side session status registry only: it MUST NOT alte
 session's timeline, busy state, settings, or binding. Its data fields are `busy` and `flags`,
 plus `cwd` and `tuiAttached` when the backend knows them; other members are absent rather than
 null. `session.status` for the bound sid keeps its existing meaning and MAY also update the
-registry entry for that sid. Agentwire coalesces these events per sid to at most one update
-every 2 seconds, suppressing unchanged payloads and always delivering the newest state once the
+registry entry for that sid. Agentwire coalesces these events per sid to at most two updates per
+second, suppressing unchanged payloads and always delivering the newest state once the
 window closes, so a client MUST treat the registry as an eventually consistent hint rather than
 a turn-accurate signal. Clients that predate this rule
 ignore an unknown-sid status event, which is why the extension is additive within v1.
@@ -292,7 +304,7 @@ session is running. Its `data.agents` is the full current list and replaces the 
 one rather than merging into it, so an empty list means no agents are tracked. Each entry carries
 `id`, `type`, `description` (200 bytes), `status` (`queued`, `running`, `completed`, or `failed`),
 and `isBackground`, plus numeric `toolUses`, `durationMs`, and `tokens` when a finished agent
-reported them. Agentwire coalesces the event to at most one emission per second per channel,
+reported them. Agentwire coalesces the event to at most two emissions per second per channel,
 suppressing an unchanged list and delivering the newest one once the window closes, and clients
 MUST clear the list on `binding.changed` because it describes the bound session only. For the pi
 backend this is limited to live TUI sessions, since a bridge-spawned RPC session cannot receive
@@ -362,6 +374,7 @@ shipped example config, then set the equivalent of:
   200;
 - `TAGMSG` history enabled and `+trevarj.github.io/agentwire` included in its storage whitelist;
 - multiline limits of at least 4096 bytes and enough lines for readable previews;
+- fakelag disabled for the private server, or a bot oper class containing only `nofakelag`;
 - private, registered channels and account-only access.
 
 Activate a test channel only after the bot and reference client interoperate. Set production

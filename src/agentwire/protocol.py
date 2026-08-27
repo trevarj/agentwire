@@ -6,6 +6,7 @@ import json
 import time
 import urllib.parse
 import uuid
+import zlib
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -56,6 +57,7 @@ EVENT_KINDS = frozenset(
         "workspace.page",
         "session.page",
         "history.begin",
+        "history.chunk",
         "history.end",
         "action.accepted",
         "action.succeeded",
@@ -347,17 +349,25 @@ def fragment_envelope(envelope: Envelope, max_tag_bytes: int = MAX_TAG_VALUE_BYT
     if tag_wire_size(encoded) <= max_tag_bytes:
         return [encoded]
     raw = encoded.encode("utf-8")
-    digest = hashlib.sha256(raw).hexdigest()
-    encoded_payload = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-    # Reserve enough room for metadata and varying integer widths.
+    # Reserve enough room for metadata, compression marker, and varying integer widths.
     chunk_size = max_tag_bytes - 360
     if chunk_size <= 0:
         raise ProtocolError("fragment tag budget is too small")
+    payload = raw
+    encoding: str | None = None
+    compressed = zlib.compress(raw, level=1)
+    raw_parts = _fragment_count(raw, chunk_size)
+    compressed_parts = _fragment_count(compressed, chunk_size)
+    if compressed_parts < raw_parts:
+        payload = compressed
+        encoding = "zlib"
+    encoded_payload = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
     chunks = [
         encoded_payload[i : i + chunk_size] for i in range(0, len(encoded_payload), chunk_size)
     ]
     if len(chunks) > MAX_FRAGMENTS:
         raise ProtocolError(f"payload requires more than {MAX_FRAGMENTS} fragments")
+    digest = hashlib.sha256(raw).hexdigest()
     result: list[str] = []
     for part, chunk in enumerate(chunks):
         fragment = {
@@ -372,6 +382,7 @@ def fragment_envelope(envelope: Envelope, max_tag_bytes: int = MAX_TAG_VALUE_BYT
             "parts": len(chunks),
             "bytes": len(raw),
             "sha256": digest,
+            "encoding": encoding,
             "b64": chunk,
         }
         value = json.dumps(
@@ -385,6 +396,11 @@ def fragment_envelope(envelope: Envelope, max_tag_bytes: int = MAX_TAG_VALUE_BYT
     return result
 
 
+def _fragment_count(payload: bytes, chunk_size: int) -> int:
+    encoded_size = len(base64.urlsafe_b64encode(payload).rstrip(b"="))
+    return max(1, (encoded_size + chunk_size - 1) // chunk_size)
+
+
 @dataclass(slots=True)
 class _PartialMessage:
     created: float
@@ -395,6 +411,7 @@ class _PartialMessage:
     message_type: str
     epoch: str | None
     session_id: str | None
+    encoding: str | None
     chunks: dict[int, str] = field(default_factory=dict)
 
 
@@ -422,8 +439,11 @@ class Reassembler:
         message_type = _required_string(raw, "t")
         epoch = _optional_string(raw, "epoch")
         session_id = _optional_string(raw, "sid")
+        encoding = _optional_string(raw, "encoding")
+        if encoding not in {None, "zlib"}:
+            raise ProtocolError("unsupported fragment encoding")
         chunk = _required_string(raw, "b64")
-        if not isinstance(parts, int) or not 2 <= parts <= MAX_FRAGMENTS:
+        if not isinstance(parts, int) or not 1 <= parts <= MAX_FRAGMENTS:
             raise ProtocolError("invalid fragment count")
         if not isinstance(part, int) or not 0 <= part < parts:
             raise ProtocolError("invalid fragment index")
@@ -436,7 +456,7 @@ class Reassembler:
             if sum(item.size for item in self._messages.values()) + size > MAX_INFLIGHT_BYTES:
                 raise ProtocolError("fragment memory budget exceeded")
             existing = _PartialMessage(
-                current, parts, size, digest, kind, message_type, epoch, session_id
+                current, parts, size, digest, kind, message_type, epoch, session_id, encoding
             )
             self._messages[message_id] = existing
         elif (
@@ -447,7 +467,8 @@ class Reassembler:
             existing.message_type,
             existing.epoch,
             existing.session_id,
-        ) != (parts, size, digest, kind, message_type, epoch, session_id):
+            existing.encoding,
+        ) != (parts, size, digest, kind, message_type, epoch, session_id, encoding):
             self._messages.pop(message_id, None)
             raise ProtocolError("inconsistent fragment metadata")
         previous = existing.chunks.get(part)
@@ -460,11 +481,26 @@ class Reassembler:
         joined = "".join(existing.chunks[index] for index in range(parts))
         padding = "=" * (-len(joined) % 4)
         try:
-            payload = base64.urlsafe_b64decode(joined + padding)
+            packed = base64.urlsafe_b64decode(joined + padding)
         except ValueError as exc:
             self._messages.pop(message_id, None)
             raise ProtocolError("invalid base64url fragment data") from exc
         self._messages.pop(message_id, None)
+        if encoding == "zlib":
+            try:
+                decompressor = zlib.decompressobj()
+                payload = decompressor.decompress(packed, size + 1)
+            except zlib.error as exc:
+                raise ProtocolError("invalid compressed fragment data") from exc
+            if (
+                len(payload) > size
+                or not decompressor.eof
+                or decompressor.unconsumed_tail
+                or decompressor.unused_data
+            ):
+                raise ProtocolError("invalid compressed fragment size or stream")
+        else:
+            payload = packed
         if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
             raise ProtocolError("fragment checksum or byte count mismatch")
         try:

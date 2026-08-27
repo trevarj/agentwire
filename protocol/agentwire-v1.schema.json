@@ -25,7 +25,7 @@
             "queue.edit", "queue.move", "queue.delete", "queue.clear",
             "request.respond", "request.skip", "agent.hello", "channel.snapshot",
             "binding.changed", "session.snapshot", "session.status", "workspace.page",
-            "session.page", "history.begin", "history.end", "action.accepted",
+            "session.page", "history.begin", "history.chunk", "history.end", "action.accepted",
             "action.succeeded", "action.failed", "action.uncertain", "queue.snapshot",
             "queue.item.added", "queue.item.updated", "queue.item.moved",
             "queue.item.removed", "user.prompt", "turn.started", "turn.completed", "turn.failed",
@@ -70,9 +70,10 @@
         "epoch": { "type": "string", "minLength": 1 },
         "sid": { "type": "string", "minLength": 1 },
         "part": { "type": "integer", "minimum": 0, "maximum": 63 },
-        "parts": { "type": "integer", "minimum": 2, "maximum": 64 },
+        "parts": { "type": "integer", "minimum": 1, "maximum": 64 },
         "bytes": { "type": "integer", "minimum": 1, "maximum": 131072 },
         "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "encoding": { "enum": ["zlib"] },
         "b64": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$" }
       },
       "additionalProperties": false

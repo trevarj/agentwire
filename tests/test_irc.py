@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from pathlib import Path
 from types import MappingProxyType
 
 import pytest
 
 from agentwire.config import IRCConfig
-from agentwire.irc import IRCClient, parse_irc_line
+from agentwire.irc import IRCClient, IRCError, parse_irc_line
 from agentwire.protocol import PROTOCOL_TAG, new_envelope
 
 
@@ -45,15 +46,18 @@ async def test_protocol_preview_tags_multiline_batch_opening_only(tmp_path: Path
     client = make_client(tmp_path)
     client._caps = {"batch", "draft/multiline"}
     lines: list[str] = []
+    completed = asyncio.Event()
 
     async def capture(line: str) -> None:
         lines.append(line)
+        if line.startswith("BATCH -"):
+            completed.set()
 
     client._write_line = capture  # type: ignore[method-assign]
     envelope = new_envelope("assistant.completed", "event", "agent", data={"content": "body"})
     await client.send_protocol("#c", envelope, "first\nsecond")
     task = asyncio.create_task(client._write_messages())
-    await asyncio.sleep(0.35)
+    await asyncio.wait_for(completed.wait(), 0.1)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -65,7 +69,8 @@ async def test_protocol_preview_tags_multiline_batch_opening_only(tmp_path: Path
 @pytest.mark.asyncio
 async def test_fragment_tail_uses_tagmsg(tmp_path: Path) -> None:
     client = make_client(tmp_path)
-    envelope = new_envelope("assistant.completed", "event", "agent", data={"content": "x" * 10000})
+    content = random.Random(0).randbytes(10000).hex()
+    envelope = new_envelope("assistant.completed", "event", "agent", data={"content": content})
     await client.send_protocol("#c", envelope, "preview")
     messages = []
     while not client._outgoing.empty():
@@ -91,6 +96,43 @@ async def test_notice_is_sent_as_a_notice(tmp_path: Path) -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert lines == ["NOTICE #c :agentwire suspended: reason"]
+
+
+@pytest.mark.asyncio
+async def test_writer_failure_interrupts_reader_and_reconnects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = make_client(tmp_path)
+    reader = asyncio.StreamReader()
+
+    class Writer:
+        def is_closing(self) -> bool:
+            return False
+
+        def write(self, _data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+    async def open_connection(
+        *_args: object, **_kwargs: object
+    ) -> tuple[asyncio.StreamReader, Writer]:
+        return reader, Writer()
+
+    async def negotiate(_reader: asyncio.StreamReader) -> None:
+        return None
+
+    async def fail_writer() -> None:
+        raise IRCError("writer failed")
+
+    monkeypatch.setattr("agentwire.irc.ssl.create_default_context", lambda **_kwargs: object())
+    monkeypatch.setattr("agentwire.irc.asyncio.open_connection", open_connection)
+    client._negotiate = negotiate  # type: ignore[method-assign]
+    client._write_messages = fail_writer  # type: ignore[method-assign]
+
+    with pytest.raises(IRCError, match="writer failed"):
+        await asyncio.wait_for(client._connect_once(), 0.5)
 
 
 CAPABILITIES = (
@@ -168,6 +210,9 @@ async def test_every_channel_topic_reaches_the_bridge(tmp_path: Path) -> None:
     )
 
     await client._negotiate(reader)
+
+    cap_request = next(line for line in written if line.startswith("CAP REQ"))
+    assert "echo-message" not in cap_request
 
     # The account the server granted, not the configured nickname, is what
     # activation validates a topic's agent against.

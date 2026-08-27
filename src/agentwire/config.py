@@ -125,7 +125,7 @@ class Config:
     bridge: BridgeConfig
     secrets: SecretsConfig
     irc: IRCConfig
-    codex: CodexConfig
+    codex: CodexConfig | None
     opencode: OpenCodeConfig | None
     stack: StackConfig
     # Trails the required sections so existing positional construction keeps
@@ -178,7 +178,7 @@ def load_config(path: str | Path) -> Config:
             raise ConfigError(f"unsupported backend {backend!r} for {channel}")
         channels[channel.lower()] = backend
 
-    codex = _table(raw, "codex")
+    codex = _table(raw, "codex") if "codex" in channels.values() else None
     opencode = _table(raw, "opencode") if "opencode" in channels.values() else None
     claude = _table(raw, "claude") if "claude" in channels.values() else None
     pi = _table(raw, "pi") if "pi" in channels.values() else None
@@ -212,9 +212,13 @@ def load_config(path: str | Path) -> Config:
             password_env=_required_str(irc, "password_env", "irc"),
             channels=MappingProxyType(channels),
         ),
-        codex=CodexConfig(
-            socket_path=_path(_required_str(codex, "socket_path", "codex")),
-            binary=_required_str(codex, "binary", "codex"),
+        codex=(
+            CodexConfig(
+                socket_path=_path(_required_str(codex, "socket_path", "codex")),
+                binary=_required_str(codex, "binary", "codex"),
+            )
+            if codex is not None
+            else None
         ),
         opencode=(
             OpenCodeConfig(

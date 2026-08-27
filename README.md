@@ -32,8 +32,8 @@ deduplication, event history, and prompt queues.
 On first use of an old JSON state path, Agentwire imports its bindings and preserves the original
 as a mode-0600 `.legacy-json` backup.
 
-The foreground stack starts the SSH tunnel, Codex app-server, and bridge. It starts OpenCode only
-when an OpenCode-backed channel is configured. Claude needs no server here: when a Claude-backed
+The foreground stack starts the SSH tunnel and bridge. It starts Codex and OpenCode servers only
+when channels use those backends. Claude needs no server here: when a Claude-backed
 channel is configured, the bridge starts one `claude` CLI subprocess per session through the
 Claude Agent SDK and stops it with the session. Because there is no shared Claude server, live
 session discovery only sees sessions this bridge is running; `agentwire doctor` verifies the
@@ -49,11 +49,13 @@ the terminal; only bridge-spawned sessions relay dialogs as Agentwire questions 
 nix run .#stack
 ```
 
-The bridge requires TLS, SASL, account tags, message tags, server time, batches, echo messages,
-labeled responses, standard replies, multiline messages, chat history, and event playback. It
-will not connect with a reduced protocol. Configure Ergo 2.19.0 or newer with persistent SQLite
-history, a 30-day channel retention period, and stored `TAGMSG` values for
-`+trevarj.github.io/agentwire`.
+The bridge requires TLS, SASL, account tags, message tags, server time, batches, echo-message
+support, labeled responses, standard replies, multiline messages, chat history, and event playback.
+It does not enable echo-message on its own connection because receiving its published traffic would
+only duplicate work. Configure Ergo 2.19.0 or newer with persistent SQLite history, a 30-day channel
+retention period, stored `TAGMSG` values for `+trevarj.github.io/agentwire`, and no fakelag for the
+Agentwire bot. On a shared server, use a dedicated oper class whose only capability is `nofakelag`;
+never grant the bot general operator privileges.
 
 Set a channel topic to activate the harness only after testing:
 

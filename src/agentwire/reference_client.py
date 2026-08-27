@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, TextIO
 
 from agentwire.protocol import (
+    HISTORY_EVENT_KINDS,
     PROTOCOL_TAG,
     Envelope,
     ProtocolError,
@@ -57,6 +58,20 @@ class HarnessState:
             self.busy = bool(event.data.get("busy"))
             self.settings = dict(event.data.get("settings") or {})
             self.queue = list(event.data.get("queue") or [])
+        elif event.kind == "history.chunk":
+            for raw in event.data.get("events") or ():
+                if not isinstance(raw, dict):
+                    raise ProtocolError("history chunk events must be objects")
+                historic = Envelope.from_dict(raw)
+                if (
+                    historic.message_type != "event"
+                    or historic.kind not in HISTORY_EVENT_KINDS
+                    or not historic.history
+                    or historic.session_id != event.session_id
+                    or historic.reply != event.reply
+                ):
+                    raise ProtocolError("history chunk event metadata does not match its page")
+                self.apply(historic)
         elif event.kind == "binding.changed":
             session = event.data.get("session")
             self.session_id = (

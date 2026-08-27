@@ -26,8 +26,9 @@ from agentwire.text import clean_block, safe_one_line, truncate_utf8
 _MAX_TOOL_PAYLOAD_BYTES = 32 * 1024
 _MAX_LINE_BYTES = 8 * 1024 * 1024
 _COMMAND_TIMEOUT = 30.0
-# Socket discovery cadence: a new TUI shows up within a phone tap's patience.
-_DISCOVER_SECONDS = 2.0
+# Socket discovery cadence: directory scan is tiny, and a new TUI should appear
+# before a second phone tap.
+_DISCOVER_SECONDS = 0.5
 _SESSION_LIST_LIMIT = 20
 # pi-tui-kit renders questionnaire titles as "<header>: <prompt>" and appends a
 # synthetic free-form row to every select; both are undone for the clients.

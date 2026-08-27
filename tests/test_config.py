@@ -154,6 +154,7 @@ def test_pi_channel_requires_pi_table_and_loads_defaults(tmp_path: Path) -> None
     with config_path.open("a", encoding="utf-8") as handle:
         handle.write('\n[pi]\nbinary = "pi"\n')
     config = load_config(config_path)
+    assert config.codex is None
     assert config.pi is not None
     assert config.pi.binary == "pi"
     assert config.pi.socket_dir.name == "pi"

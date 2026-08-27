@@ -3,7 +3,9 @@ from __future__ import annotations
 import io
 import json
 
-from agentwire.protocol import fragment_envelope, new_envelope
+import pytest
+
+from agentwire.protocol import ProtocolError, fragment_envelope, new_envelope
 from agentwire.reference_client import ProtocolClient, run_jsonl
 
 
@@ -52,6 +54,42 @@ def test_reference_client_replaces_timeline_context_on_binding_change() -> None:
         )
     )
     assert client.state.assistant == [{"iid": "i1", "content": "new"}]
+
+
+def test_reference_client_applies_packed_history_events() -> None:
+    client = ProtocolClient(device="phone", instance="client")
+    historic = new_envelope(
+        "assistant.completed",
+        "event",
+        "agent",
+        session_id="s1",
+        item_id="i1",
+        reply="request-1",
+        history=True,
+        data={"content": "restored"},
+    )
+    client.state.apply(
+        new_envelope(
+            "history.chunk",
+            "event",
+            "agent",
+            session_id="s1",
+            reply="request-1",
+            data={"page": "p1", "index": 0, "events": [historic.to_dict()]},
+        )
+    )
+    assert client.state.assistant == [{"iid": "i1", "content": "restored"}]
+
+    invalid = new_envelope(
+        "history.chunk",
+        "event",
+        "agent",
+        session_id="other",
+        reply="request-1",
+        data={"events": [historic.to_dict()]},
+    )
+    with pytest.raises(ProtocolError, match="metadata does not match"):
+        client.state.apply(invalid)
 
 
 def test_jsonl_cli_emits_action_wire_messages() -> None:

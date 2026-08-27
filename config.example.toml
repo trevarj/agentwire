@@ -21,6 +21,7 @@ password_env = "AGENTWIRE_IRC_PASSWORD"
 # Each channel names the backend that owns it: codex, opencode, claude, or pi.
 channels = { "#codex" = "codex" }
 
+# Only read when a channel above is bound to the "codex" backend.
 [codex]
 socket_path = "$XDG_RUNTIME_DIR/agentwire/codex.sock"
 binary = "codex"

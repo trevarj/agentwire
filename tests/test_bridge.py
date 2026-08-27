@@ -32,7 +32,7 @@ from agentwire.models import (
     SessionOutput,
     SessionSummary,
 )
-from agentwire.protocol import PROTOCOL_TAG, ProtocolError, encode_envelope, new_envelope
+from agentwire.protocol import PROTOCOL_TAG, Envelope, ProtocolError, encode_envelope, new_envelope
 
 
 class FakeIRC:
@@ -171,14 +171,46 @@ def make_bridge(
 
 
 @pytest.mark.asyncio
-async def test_topic_activates_harness_and_emits_bootstrap(tmp_path: Path) -> None:
+async def test_action_workers_preserve_channel_independence(tmp_path: Path) -> None:
+    bridge, _irc, _backend = make_bridge(tmp_path, channels={"#first": "codex", "#second": "codex"})
+    for channel in bridge.channels:
+        await bridge._handle_topic(channel, "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_done = asyncio.Event()
+
+    async def dispatch(channel: str, _action: Envelope) -> None:
+        if channel == "#first":
+            first_started.set()
+            await release_first.wait()
+        else:
+            second_done.set()
+
+    bridge._dispatch_action = dispatch  # type: ignore[method-assign]
+    workers = [asyncio.create_task(bridge._action_loop(channel)) for channel in bridge.channels]
+    try:
+        now = asyncio.get_running_loop().time()
+        action = new_envelope("sync.request", "action", "client", device="phone")
+        await bridge._action_queues["#first"].put((action, now))
+        await first_started.wait()
+        await bridge._action_queues["#second"].put((action, now))
+        await asyncio.wait_for(second_done.wait(), 0.5)
+        assert not release_first.is_set()
+    finally:
+        release_first.set()
+        for worker in workers:
+            worker.cancel()
+        await asyncio.gather(*workers, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_topic_activates_harness_and_waits_for_client_sync(tmp_path: Path) -> None:
     bridge, irc, _backend = make_bridge(tmp_path)
     await bridge._handle_topic(
         "#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex | Workspace"
     )
     assert bridge.channels["#codex"].activation is not None
-    assert [item[1].kind for item in irc.sent] == ["agent.hello", "channel.snapshot"]
-    assert irc.sent[0][1].data["settingOptions"]["model"][0]["value"] == "gpt-test"
+    assert irc.sent == []
     await bridge._handle_topic("#codex", "ordinary channel")
     assert bridge.channels["#codex"].activation is None
     # Clients trust events only from the topic agent, so a topic naming another
@@ -351,10 +383,10 @@ async def test_single_account_bridge_never_consumes_its_own_events(tmp_path: Pat
     bridge, irc, backend = make_bridge(tmp_path, owner="bridge")
     await bridge._handle_topic("#codex", "agentwire:v1;account=bridge;agent=bridge;backend=codex")
     assert bridge.channels["#codex"].activation is not None
-    own_event = encode_envelope(irc.sent[0][1])
-    irc.sent.clear()
+    own_event = encode_envelope(new_envelope("agent.hello", "event", "bridge", epoch=bridge.epoch))
 
     loop_task = asyncio.create_task(bridge._irc_loop())
+    action_task = asyncio.create_task(bridge._action_loop("#codex"))
     try:
         # Its own published hello, echoed back with its own account tag, must
         # never be treated as a command.
@@ -381,17 +413,19 @@ async def test_single_account_bridge_never_consumes_its_own_events(tmp_path: Pat
             )
         )
         for _ in range(200):
-            if any(item[1].kind == "action.succeeded" for item in irc.sent):
+            if any(item[1].kind == "channel.snapshot" for item in irc.sent):
                 break
             await asyncio.sleep(0.005)
     finally:
         loop_task.cancel()
+        action_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await loop_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await action_task
     kinds = [item[1].kind for item in irc.sent]
-    # Exactly one acknowledged action: the echoed event produced no
-    # acknowledgement, no failure, and no backend work.
-    assert kinds.count("action.accepted") == 1
+    # Echoed event produced no response; read-only sync emits only its data.
+    assert "action.accepted" not in kinds and "action.succeeded" not in kinds
     assert "action.failed" not in kinds and "action.uncertain" not in kinds
     assert "agent.hello" in kinds
     assert backend.sent == []
@@ -568,11 +602,13 @@ async def test_history_is_scoped_to_binding_and_echoes_backend_cursor(tmp_path: 
 
     backend.list_history.assert_awaited_once_with("s1", "current", 20)
     begin = next(item[1] for item in irc.sent if item[1].kind == "history.begin")
-    prompt = next(item[1] for item in irc.sent if item[1].kind == "user.prompt")
+    chunk = next(item[1] for item in irc.sent if item[1].kind == "history.chunk")
+    prompt = Envelope.from_dict(chunk.data["events"][0])
     end = next(item[1] for item in irc.sent if item[1].kind == "history.end")
-    assert begin.session_id == end.session_id == prompt.session_id == "s1"
-    assert begin.reply == end.reply == prompt.reply == action.id
+    assert begin.session_id == end.session_id == chunk.session_id == prompt.session_id == "s1"
+    assert begin.reply == end.reply == chunk.reply == prompt.reply == action.id
     assert begin.data["next"] == end.data["next"] == "older"
+    assert begin.data["chunks"] == end.data["chunks"] == 1
     assert prompt.history is True
     assert prompt.data == {"content": "hello"}
 
@@ -588,6 +624,46 @@ async def test_history_is_scoped_to_binding_and_echoes_backend_cursor(tmp_path: 
     await bridge._handle_action("#codex", bad)
     failed = next(item[1] for item in irc.sent if item[1].kind == "action.failed")
     assert "no longer attached" in failed.data["message"]
+
+
+@pytest.mark.asyncio
+async def test_history_events_are_packed_into_chunks(tmp_path: Path) -> None:
+    bridge, irc, backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    bridge.channels["#codex"].binding = ChannelBinding("codex", "s1", str(tmp_path))
+    backend.list_history = AsyncMock(  # type: ignore[method-assign]
+        return_value=HistoryPage(
+            tuple(
+                BackendEvent(
+                    "assistant",
+                    "codex",
+                    session_id="s1",
+                    turn_id="t1",
+                    item_id=f"i{index}",
+                    text=f"reply {index}",
+                )
+                for index in range(100)
+            ),
+            None,
+        )
+    )
+
+    action = new_envelope(
+        "history.request",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        session_id="s1",
+    )
+    await bridge._handle_action("#codex", action)
+
+    assert [event.kind for _channel, event, _preview in irc.sent] == [
+        "history.begin",
+        "history.chunk",
+        "history.end",
+    ]
+    assert len(irc.sent[1][1].data["events"]) == 100
 
 
 @pytest.mark.asyncio
@@ -758,13 +834,8 @@ async def test_sync_returns_correlated_hello_and_snapshot(tmp_path: Path) -> Non
     action = new_envelope("sync.request", "action", "client", device="phone")
     await bridge._handle_action("#codex", action)
     correlated = [item for item in irc.sent if item[1].reply == action.id]
-    assert [item[1].kind for item in correlated] == [
-        "action.accepted",
-        "agent.hello",
-        "channel.snapshot",
-        "action.succeeded",
-    ]
-    assert correlated[1][1].epoch == bridge.epoch
+    assert [item[1].kind for item in correlated] == ["agent.hello", "channel.snapshot"]
+    assert correlated[0][1].epoch == bridge.epoch
 
 
 @pytest.mark.asyncio
@@ -858,6 +929,33 @@ async def test_busy_prompt_queues_and_completion_drains_it(tmp_path: Path) -> No
         "#codex", BackendEvent("turn_done", "codex", session_id="s1", turn_id="old")
     )
     assert backend.sent == [("s1", "later")]
+
+
+@pytest.mark.asyncio
+async def test_queue_move_emits_one_snapshot(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    bridge.channels["#codex"].binding = ChannelBinding("codex", "s1", str(tmp_path))
+    await bridge.state.enqueue("one", "#codex", "s1", "first", 2)
+    await bridge.state.enqueue("two", "#codex", "s1", "second", 2)
+    irc.sent.clear()
+
+    action = new_envelope(
+        "queue.move",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        session_id="s1",
+        item_id="two",
+        data={"position": 0},
+    )
+    await bridge._handle_action("#codex", action)
+
+    snapshots = [event for _channel, event, _preview in irc.sent if event.kind == "queue.snapshot"]
+    assert len(snapshots) == 1
+    assert [item["iid"] for item in snapshots[0].data["items"]] == ["two", "one"]
+    assert not any(event.kind == "queue.item.moved" for _channel, event, _preview in irc.sent)
 
 
 @pytest.mark.asyncio

@@ -24,6 +24,7 @@ from agentwire.protocol import (
     TopicActivation,
     build_topic,
     decode_envelope,
+    encode_envelope,
     new_envelope,
     parse_topic,
     suggested_topic,
@@ -35,10 +36,18 @@ from agentwire.text import clean_block, clean_text, safe_one_line, truncate_utf8
 MAX_CONTENT_BYTES = 64 * 1024
 MAX_PREVIEW_BYTES = 4 * 1024
 MAX_REASON_BYTES = 200
+# Packing history avoids one IRC command per tiny event while leaving room for
+# outer envelope metadata beneath protocol's 128 KiB payload ceiling.
+HISTORY_CHUNK_BYTES = 96 * 1024
 # Shortest gap between two `session.status` events for the same unbound session.
-OBSERVED_STATUS_SECONDS = 2.0
+OBSERVED_STATUS_SECONDS = 0.5
 # A fleet of agents can churn faster than a phone can usefully render.
-SUBAGENT_UPDATE_SECONDS = 1.0
+SUBAGENT_UPDATE_SECONDS = 0.5
+# Read actions return reply-tagged data and are safe to repeat, so lifecycle
+# acknowledgements would only add two IRC commands to every page request.
+READ_ACTION_KINDS = frozenset(
+    {"sync.request", "workspace.list.request", "session.list.request", "history.request"}
+)
 # Diagnostics name channels, accounts, kinds, and reasons. They never carry
 # prompt text, tool output, tag values, or credentials.
 LOGGER = logging.getLogger("agentwire.bridge")
@@ -107,6 +116,9 @@ class Bridge:
         self.instance = str(uuid.uuid4())
         self.epoch = secrets.token_urlsafe(24)
         self._reassemblers = {channel: Reassembler() for channel in self.channels}
+        self._action_queues: dict[str, asyncio.Queue[tuple[Envelope, float]]] = {
+            channel: asyncio.Queue() for channel in self.channels
+        }
         self._tasks: list[asyncio.Task[None]] = []
         self._closed = False
         # Configured channels whose topic reply has been evaluated at least once, and whether
@@ -130,6 +142,12 @@ class Bridge:
             await self._restore_bindings()
             self._tasks = [
                 asyncio.create_task(self._irc_loop(), name="bridge-irc"),
+                *(
+                    asyncio.create_task(
+                        self._action_loop(channel), name=f"bridge-{channel}-actions"
+                    )
+                    for channel in self.channels
+                ),
                 *(
                     asyncio.create_task(self._backend_loop(backend), name=f"bridge-{name}-events")
                     for name, backend in self.backends.items()
@@ -220,7 +238,7 @@ class Bridge:
                     continue
                 envelope = self._reassemblers[message.channel].add(value)
                 if envelope is not None:
-                    await self._handle_action(message.channel, envelope)
+                    await self._action_queues[message.channel].put((envelope, time.monotonic()))
                 else:
                     LOGGER.debug(
                         "%s: holding a fragment until its message is complete", message.channel
@@ -229,6 +247,30 @@ class Bridge:
                 await self._emit_failure(message.channel, None, str(exc))
             except Exception:
                 await self._emit_failure(message.channel, None, "unexpected bridge failure")
+
+    async def _action_loop(self, channel: str) -> None:
+        queue = self._action_queues[channel]
+        while True:
+            action, queued_at = await queue.get()
+            try:
+                if self.channels[channel].activation is None:
+                    LOGGER.info("%s: dropped queued action %s after suspension", channel, action.id)
+                    continue
+                LOGGER.debug(
+                    "%s: action %s (%s) waited %.1f ms",
+                    channel,
+                    action.kind,
+                    action.id,
+                    (time.monotonic() - queued_at) * 1000,
+                )
+                await self._handle_action(channel, action)
+            except (BackendError, ConfigError, ProtocolError, ValueError) as exc:
+                await self._emit_failure(channel, action.id, str(exc))
+            except Exception:
+                LOGGER.exception("%s: unexpected action worker failure", channel)
+                await self._emit_failure(channel, action.id, "unexpected bridge failure")
+            finally:
+                queue.task_done()
 
     def _is_own_message(self, message: IRCMessage) -> bool:
         return message.nick.lower() == self.config.irc.nickname.lower()
@@ -241,8 +283,8 @@ class Bridge:
         """
 
         if self._is_own_message(message):
-            # echo-message hands the bridge back everything it publishes. That
-            # is expected traffic, not a fault, so it must not warn.
+            # A server or test relay may still hand the bridge its own traffic.
+            # That is expected, not a fault, so it must not warn.
             LOGGER.debug(
                 "%s: ignored this bridge's own echoed %s", message.channel, message.command
             )
@@ -399,8 +441,8 @@ class Bridge:
             runtime.busy = summary.busy
             runtime.active_turn = summary.active_turn_id
             await self.state.set(channel, runtime.binding)
-        await self._emit_hello(channel)
-        await self._emit_snapshot(channel)
+        # Client sync is authoritative bootstrap. Publishing the same hello and
+        # snapshot here made every activation pay for both messages twice.
         if runtime.binding is not None and not runtime.busy:
             await self._drain_queue(channel)
 
@@ -416,6 +458,8 @@ class Bridge:
                     "workspaces",
                     "sessions",
                     "history",
+                    "historyChunks",
+                    "compressedFragments",
                     "settings",
                     "turns",
                     "steering",
@@ -449,6 +493,7 @@ class Bridge:
                 "queueItems": self.config.bridge.queue_limit,
                 "historyEvents": 200,
                 "historyBytes": 512 * 1024,
+                "historyChunkBytes": HISTORY_CHUNK_BYTES,
                 "historyDays": 30,
             },
             "settings": (
@@ -475,8 +520,8 @@ class Bridge:
 
     async def _handle_action(self, channel: str, action: Envelope) -> None:
         if action.message_type != "action":
-            # Published events come back through echo-message and are never
-            # commands. Expected traffic, so this stays below warning level.
+            # A relayed published event is never a command. Expected traffic,
+            # so this stays below warning level.
             LOGGER.debug(
                 "%s: ignored a %s %s, which is not an action",
                 channel,
@@ -493,31 +538,50 @@ class Bridge:
         if action.kind != "sync.request" and action.epoch != self.epoch:
             await self._emit_failure(channel, action.id, "stale or missing live epoch")
             return
-        LOGGER.info("%s: journaling action %s (%s)", channel, action.kind, action.id)
-        duplicate = await self.state.claim_action(action, channel)
-        if duplicate is not None:
-            await self._emit(
-                channel,
-                f"action.{duplicate}" if duplicate != "accepted" else "action.accepted",
-                reply=action.id,
-                data={"duplicate": True},
-            )
-            return
-        await self._emit(channel, "action.accepted", reply=action.id)
+        started = time.monotonic()
+        tracked = action.kind not in READ_ACTION_KINDS
+        if tracked:
+            LOGGER.info("%s: journaling action %s (%s)", channel, action.kind, action.id)
+            duplicate = await self.state.claim_action(action, channel)
+            if duplicate is not None:
+                await self._emit(
+                    channel,
+                    f"action.{duplicate}" if duplicate != "accepted" else "action.accepted",
+                    reply=action.id,
+                    data={"duplicate": True},
+                )
+                return
+            await self._emit(channel, "action.accepted", reply=action.id)
         try:
             await self._dispatch_action(channel, action)
         except (BackendError, ConfigError, ProtocolError, ValueError) as exc:
             detail = safe_one_line(str(exc), 1000)
-            await self.state.finish_action(action.id, "failed", detail)
+            if tracked:
+                await self.state.finish_action(action.id, "failed", detail)
             await self._emit(channel, "action.failed", reply=action.id, data={"message": detail})
             return
         except Exception:
             detail = "backend outcome is unknown"
-            await self.state.finish_action(action.id, "uncertain", detail)
-            await self._emit(channel, "action.uncertain", reply=action.id, data={"message": detail})
+            if tracked:
+                await self.state.finish_action(action.id, "uncertain", detail)
+                await self._emit(
+                    channel, "action.uncertain", reply=action.id, data={"message": detail}
+                )
+            else:
+                await self._emit(
+                    channel, "action.failed", reply=action.id, data={"message": detail}
+                )
             return
-        await self.state.finish_action(action.id, "succeeded")
-        await self._emit(channel, "action.succeeded", reply=action.id)
+        if tracked:
+            await self.state.finish_action(action.id, "succeeded")
+            await self._emit(channel, "action.succeeded", reply=action.id)
+        LOGGER.debug(
+            "%s: action %s (%s) completed in %.1f ms",
+            channel,
+            action.kind,
+            action.id,
+            (time.monotonic() - started) * 1000,
+        )
 
     async def _dispatch_action(self, channel: str, action: Envelope) -> None:
         handlers = {
@@ -691,9 +755,11 @@ class Bridge:
                 for payload in payloads
             ]
             next_cursor = None
+        chunks = self._history_chunks(history)
         page_data: dict[str, Any] = {
             "page": page_id,
             "count": len(history),
+            "chunks": len(chunks),
             "cursor": cursor,
         }
         if backend_page is not None:
@@ -706,8 +772,19 @@ class Bridge:
             data=page_data,
             journal=False,
         )
-        for historic in history:
-            await self.irc.send_protocol(channel, historic)
+        for index, chunk in enumerate(chunks):
+            await self._emit(
+                channel,
+                "history.chunk",
+                session_id=session_id,
+                reply=action.id,
+                data={
+                    "page": page_id,
+                    "index": index,
+                    "events": [event.to_dict() for event in chunk],
+                },
+                journal=False,
+            )
         await self._emit(
             channel,
             "history.end",
@@ -716,6 +793,23 @@ class Bridge:
             data=page_data,
             journal=False,
         )
+
+    @staticmethod
+    def _history_chunks(history: list[Envelope]) -> list[list[Envelope]]:
+        chunks: list[list[Envelope]] = []
+        current: list[Envelope] = []
+        current_bytes = 0
+        for event in history:
+            size = len(encode_envelope(event).encode("utf-8")) + 1
+            if current and current_bytes + size > HISTORY_CHUNK_BYTES:
+                chunks.append(current)
+                current = []
+                current_bytes = 0
+            current.append(event)
+            current_bytes += size
+        if current:
+            chunks.append(current)
+        return chunks
 
     async def _action_create(self, channel: str, action: Envelope) -> None:
         cwd = str(
@@ -869,8 +963,14 @@ class Bridge:
         item_id = self._item_id(action)
         await self._require_queue_item(channel, item_id)
         items = await self.state.move_queue(item_id, position)
-        for item in items:
-            await self._emit_queue_item(channel, "queue.item.moved", item)
+        runtime = self.channels[channel]
+        binding = self._require_binding(runtime, action)
+        await self._emit(
+            channel,
+            "queue.snapshot",
+            session_id=binding.session_id,
+            data={"items": [self._queue_data(item) for item in items]},
+        )
 
     async def _action_queue_delete(self, channel: str, action: Envelope) -> None:
         item_id = self._item_id(action)

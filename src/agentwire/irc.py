@@ -7,6 +7,7 @@ import logging
 import random
 import secrets
 import ssl
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -57,6 +58,7 @@ class _OutgoingMessage:
     text: str = ""
     tags: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
     command: str = "PRIVMSG"
+    queued_at: float = field(default_factory=time.monotonic)
 
 
 def _unescape_tag(value: str) -> str:
@@ -223,7 +225,21 @@ class IRCClient:
         await self._write_line(f"NICK {self.config.nickname}")
         await self._write_line(f"USER {self.config.username} 0 * :{self.config.realname}")
         await self._negotiate(reader)
-        self._writer_task = asyncio.create_task(self._write_messages(), name="irc-writer")
+        reader_task = asyncio.create_task(self._read_messages(reader), name="irc-reader")
+        writer_task = asyncio.create_task(self._write_messages(), name="irc-writer")
+        self._writer_task = writer_task
+        try:
+            done, _pending = await asyncio.wait(
+                {reader_task, writer_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                task.result()
+        finally:
+            reader_task.cancel()
+            writer_task.cancel()
+            await asyncio.gather(reader_task, writer_task, return_exceptions=True)
+
+    async def _read_messages(self, reader: asyncio.StreamReader) -> None:
         while not self._closed:
             raw = await reader.readline()
             if not raw:
@@ -250,7 +266,10 @@ class IRCClient:
             "draft/chathistory",
             "draft/event-playback",
         }
-        wanted = required | {"extended-join"}
+        # Bridge must prove clients can use echo-message, but enabling it on
+        # this connection only sends every published event back to be discarded.
+        enabled_required = required - {"echo-message"}
+        wanted = enabled_required | {"extended-join"}
         while not (welcome and cap_finished):
             raw = await reader.readline()
             if not raw:
@@ -280,7 +299,7 @@ class IRCClient:
                         for cap in line.params[-1].split()
                         if not cap.startswith("-")
                     )
-                    if required - self._caps:
+                    if enabled_required - self._caps:
                         raise IRCError("IRC server did not acknowledge required capabilities")
                     await self._write_line("AUTHENTICATE PLAIN")
                     sasl_started = True
@@ -489,6 +508,13 @@ class IRCClient:
         while not self._closed:
             message = await self._outgoing.get()
             target, text = message.target, message.text
+            LOGGER.debug(
+                "outgoing %s to %s waited %.1f ms (queue depth %d)",
+                message.command,
+                target,
+                (time.monotonic() - message.queued_at) * 1000,
+                self._outgoing.qsize(),
+            )
             if message.command == "TAGMSG":
                 await self._write_line(f"{_format_tags(message.tags)}TAGMSG {target}")
                 continue
@@ -512,13 +538,11 @@ class IRCClient:
                 await self._write_line(f"{tag_prefix}BATCH +{batch_id} draft/multiline {target}")
                 for item in lines:
                     await self._write_line(f"@batch={batch_id} PRIVMSG {target} :{item}")
-                    await asyncio.sleep(0.15)
                 await self._write_line(f"BATCH -{batch_id}")
             else:
                 for item in lines:
                     tag_prefix = _format_tags(message.tags) if message.tags else ""
                     await self._write_line(f"{tag_prefix}{message.command} {target} :{item}")
-                    await asyncio.sleep(0.15)
 
     async def _write_line(self, line: str) -> None:
         if self._writer is None or self._writer.is_closing():
@@ -529,7 +553,7 @@ class IRCClient:
     async def _close_connection(self) -> None:
         if self._writer_task is not None:
             self._writer_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._writer_task
         self._writer_task = None
         if self._writer is not None:
