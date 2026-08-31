@@ -284,6 +284,10 @@ class OpenCodeBackend(Backend):
         if not part_id or not session_id or status == previous:
             return
         self._tool_states[part_id] = status
+        # ponytail: parts are never reported gone, so the dedupe map is capped
+        # by evicting the oldest entries instead of tracking part lifecycles.
+        while len(self._tool_states) > 4096:
+            del self._tool_states[next(iter(self._tool_states))]
         tool_kind = self._tool_kind(str(part.get("tool") or ""))
         if status in {"pending", "running"} and previous not in {"pending", "running"}:
             await self._events.put(

@@ -14,7 +14,7 @@ from types import MappingProxyType
 
 from agentwire.config import IRCConfig
 from agentwire.protocol import PROTOCOL_TAG, Envelope, fragment_envelope
-from agentwire.text import clean_text, truncate_utf8
+from agentwire.text import clean_text
 
 # Diagnostics describe identities, classifications, and lifecycle transitions.
 # They never carry message text, tag values, or credentials: IRC traffic is the
@@ -645,12 +645,14 @@ class IRCClient:
                     continue
                 lines: list[str] = []
                 for logical in text.splitlines() or [text]:
-                    remaining = logical
-                    while len(remaining.encode("utf-8")) > 350:
-                        piece = truncate_utf8(remaining, 350)
+                    # Split on the encoded bytes so a long line costs one
+                    # encode instead of re-encoding the remainder per piece.
+                    encoded = logical.encode("utf-8")
+                    while len(encoded) > 350:
+                        piece = encoded[:350].decode("utf-8", errors="ignore")
                         lines.append(piece)
-                        remaining = remaining[len(piece) :]
-                    lines.append(remaining or " ")
+                        encoded = encoded[len(piece.encode("utf-8")) :]
+                    lines.append(encoded.decode("utf-8") or " ")
                 # A multiline batch carries PRIVMSG lines, so only a PRIVMSG may use
                 # it; a NOTICE is always sent as discrete lines.
                 if (

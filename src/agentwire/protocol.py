@@ -252,12 +252,10 @@ def new_envelope(
 
 
 def encode_envelope(envelope: Envelope) -> str:
-    raw = json.dumps(
-        envelope.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
-    if len(raw) > MAX_PAYLOAD_BYTES:
+    text = json.dumps(envelope.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if len(text.encode("utf-8")) > MAX_PAYLOAD_BYTES:
         raise ProtocolError(f"payload exceeds {MAX_PAYLOAD_BYTES} bytes")
-    return raw.decode("utf-8")
+    return text
 
 
 def decode_envelope(value: str) -> Envelope:
@@ -274,9 +272,13 @@ def decode_envelope(value: str) -> Envelope:
 
 def tag_wire_size(value: str) -> int:
     """Return the UTF-8 byte size after IRCv3 message-tag escaping."""
-    escaped = value.replace("\\", "\\\\").replace(";", "\\:").replace(" ", "\\s")
-    escaped = escaped.replace("\r", "\\r").replace("\n", "\\n")
-    return len(escaped.encode("utf-8"))
+    # Every escaped character becomes a two-byte sequence, so counting them is
+    # enough; building the escaped string just to measure it allocated a copy
+    # of every envelope on the wire path.
+    size = len(value.encode("utf-8"))
+    for char in "\\; \r\n":
+        size += value.count(char)
+    return size
 
 
 def parse_topic(topic: str) -> TopicActivation | None:
@@ -427,8 +429,13 @@ class Reassembler:
             raw = json.loads(value)
         except json.JSONDecodeError as exc:
             raise ProtocolError(f"invalid JSON: {exc.msg}") from exc
-        if not isinstance(raw, dict) or raw.get("k") != "fragment":
-            return decode_envelope(value)
+        if not isinstance(raw, dict):
+            raise ProtocolError("protocol value must be a JSON object")
+        if raw.get("k") != "fragment":
+            # Tag values are bounded by the IRCv3 tag section, far below the
+            # payload ceiling, so the parsed object is validated directly
+            # instead of round-tripping through a second json.loads.
+            return Envelope.from_dict(raw)
         if raw.get("v") != PROTOCOL_VERSION:
             raise ProtocolError("unsupported fragment version")
         message_id = _required_string(raw, "id")

@@ -129,6 +129,7 @@ class CodexTuiSessionPresence:
 
 class CodexBackend(Backend):
     name = "codex"
+    has_authoritative_history = True
 
     def __init__(self, config: CodexConfig) -> None:
         self.config = config

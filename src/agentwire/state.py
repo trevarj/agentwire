@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import sqlite3
@@ -30,6 +31,7 @@ class StateStore:
         self.path = path
         self._lock = asyncio.Lock()
         self._initialized = False
+        self._db: sqlite3.Connection | None = None
 
     async def initialize(self) -> None:
         if self._initialized:
@@ -129,11 +131,26 @@ class StateStore:
         async with self._lock:
             return await asyncio.to_thread(self._clear_queue, channel.lower(), session_id)
 
+    async def close(self) -> None:
+        async with self._lock:
+            if self._db is not None:
+                await asyncio.to_thread(self._db.close)
+                self._db = None
+                self._initialized = False
+
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
-        connection.execute("PRAGMA journal_mode=DELETE")
-        connection.execute("PRAGMA foreign_keys=ON")
-        return connection
+        if self._db is None:
+            # One persistent WAL connection. Per-operation connections in
+            # DELETE journal mode paid connection setup plus a journal-file
+            # create/fsync/delete cycle on every commit, which dominated the
+            # event write path. All access is serialized by self._lock, so
+            # sharing one handle across to_thread workers is safe.
+            connection = sqlite3.connect(self.path, check_same_thread=False)
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            self._db = connection
+        return self._db
 
     def _initialize(self) -> None:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -225,6 +242,11 @@ class StateStore:
                     ),
                 )
         os.chmod(self.path, 0o600)
+        # WAL sidecar files inherit creation-time permissions, not the chmod
+        # above; keep the documented 0600 posture for everything on disk.
+        for suffix in ("-wal", "-shm"):
+            with contextlib.suppress(OSError):
+                os.chmod(f"{self.path}{suffix}", 0o600)
 
     def _move_legacy_json(self) -> dict[str, ChannelBinding]:
         if not self.path.exists():

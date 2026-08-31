@@ -26,6 +26,9 @@ from agentwire.text import clean_block, safe_one_line, truncate_utf8
 _MAX_TOOL_PAYLOAD_BYTES = 32 * 1024
 _MAX_LINE_BYTES = 8 * 1024 * 1024
 _COMMAND_TIMEOUT = 30.0
+# History paging bursts reuse one fetched transcript; invalidated on any new
+# message frame and by this backstop for sessions written outside the bridge.
+_ENTRIES_CACHE_SECONDS = 5.0
 # Socket discovery cadence: directory scan is tiny, and a new TUI should appear
 # before a second phone tap.
 _DISCOVER_SECONDS = 0.5
@@ -233,6 +236,7 @@ class PiBackend(Backend):
     """
 
     name = "pi"
+    has_authoritative_history = True
 
     def __init__(self, config: PiConfig) -> None:
         self.config = config
@@ -248,6 +252,9 @@ class PiBackend(Backend):
         # answer can be routed back through it.
         self._ui_requests: dict[str, tuple[_Session, dict[str, Any], str | None]] = {}
         self._setting_options: dict[str, Any] | None = None
+        # ponytail: one-slot whole-transcript cache; move to since-cursor
+        # increments if transcripts outgrow a single fetch.
+        self._entries_cache: tuple[str, float, list[dict[str, Any]]] | None = None
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -462,6 +469,7 @@ class PiBackend(Backend):
     async def _handle_frame(self, session: _Session, frame: dict[str, Any]) -> None:
         kind = frame.get("type")
         if kind == "session_changed":
+            self._entries_cache = None
             await self._session_changed(session, frame)
         elif kind == "agent_start":
             session.busy = True
@@ -471,6 +479,8 @@ class PiBackend(Backend):
         elif kind == "agent_settled":
             await self._settle_turn(session)
         elif kind == "message_end":
+            # The transcript grew; a cached copy would serve stale history.
+            self._entries_cache = None
             await self._handle_message(session, frame.get("message"))
         elif kind == "tool_execution_start":
             await self._handle_tool_start(session, frame)
@@ -851,16 +861,18 @@ class PiBackend(Backend):
     # ------------------------------------------------------------------
 
     async def list_sessions(self, cwd: str) -> list[SessionSummary]:
+        # One thread hop for the whole scan: the stat-driven sort and one file
+        # read per summary would otherwise block the loop or hop per file.
+        return await asyncio.to_thread(self._list_sessions_blocking, cwd)
+
+    def _list_sessions_blocking(self, cwd: str) -> list[SessionSummary]:
         directory = self.config.session_root / _cwd_dir_name(cwd)
         try:
             files = [path for path in directory.iterdir() if path.suffix == ".jsonl"]
         except OSError:
-            files = []
+            return []
         files.sort(key=self._mtime, reverse=True)
-        summaries = []
-        for path in files[:_SESSION_LIST_LIMIT]:
-            summaries.append(await asyncio.to_thread(self._file_summary, path, cwd))
-        return summaries
+        return [self._file_summary(path, cwd) for path in files[:_SESSION_LIST_LIMIT]]
 
     def count_sessions(self, cwd: str) -> int | None:
         directory = self.config.session_root / _cwd_dir_name(cwd)
@@ -1177,6 +1189,13 @@ class PiBackend(Backend):
     # ------------------------------------------------------------------
 
     async def _entries(self, session_id: str) -> list[dict[str, Any]]:
+        cached = self._entries_cache
+        if (
+            cached is not None
+            and cached[0] == session_id
+            and time.monotonic() - cached[1] < _ENTRIES_CACHE_SECONDS
+        ):
+            return cached[2]
         session = self._sessions.get(session_id)
         if session is not None and not session.transport.closed:
             pages: list[Any] = []
@@ -1227,11 +1246,14 @@ class PiBackend(Backend):
                         "message": message,
                     }
                 )
+            self._entries_cache = (session_id, time.monotonic(), entries)
             return entries
         path = self._session_file(session_id, session.cwd if session else None)
         if path is None:
             raise BackendError(f"pi session {session_id} was not found on disk")
-        return await asyncio.to_thread(self._file_entries, path)
+        entries = await asyncio.to_thread(self._file_entries, path)
+        self._entries_cache = (session_id, time.monotonic(), entries)
+        return entries
 
     @staticmethod
     def _prune_args(args: Any) -> dict[str, Any]:

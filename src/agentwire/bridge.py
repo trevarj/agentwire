@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 import secrets
@@ -24,7 +25,6 @@ from agentwire.protocol import (
     TopicActivation,
     build_topic,
     decode_envelope,
-    encode_envelope,
     new_envelope,
     parse_topic,
     suggested_topic,
@@ -217,6 +217,7 @@ class Bridge:
             *(backend.close() for backend in self.backends.values()),
             return_exceptions=True,
         )
+        await self.state.close()
 
     async def _restore_bindings(self) -> None:
         for channel, binding in (await self.state.load()).items():
@@ -699,26 +700,35 @@ class Bridge:
         parent_value = action.data.get("parent")
         if parent_value is None:
             parent: Path | None = None
-            directories = list(self.config.bridge.allowed_roots)
         elif isinstance(parent_value, str):
             parent = resolve_workspace(parent_value, self.config.bridge.allowed_roots)
-            directories = self._workspace_children(parent)
         else:
             raise ProtocolError("workspace parent must be a string")
         backend = self.backends[self.channels[channel].backend]
-        counts = await asyncio.to_thread(
-            lambda: [backend.count_sessions(str(directory)) for directory in directories]
-        )
-        items = []
-        for directory, count in zip(directories, counts, strict=True):
-            item: dict[str, Any] = {
-                "path": str(directory),
-                "name": directory.name,
-                "hasChildren": bool(self._workspace_children(directory, limit=1)),
-            }
-            if count is not None:
-                item["sessionCount"] = count
-            items.append(item)
+
+        def build_items() -> list[dict[str, Any]]:
+            # Directory listing, the per-child hasChildren probe, and session
+            # counting are all filesystem work; one thread hop keeps every scan
+            # off the event loop instead of only the counts.
+            directories = (
+                list(self.config.bridge.allowed_roots)
+                if parent is None
+                else self._workspace_children(parent)
+            )
+            items: list[dict[str, Any]] = []
+            for directory in directories:
+                item: dict[str, Any] = {
+                    "path": str(directory),
+                    "name": directory.name,
+                    "hasChildren": bool(self._workspace_children(directory, limit=1)),
+                }
+                count = backend.count_sessions(str(directory))
+                if count is not None:
+                    item["sessionCount"] = count
+                items.append(item)
+            return items
+
+        items = await asyncio.to_thread(build_items)
         await self._emit(
             channel,
             "workspace.page",
@@ -838,7 +848,7 @@ class Bridge:
                 for payload in payloads
             ]
             next_cursor = None
-        chunks = self._history_chunks(history)
+        chunks = self._history_chunks([event.to_dict() for event in history])
         page_data: dict[str, Any] = {
             "page": page_id,
             "count": len(history),
@@ -864,7 +874,7 @@ class Bridge:
                 data={
                     "page": page_id,
                     "index": index,
-                    "events": [event.to_dict() for event in chunk],
+                    "events": chunk,
                 },
                 journal=False,
             )
@@ -878,17 +888,23 @@ class Bridge:
         )
 
     @staticmethod
-    def _history_chunks(history: list[Envelope]) -> list[list[Envelope]]:
-        chunks: list[list[Envelope]] = []
-        current: list[Envelope] = []
+    def _history_chunks(history: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        chunks: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
         current_bytes = 0
-        for event in history:
-            size = len(encode_envelope(event).encode("utf-8")) + 1
+        for payload in history:
+            # Sized on the same minified JSON the chunk envelope carries, so
+            # each event is serialized once for packing rather than encoded a
+            # second time just to be measured.
+            size = (
+                len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                + 1
+            )
             if current and current_bytes + size > HISTORY_CHUNK_BYTES:
                 chunks.append(current)
                 current = []
                 current_bytes = 0
-            current.append(event)
+            current.append(payload)
             current_bytes += size
         if current:
             chunks.append(current)
@@ -1557,7 +1573,17 @@ class Bridge:
             reply=reply,
             data=data or {},
         )
-        should_journal = kind in HISTORY_EVENT_KINDS if journal is None else journal
+        if journal is not None:
+            should_journal = journal
+        elif kind not in HISTORY_EVENT_KINDS:
+            should_journal = False
+        else:
+            # The journal only backs history for backends without their own
+            # transcript pagination; writing it for the others is a per-event
+            # database commit that is never read back.
+            runtime = self.channels.get(channel)
+            backend = self.backends.get(runtime.backend) if runtime else None
+            should_journal = backend is None or not backend.has_authoritative_history
         if should_journal:
             await self.state.append_event(channel, envelope)
         await self.irc.send_protocol(channel, envelope, preview)

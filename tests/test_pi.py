@@ -716,6 +716,9 @@ async def test_live_history_pages_past_extension_limit_and_stops_on_no_progress(
         call({"type": "get_entries", "limit": 500, "since": "e499"}),
     ]
 
+    # A new message frame would clear the paging cache; simulate that so the
+    # second fetch exercises the leaf-stop logic instead of the cache.
+    harness._entries_cache = None
     session.transport.request = AsyncMock(
         side_effect=[
             {"entries": first, "leafId": "later"},

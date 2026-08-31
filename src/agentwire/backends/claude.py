@@ -119,6 +119,7 @@ class ClaudeBackend(Backend):
     """
 
     name = "claude"
+    has_authoritative_history = True
 
     def __init__(self, config: ClaudeConfig, api_key: str | None = None) -> None:
         self.config = config

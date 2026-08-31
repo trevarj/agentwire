@@ -13,6 +13,9 @@ class BackendError(RuntimeError):
 
 class Backend(abc.ABC):
     name: str
+    # True when list_history serves authoritative transcript pages. The bridge
+    # journal is never read for such a backend, so it is not written either.
+    has_authoritative_history = False
 
     @abc.abstractmethod
     async def start(self) -> None: ...
