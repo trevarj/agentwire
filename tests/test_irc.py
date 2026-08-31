@@ -81,6 +81,121 @@ async def test_fragment_tail_uses_tagmsg(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_outgoing_flush_completes_after_prior_messages(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    lines: list[str] = []
+
+    async def capture(line: str) -> None:
+        lines.append(line)
+
+    client._write_line = capture  # type: ignore[method-assign]
+    task = asyncio.create_task(client._write_messages())
+    client._writer_task = task
+    try:
+        await client.send_notice("#c", "before close")
+        await asyncio.wait_for(client.flush(), 0.1)
+        await asyncio.wait_for(client._outgoing.join(), 0.1)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert lines == ["NOTICE #c :before close"]
+
+
+@pytest.mark.asyncio
+async def test_dynamic_channel_controls_require_confirmed_private_order(tmp_path: Path) -> None:
+    client = make_client(tmp_path)
+    lines: list[str] = []
+
+    async def capture(line: str) -> None:
+        lines.append(line)
+
+    client._write_line = capture  # type: ignore[method-assign]
+    client._joined.add("#c")
+    client._topics.add("#c")
+    client._ready.set()
+    channel = "#pi-abcd1234"
+    client.register_channel(channel)
+    assert not client._ready.is_set()
+
+    joining = asyncio.create_task(client.join_channel(channel))
+    await asyncio.sleep(0)
+    await client._handle_line(parse_irc_line(f":agentwire!u@h JOIN {channel}"))
+    await joining
+
+    private = asyncio.create_task(client.set_private(channel))
+    await asyncio.sleep(0)
+    assert lines[-2:] == [f"MODE {channel} +is", f"MODE {channel}"]
+    await client._handle_line(parse_irc_line(f":server 324 agentwire {channel} +isnt"))
+    await private
+
+    topic = asyncio.create_task(client.set_topic(channel, "agentwire:v1"))
+    await asyncio.sleep(0)
+    await client._handle_line(parse_irc_line(f":agentwire!u@h TOPIC {channel} :agentwire:v1"))
+    await topic
+    assert client._ready.is_set()
+
+    invite = asyncio.create_task(client.invite(channel, "Alice"))
+    await asyncio.sleep(0)
+    await client._handle_line(parse_irc_line(f":server 341 agentwire Alice {channel}"))
+    await invite
+
+    part = asyncio.create_task(client.part_channel(channel))
+    await asyncio.sleep(0)
+    await client._handle_line(parse_irc_line(f":agentwire!u@h PART {channel} :session closed"))
+    await part
+    assert client._ready.is_set()
+
+    assert lines == [
+        f"JOIN {channel}",
+        f"MODE {channel} +is",
+        f"MODE {channel}",
+        f"TOPIC {channel} :agentwire:v1",
+        f"INVITE Alice {channel}",
+        f"PART {channel} :session closed",
+    ]
+    assert client._control_waiter is None
+
+    client.unregister_channel(channel)
+    with pytest.raises(IRCError, match="not registered"):
+        await client.set_topic(channel, "")
+    with pytest.raises(IRCError, match="invalid IRC nickname"):
+        await client.invite("#c", "bad nick")
+    with pytest.raises(IRCError, match="invalid IRC channel"):
+        client.register_channel("#bad,channel")
+
+
+@pytest.mark.asyncio
+async def test_dynamic_channel_control_rejection_timeout_and_disconnect_clean_waiters(
+    tmp_path: Path,
+) -> None:
+    client = make_client(tmp_path)
+
+    async def capture(_line: str) -> None:
+        return None
+
+    client._write_line = capture  # type: ignore[method-assign]
+    client.register_channel("#pi-deadbeef")
+    rejected = asyncio.create_task(client.set_private("#pi-deadbeef"))
+    await asyncio.sleep(0)
+    await client._handle_line(parse_irc_line(":server 482 agentwire #pi-deadbeef :not op"))
+    with pytest.raises(IRCError, match=r"rejected mode \(482\)"):
+        await rejected
+    assert client._control_waiter is None
+
+    with pytest.raises(IRCError, match="timed out"):
+        await client.set_topic("#pi-deadbeef", "topic", timeout=0.01)
+    assert client._control_waiter is None
+
+    disconnected = asyncio.create_task(client.invite("#pi-deadbeef", "Alice"))
+    await asyncio.sleep(0)
+    await client._close_connection()
+    with pytest.raises(IRCError, match="connection closed"):
+        await disconnected
+    assert client._control_waiter is None
+
+
+@pytest.mark.asyncio
 async def test_notice_is_sent_as_a_notice(tmp_path: Path) -> None:
     client = make_client(tmp_path)
     lines: list[str] = []

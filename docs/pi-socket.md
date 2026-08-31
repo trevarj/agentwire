@@ -21,11 +21,11 @@ bridge shares one translator for both transports.
 ## Frames from pi
 
 - `hello` — first frame on a socket connection:
-  `{type, pv, sessionId, sessionFile, cwd, sessionName, model, thinkingLevel, busy, pid}`.
+  `{type, pv, sessionId, sessionFile, cwd, sessionName, model, thinkingLevel, busy, waiting, pid}`.
   The durable session identity used by the bridge is the session file stem,
   not `sessionId`.
 - `session_changed` — same payload, re-announced after `/new`, `/resume`,
-  fork, rename, model, or thinking-level changes.
+  fork, rename, model, thinking-level, or waiting-for-input changes.
 - `agent_start` / `agent_settled` — busy boundary markers. `agent_settled`
   means no retry, compaction retry, or queued continuation remains, and closes
   the bridge's open turn.
@@ -54,7 +54,8 @@ Every command carries an `id`; the reply is
 - `abort`
 - `get_state` — the `hello` payload.
 - `get_entries {since?, limit?}` — condensed active-branch messages with
-  stable entry ids; `since` is a strict cursor.
+  stable entry ids and the active branch `leafId`; `since` is a strict cursor.
+  The bridge pages live TUI history in 500-entry windows until it reaches that leaf.
 - `get_available_models` / `set_model {provider, modelId}`
 - `set_thinking_level {level}`
 - `set_session_name {name}`

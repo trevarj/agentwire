@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, call
 
 import pytest
 
@@ -449,8 +450,14 @@ async def test_extension_ui_dialogs_relay_and_resolve(tmp_path: Path) -> None:
         {"type": "extension_ui_request", "id": "n1", "method": "notify", "message": "ignored"},
     )
     events = drain(harness)
-    assert [event.kind for event in events] == ["question", "approval"]
-    question = events[0]
+    assert [event.kind for event in events] == [
+        "status_changed",
+        "question",
+        "status_changed",
+        "approval",
+    ]
+    assert events[0].data["active_flags"] == ["waiting"]
+    question = events[1]
     assert question.questions[0].options == ("a", "b")
     assert question.questions[0].custom is False
 
@@ -490,8 +497,8 @@ async def test_plan_mode_questionnaire_round_trip(tmp_path: Path) -> None:
             {"type": "extension_ui_request", "id": token, "method": method, **extra},
         )
         events = drain(harness)
-        assert [event.kind for event in events] == ["question"]
-        return events[0]
+        assert [event.kind for event in events][-2:] == ["status_changed", "question"]
+        return events[-1]
 
     # (a) the questionnaire select splits its title and hides the free-form row.
     event = await ask(
@@ -678,6 +685,131 @@ async def test_list_sessions_reads_titles_and_marks_live(tmp_path: Path) -> None
     assert session.id == STEM
 
 
+@pytest.mark.asyncio
+async def test_live_history_pages_past_extension_limit_and_stops_on_no_progress(
+    tmp_path: Path,
+) -> None:
+    harness = backend(tmp_path)
+    session = attached(harness)
+
+    def entry(index: int) -> dict[str, Any]:
+        return {
+            "id": f"e{index}",
+            "timestamp": "2026-08-24T12:00:00Z",
+            "message": {"role": "user", "text": f"message {index}"},
+        }
+
+    first = [entry(index) for index in range(500)]
+    second = [entry(index) for index in range(500, 501)]
+    session.transport.request = AsyncMock(
+        side_effect=[
+            {"entries": first, "leafId": "e500"},
+            {"entries": second, "leafId": "e500"},
+        ]
+    )
+
+    entries = await harness._entries(STEM)
+
+    assert len(entries) == 501
+    assert session.transport.request.await_args_list == [
+        call({"type": "get_entries", "limit": 500}),
+        call({"type": "get_entries", "limit": 500, "since": "e499"}),
+    ]
+
+    session.transport.request = AsyncMock(
+        side_effect=[
+            {"entries": first, "leafId": "later"},
+            {"entries": first, "leafId": "later"},
+        ]
+    )
+    assert len(await harness._entries(STEM)) == 500
+    assert session.transport.request.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_waiting_state_comes_from_tui_frames_and_open_rpc_requests(tmp_path: Path) -> None:
+    harness = backend(tmp_path)
+    session = harness._register(
+        {
+            "sessionFile": f"/s/{STEM}.jsonl",
+            "cwd": CWD,
+            "busy": True,
+            "waiting": True,
+        },
+        _Transport(asyncio.StreamReader(), FakeWriter()),
+        tui=True,
+    )
+    assert session is not None
+    session.pump.cancel()
+    assert drain(harness)[0].data["active_flags"] == ["waiting"]
+
+    await harness._handle_frame(
+        session, {"type": "session_changed", "waiting": False, "sessionName": "live"}
+    )
+    assert drain(harness)[0].data["active_flags"] == []
+
+    rpc = attached(harness, tui=False)
+    await harness._handle_frame(
+        rpc,
+        {"type": "extension_ui_request", "id": "q", "method": "input", "title": "Value"},
+    )
+    assert drain(harness)[0].data["active_flags"] == ["waiting"]
+
+
+@pytest.mark.asyncio
+async def test_close_session_only_stops_bridge_owned_rpc(tmp_path: Path) -> None:
+    harness = backend(tmp_path)
+    session = attached(harness, tui=True)
+    with pytest.raises(BackendError, match="live pi TUI"):
+        await harness.close_session(STEM)
+
+    session.tui = False
+    with pytest.raises(BackendError, match="not owned"):
+        await harness.close_session(STEM)
+
+    session.transport.process = object()  # type: ignore[assignment]
+    session.transport.close = AsyncMock()
+    harness._ui_requests["q"] = (session, {}, None)
+    await harness.close_session(STEM)
+
+    assert STEM not in harness._sessions
+    assert harness._ui_requests == {}
+    session.transport.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_close_session_keeps_registry_until_cancelled_termination_finishes(
+    tmp_path: Path,
+) -> None:
+    harness = backend(tmp_path)
+    session = attached(harness)
+    session.tui = False
+    session.transport.process = object()  # type: ignore[assignment]
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def block_close() -> None:
+        started.set()
+        await release.wait()
+
+    session.transport.close = block_close  # type: ignore[method-assign]
+    harness._ui_requests["q"] = (session, {}, None)
+    closing = asyncio.create_task(harness.close_session(STEM))
+    await started.wait()
+    assert harness._sessions[STEM] is session
+    assert "q" in harness._ui_requests
+
+    closing.cancel()
+    await asyncio.sleep(0)
+    assert harness._sessions[STEM] is session
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await closing
+
+    assert STEM not in harness._sessions
+    assert harness._ui_requests == {}
+
+
 def test_count_sessions_counts_jsonl_files(tmp_path: Path) -> None:
     harness = backend(tmp_path)
     assert harness.count_sessions(CWD) == 0
@@ -822,6 +954,9 @@ async def test_registration_and_turn_edges_report_session_status(tmp_path: Path)
     assert settled[0].data["active_flags"] == ["waiting"]
 
     await harness.resolve_approval("u1", True)
+    resolved = drain(harness)
+    assert [event.kind for event in resolved] == ["status_changed"]
+    assert resolved[0].data["active_flags"] == []
     await harness._handle_frame(session, {"type": "session_changed", "sessionName": "renamed"})
     changed = drain(harness)
     assert [event.kind for event in changed] == ["status_changed"]

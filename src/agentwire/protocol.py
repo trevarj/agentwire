@@ -28,6 +28,7 @@ ACTION_KINDS = frozenset(
         "session.list.request",
         "history.request",
         "session.create",
+        "session.close",
         "session.attach",
         "session.detach",
         "session.rename",

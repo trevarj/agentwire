@@ -52,6 +52,15 @@ class _IncomingBatch:
     lines: list[str] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class _ControlWaiter:
+    kind: str
+    channel: str
+    future: asyncio.Future[None]
+    topic: str = ""
+    nick: str = ""
+
+
 @dataclass(slots=True, frozen=True)
 class _OutgoingMessage:
     target: str
@@ -59,6 +68,7 @@ class _OutgoingMessage:
     tags: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
     command: str = "PRIVMSG"
     queued_at: float = field(default_factory=time.monotonic)
+    done: asyncio.Future[None] | None = None
 
 
 def _unescape_tag(value: str) -> str:
@@ -124,7 +134,13 @@ class IRCClient:
         self._writer_task: asyncio.Task[None] | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._caps: set[str] = set()
+        self._channel_order = [self._valid_channel(channel) for channel in config.channels]
+        self._accepted_channels = set(self._channel_order)
         self._joined: set[str] = set()
+        self._control_lock = asyncio.Lock()
+        self._control_waiter: _ControlWaiter | None = None
+        self._write_lock = asyncio.Lock()
+        self._flush_waiters: set[asyncio.Future[None]] = set()
         # Channels whose topic the server has answered, with 331 or 332.
         self._topics: set[str] = set()
         self._batches: dict[str, _IncomingBatch] = {}
@@ -180,6 +196,98 @@ class IRCClient:
         for fragment in fragments[1:]:
             await self.send_tagmsg(target, MappingProxyType({PROTOCOL_TAG: fragment}))
 
+    def register_channel(self, channel: str) -> None:
+        value = self._valid_channel(channel)
+        if value not in self._accepted_channels:
+            self._channel_order.append(value)
+            self._accepted_channels.add(value)
+            self._ready.clear()
+
+    def unregister_channel(self, channel: str) -> None:
+        value = self._valid_channel(channel)
+        self._accepted_channels.discard(value)
+        self._channel_order = [channel for channel in self._channel_order if channel != value]
+        self._joined.discard(value)
+        self._topics.discard(value)
+        if (
+            self._writer_task is not None
+            and not self._writer_task.done()
+            and self._joined == self._topics == self._accepted_channels
+        ):
+            self._ready.set()
+
+    async def join_channel(self, channel: str, timeout: float = 10) -> None:
+        value = self._registered_channel(channel)
+        if value in self._joined:
+            return
+        await self._control("join", value, (f"JOIN {value}",), timeout)
+
+    async def set_private(self, channel: str, timeout: float = 10) -> None:
+        value = self._registered_channel(channel)
+        await self._control(
+            "mode",
+            value,
+            (f"MODE {value} +is", f"MODE {value}"),
+            timeout,
+        )
+
+    async def set_topic(self, channel: str, topic: str, timeout: float = 10) -> None:
+        value = self._registered_channel(channel)
+        if "\r" in topic or "\n" in topic:
+            raise IRCError("IRC topic contains a line break")
+        await self._control("topic", value, (f"TOPIC {value} :{topic}",), timeout, topic=topic)
+        if self._joined == self._topics == self._accepted_channels:
+            self._ready.set()
+
+    async def invite(self, channel: str, nick: str, timeout: float = 10) -> None:
+        value = self._registered_channel(channel)
+        target = self._valid_nick(nick)
+        await self._control(
+            "invite",
+            value,
+            (f"INVITE {target} {value}",),
+            timeout,
+            nick=target,
+        )
+
+    async def _control(
+        self,
+        kind: str,
+        channel: str,
+        commands: tuple[str, ...],
+        timeout: float,
+        *,
+        topic: str = "",
+        nick: str = "",
+    ) -> None:
+        async with self._control_lock:
+            future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+            self._control_waiter = _ControlWaiter(kind, channel, future, topic, nick)
+            try:
+                for command in commands:
+                    await self._write_line(command)
+                await asyncio.wait_for(future, timeout)
+            except TimeoutError as exc:
+                raise IRCError(f"timed out waiting for {kind} confirmation in {channel}") from exc
+            finally:
+                self._control_waiter = None
+
+    async def flush(self) -> None:
+        if self._writer_task is None or self._writer_task.done():
+            raise IRCError("IRC writer is not running")
+        future = asyncio.get_running_loop().create_future()
+        self._flush_waiters.add(future)
+        try:
+            await self._outgoing.put(_OutgoingMessage("", command="FLUSH", done=future))
+            await future
+        finally:
+            self._flush_waiters.discard(future)
+
+    async def part_channel(self, channel: str, timeout: float = 10) -> None:
+        value = self._registered_channel(channel)
+        await self._control("part", value, (f"PART {value} :session closed",), timeout)
+        self.unregister_channel(value)
+
     async def _run(self) -> None:
         delay = 0.5
         while not self._closed:
@@ -228,6 +336,8 @@ class IRCClient:
         reader_task = asyncio.create_task(self._read_messages(reader), name="irc-reader")
         writer_task = asyncio.create_task(self._write_messages(), name="irc-writer")
         self._writer_task = writer_task
+        if self._joined == self._topics == self._accepted_channels:
+            self._ready.set()
         try:
             done, _pending = await asyncio.wait(
                 {reader_task, writer_task}, return_when=asyncio.FIRST_COMPLETED
@@ -335,7 +445,7 @@ class IRCClient:
             self.account or "<unconfirmed>",
         )
         await self._write_line(f"MODE {self.config.nickname} +B")
-        for channel in self.config.channels:
+        for channel in self._channel_order:
             await self._write_line(f"JOIN {channel}")
             # A server sends RPL_TOPIC unsolicited only when a topic is set, and
             # sends nothing at all for a channel that has none. Activation is
@@ -344,7 +454,7 @@ class IRCClient:
             # one whose topic had not arrived yet: silent, suspended, forever.
             # Asking explicitly guarantees exactly one 331 or 332 per channel.
             await self._write_line(f"TOPIC {channel}")
-        expected = set(self.config.channels)
+        expected = set(self._accepted_channels)
         while self._joined != expected or self._topics != expected:
             raw = await reader.readline()
             if not raw:
@@ -358,7 +468,6 @@ class IRCClient:
             # waits for the topic of every channel, not merely the last JOIN
             # echo, so no reply is left unread behind the loop either.
             await self._handle_line(line)
-        self._ready.set()
 
     def _note_account(self, account: str, source: str) -> None:
         value = account.strip().lower()
@@ -383,23 +492,30 @@ class IRCClient:
             # tag the server attributed it to, which is the identity clients
             # authenticate events against.
             self._note_account(str(line.tags.get("account") or ""), "own echoed message")
+        if self._handle_control_reply(line, nick):
+            return
         if line.command == "KICK" and len(line.params) >= 2:
             channel, target = line.params[:2]
-            if target.lower() == self.config.nickname.lower():
-                LOGGER.warning("kicked from %s; rejoining", channel.lower())
-                self._joined.discard(channel.lower())
-                self._topics.discard(channel.lower())
-                await self._write_line(f"JOIN {channel}")
+            value = channel.lower()
+            if target.lower() == self.config.nickname.lower() and value in self._accepted_channels:
+                LOGGER.warning("kicked from %s; rejoining", value)
+                self._joined.discard(value)
+                self._topics.discard(value)
+                await self._write_line(f"JOIN {value}")
                 # Re-ask, for the same reason the join sequence asks.
-                await self._write_line(f"TOPIC {channel}")
+                await self._write_line(f"TOPIC {value}")
                 self._ready.clear()
             return
         if line.command == "JOIN" and nick.lower() == self.config.nickname.lower():
             channel = line.params[0].lower()
-            if channel in self.config.channels:
+            if channel in self._accepted_channels:
                 LOGGER.info("joined %s", channel)
                 self._joined.add(channel)
-                if self._joined == self._topics == set(self.config.channels):
+                if (
+                    self._writer_task is not None
+                    and not self._writer_task.done()
+                    and self._joined == self._topics == self._accepted_channels
+                ):
                     self._ready.set()
             else:
                 LOGGER.info("parting %s: not a configured bridge channel", channel)
@@ -409,7 +525,7 @@ class IRCClient:
             batch_id = line.params[0]
             if PROTOCOL_TAG in line.tags and len(line.params) >= 3 and batch_id.startswith("+"):
                 channel = line.params[2].lower()
-                if channel in self.config.channels:
+                if channel in self._accepted_channels:
                     await self._messages.put(
                         IRCMessage(
                             channel=channel,
@@ -450,7 +566,7 @@ class IRCClient:
                 channel, text = line.params[0].lower(), line.params[1]
             else:
                 return
-            if channel in self.config.channels:
+            if channel in self._accepted_channels:
                 LOGGER.info(
                     "%s: topic reply %s received (%s)",
                     channel,
@@ -458,7 +574,11 @@ class IRCClient:
                     "no topic is set" if line.command == "331" else "topic present",
                 )
                 self._topics.add(channel)
-                if self._joined == self._topics == set(self.config.channels):
+                if (
+                    self._writer_task is not None
+                    and not self._writer_task.done()
+                    and self._joined == self._topics == self._accepted_channels
+                ):
                     self._ready.set()
                 await self._messages.put(
                     IRCMessage(
@@ -476,7 +596,7 @@ class IRCClient:
         if len(line.params) < (2 if line.command == "PRIVMSG" else 1):
             return
         channel = line.params[0].lower()
-        if channel not in self.config.channels:
+        if channel not in self._accepted_channels:
             if PROTOCOL_TAG in line.tags:
                 LOGGER.warning(
                     "dropped a protocol %s from %s: %s is not a configured bridge channel",
@@ -507,50 +627,142 @@ class IRCClient:
     async def _write_messages(self) -> None:
         while not self._closed:
             message = await self._outgoing.get()
-            target, text = message.target, message.text
-            LOGGER.debug(
-                "outgoing %s to %s waited %.1f ms (queue depth %d)",
-                message.command,
-                target,
-                (time.monotonic() - message.queued_at) * 1000,
-                self._outgoing.qsize(),
-            )
-            if message.command == "TAGMSG":
-                await self._write_line(f"{_format_tags(message.tags)}TAGMSG {target}")
-                continue
-            lines: list[str] = []
-            for logical in text.splitlines() or [text]:
-                remaining = logical
-                while len(remaining.encode("utf-8")) > 350:
-                    piece = truncate_utf8(remaining, 350)
-                    lines.append(piece)
-                    remaining = remaining[len(piece) :]
-                lines.append(remaining or " ")
-            # A multiline batch carries PRIVMSG lines, so only a PRIVMSG may use
-            # it; a NOTICE is always sent as discrete lines.
-            if (
-                len(lines) > 1
-                and message.command == "PRIVMSG"
-                and {"batch", "draft/multiline"} <= self._caps
-            ):
-                batch_id = f"bridge-{secrets.token_hex(4)}"
-                tag_prefix = _format_tags(message.tags) if message.tags else ""
-                await self._write_line(f"{tag_prefix}BATCH +{batch_id} draft/multiline {target}")
-                for item in lines:
-                    await self._write_line(f"@batch={batch_id} PRIVMSG {target} :{item}")
-                await self._write_line(f"BATCH -{batch_id}")
-            else:
-                for item in lines:
+            try:
+                if message.command == "FLUSH":
+                    if message.done is not None and not message.done.done():
+                        message.done.set_result(None)
+                    continue
+                target, text = message.target, message.text
+                LOGGER.debug(
+                    "outgoing %s to %s waited %.1f ms (queue depth %d)",
+                    message.command,
+                    target,
+                    (time.monotonic() - message.queued_at) * 1000,
+                    self._outgoing.qsize(),
+                )
+                if message.command == "TAGMSG":
+                    await self._write_line(f"{_format_tags(message.tags)}TAGMSG {target}")
+                    continue
+                lines: list[str] = []
+                for logical in text.splitlines() or [text]:
+                    remaining = logical
+                    while len(remaining.encode("utf-8")) > 350:
+                        piece = truncate_utf8(remaining, 350)
+                        lines.append(piece)
+                        remaining = remaining[len(piece) :]
+                    lines.append(remaining or " ")
+                # A multiline batch carries PRIVMSG lines, so only a PRIVMSG may use
+                # it; a NOTICE is always sent as discrete lines.
+                if (
+                    len(lines) > 1
+                    and message.command == "PRIVMSG"
+                    and {"batch", "draft/multiline"} <= self._caps
+                ):
+                    batch_id = f"bridge-{secrets.token_hex(4)}"
                     tag_prefix = _format_tags(message.tags) if message.tags else ""
-                    await self._write_line(f"{tag_prefix}{message.command} {target} :{item}")
+                    await self._write_line(
+                        f"{tag_prefix}BATCH +{batch_id} draft/multiline {target}"
+                    )
+                    for item in lines:
+                        await self._write_line(f"@batch={batch_id} PRIVMSG {target} :{item}")
+                    await self._write_line(f"BATCH -{batch_id}")
+                else:
+                    for item in lines:
+                        tag_prefix = _format_tags(message.tags) if message.tags else ""
+                        await self._write_line(f"{tag_prefix}{message.command} {target} :{item}")
+            finally:
+                self._outgoing.task_done()
 
     async def _write_line(self, line: str) -> None:
-        if self._writer is None or self._writer.is_closing():
-            raise IRCError("IRC is not connected")
-        self._writer.write(f"{line}\r\n".encode())
-        await self._writer.drain()
+        async with self._write_lock:
+            if self._writer is None or self._writer.is_closing():
+                raise IRCError("IRC is not connected")
+            self._writer.write(f"{line}\r\n".encode())
+            await self._writer.drain()
+
+    def _handle_control_reply(self, line: IRCLine, nick: str) -> bool:
+        waiter = self._control_waiter
+        if waiter is None or waiter.future.done():
+            return False
+        channel = next((param.lower() for param in line.params if param.startswith("#")), "")
+        if waiter.kind == "join" and line.command == "JOIN":
+            if nick.lower() == self.config.nickname.lower() and channel == waiter.channel:
+                self._joined.add(channel)
+                waiter.future.set_result(None)
+                return True
+        elif waiter.kind == "mode" and line.command == "324" and channel == waiter.channel:
+            index = next(i for i, param in enumerate(line.params) if param.lower() == channel)
+            modes = line.params[index + 1] if index + 1 < len(line.params) else ""
+            enabled: set[str] = set()
+            adding = True
+            for char in modes:
+                if char == "+":
+                    adding = True
+                elif char == "-":
+                    adding = False
+                elif char in {"i", "s"}:
+                    (enabled.add if adding else enabled.discard)(char)
+            if enabled == {"i", "s"}:
+                waiter.future.set_result(None)
+            else:
+                waiter.future.set_exception(IRCError("IRC did not apply private channel modes"))
+            return True
+        elif waiter.kind == "topic" and line.command == "TOPIC":
+            if (
+                nick.lower() == self.config.nickname.lower()
+                and channel == waiter.channel
+                and len(line.params) >= 2
+                and line.params[-1] == waiter.topic
+            ):
+                self._topics.add(channel)
+                waiter.future.set_result(None)
+                return True
+        elif waiter.kind == "invite" and line.command == "341":
+            if channel == waiter.channel and any(
+                param.lower() == waiter.nick.lower() for param in line.params
+            ):
+                waiter.future.set_result(None)
+                return True
+        elif (
+            waiter.kind == "part"
+            and line.command == "PART"
+            and nick.lower() == self.config.nickname.lower()
+            and channel == waiter.channel
+        ):
+            self._joined.discard(channel)
+            self._topics.discard(channel)
+            waiter.future.set_result(None)
+            return True
+
+        errors = {
+            "join": {"403", "405", "471", "473", "474", "475", "477"},
+            "mode": {"403", "442", "472", "482"},
+            "topic": {"403", "442", "482"},
+            "invite": {"401", "403", "442", "443", "482"},
+            "part": {"403", "442"},
+        }
+        if line.command not in errors[waiter.kind]:
+            return False
+        if channel and channel != waiter.channel:
+            return False
+        if (
+            waiter.kind == "invite"
+            and line.command == "401"
+            and not any(param.lower() == waiter.nick.lower() for param in line.params)
+        ):
+            return False
+        waiter.future.set_exception(IRCError(f"IRC rejected {waiter.kind} ({line.command})"))
+        return True
 
     async def _close_connection(self) -> None:
+        waiter = self._control_waiter
+        if waiter is not None and not waiter.future.done():
+            waiter.future.set_exception(IRCError("IRC connection closed before control reply"))
+        for flush_waiter in self._flush_waiters:
+            if not flush_waiter.done():
+                flush_waiter.set_exception(
+                    IRCError("IRC connection closed before outgoing messages flushed")
+                )
         if self._writer_task is not None:
             self._writer_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -565,3 +777,32 @@ class IRCClient:
     @staticmethod
     def _nick(prefix: str | None) -> str:
         return (prefix or "").split("!", 1)[0]
+
+    @staticmethod
+    def _valid_channel(channel: str) -> str:
+        value = channel.lower()
+        if (
+            len(value.encode("utf-8")) > 50
+            or not value.startswith("#")
+            or len(value) == 1
+            or any(ord(char) < 0x21 or char in ",:" for char in value)
+        ):
+            raise IRCError("invalid IRC channel")
+        return value
+
+    def _registered_channel(self, channel: str) -> str:
+        value = self._valid_channel(channel)
+        if value not in self._accepted_channels:
+            raise IRCError(f"IRC channel is not registered: {value}")
+        return value
+
+    @staticmethod
+    def _valid_nick(nick: str) -> str:
+        if (
+            not nick
+            or len(nick.encode("utf-8")) > 30
+            or nick[0].isdigit()
+            or any(ord(char) < 0x21 or char in " ,:*?!@." for char in nick)
+        ):
+            raise IRCError("invalid IRC nickname")
+        return nick

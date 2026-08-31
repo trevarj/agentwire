@@ -19,7 +19,7 @@
         "k": {
           "enum": [
             "sync.request", "workspace.list.request", "session.list.request",
-            "history.request", "session.create", "session.attach", "session.detach",
+            "history.request", "session.create", "session.close", "session.attach", "session.detach",
             "session.rename", "session.fork", "session.archive", "session.unarchive",
             "settings.update", "turn.prompt", "turn.steer", "turn.cancel",
             "queue.edit", "queue.move", "queue.delete", "queue.clear",

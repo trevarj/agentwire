@@ -19,6 +19,7 @@ from agentwire.config import (
     Config,
     IRCConfig,
     OpenCodeConfig,
+    PiConfig,
     SecretsConfig,
     StackConfig,
 )
@@ -40,12 +41,12 @@ class FakeIRC:
         self.incoming: asyncio.Queue[Any] = asyncio.Queue()
         self.sent: list[tuple[str, Any, str | None]] = []
         self.notices: list[tuple[str, str]] = []
+        self.operations: list[tuple[str, ...]] = []
+        self.accepted: set[str] = set()
         # The account the server confirmed; empty until SASL reports one.
         self.account = account
 
     async def start(self) -> None: ...
-
-    async def wait_ready(self, timeout: float = 30) -> None: ...
 
     async def close(self) -> None: ...
 
@@ -54,9 +55,40 @@ class FakeIRC:
 
     async def send_protocol(self, channel: str, envelope: Any, preview: str | None = None) -> None:
         self.sent.append((channel, envelope, preview))
+        self.operations.append(("event", channel, envelope.kind))
 
     async def send_notice(self, channel: str, text: str) -> None:
         self.notices.append((channel, text))
+
+    def register_channel(self, channel: str) -> None:
+        self.accepted.add(channel)
+        self.operations.append(("register", channel))
+
+    def unregister_channel(self, channel: str) -> None:
+        self.accepted.discard(channel)
+        self.operations.append(("unregister", channel))
+
+    async def wait_ready(self, timeout: float = 30) -> None:
+        self.operations.append(("ready",))
+
+    async def join_channel(self, channel: str) -> None:
+        self.operations.append(("join", channel))
+
+    async def set_private(self, channel: str) -> None:
+        self.operations.append(("mode", channel, "+is"))
+
+    async def set_topic(self, channel: str, topic: str) -> None:
+        self.operations.append(("topic", channel, topic))
+
+    async def invite(self, channel: str, nick: str) -> None:
+        self.operations.append(("invite", channel, nick))
+
+    async def flush(self) -> None:
+        self.operations.append(("flush",))
+
+    async def part_channel(self, channel: str) -> None:
+        self.operations.append(("part", channel))
+        self.accepted.discard(channel)
 
 
 class FakeBackend(Backend):
@@ -69,6 +101,9 @@ class FakeBackend(Backend):
         self.settings: dict[str, Any] = {}
         self.sessions: list[SessionSummary] | None = None
         self.session_counts: dict[str, int] = {}
+        self.created_session_id = "s1"
+        self.closed_sessions: list[str] = []
+        self.attached_sessions: list[str] = []
         self._events: asyncio.Queue[BackendEvent] = asyncio.Queue()
 
     def count_sessions(self, cwd: str) -> int | None:
@@ -96,9 +131,13 @@ class FakeBackend(Backend):
         return [SessionSummary("s1", self.workspace, "session")]
 
     async def create_session(self, cwd: str) -> SessionSummary:
-        return SessionSummary("s1", cwd, "session")
+        return SessionSummary(self.created_session_id, cwd, "session")
+
+    async def close_session(self, session_id: str) -> None:
+        self.closed_sessions.append(session_id)
 
     async def attach_session(self, session_id: str, cwd: str | None = None) -> SessionSummary:
+        self.attached_sessions.append(session_id)
         return SessionSummary(session_id, cwd or self.workspace, "session")
 
     async def configure_session(self, session_id: str, settings: Any) -> None:
@@ -143,9 +182,13 @@ def make_bridge(
     owner: str = "trev",
     account: str = "",
     channels: Mapping[str, str] | None = None,
+    backend_name: str = "codex",
+    dedicated_channels: bool = False,
 ) -> tuple[Bridge, FakeIRC, FakeBackend]:
     irc = FakeIRC(account)
     backend = FakeBackend(str(tmp_path))
+    backend.name = backend_name
+    configured_channels = dict(channels or {f"#{backend_name}": backend_name})
     config = Config(
         path=tmp_path / "config.toml",
         bridge=BridgeConfig(owner, (tmp_path,), tmp_path / "state.sqlite3", 2),
@@ -159,15 +202,20 @@ def make_bridge(
             "bridge",
             "bridge",
             "IRC_PASSWORD",
-            MappingProxyType(dict(channels or {"#codex": "codex"})),
+            MappingProxyType(configured_channels),
         ),
         codex=CodexConfig(tmp_path / "codex.sock", "codex"),
         opencode=OpenCodeConfig(
             "http://127.0.0.1:14096", "opencode", "OPENCODE_PASSWORD", "opencode"
         ),
         stack=StackConfig("ssh", "host", 16698, "127.0.0.1", 6698, "/cert", 14096, 30),
+        pi=(
+            PiConfig("pi", tmp_path / "sockets", tmp_path / "sessions", dedicated_channels)
+            if backend_name == "pi"
+            else None
+        ),
     )
-    return Bridge(config, irc, {"codex": backend}), irc, backend  # type: ignore[arg-type]
+    return Bridge(config, irc, {backend_name: backend}), irc, backend  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio
@@ -179,7 +227,7 @@ async def test_action_workers_preserve_channel_independence(tmp_path: Path) -> N
     release_first = asyncio.Event()
     second_done = asyncio.Event()
 
-    async def dispatch(channel: str, _action: Envelope) -> None:
+    async def dispatch(channel: str, _action: Envelope, _requester_nick: str = "") -> None:
         if channel == "#first":
             first_started.set()
             await release_first.wait()
@@ -191,9 +239,9 @@ async def test_action_workers_preserve_channel_independence(tmp_path: Path) -> N
     try:
         now = asyncio.get_running_loop().time()
         action = new_envelope("sync.request", "action", "client", device="phone")
-        await bridge._action_queues["#first"].put((action, now))
+        await bridge._action_queues["#first"].put((action, now, "trev"))
         await first_started.wait()
-        await bridge._action_queues["#second"].put((action, now))
+        await bridge._action_queues["#second"].put((action, now, "trev"))
         await asyncio.wait_for(second_done.wait(), 0.5)
         assert not release_first.is_set()
     finally:
@@ -664,6 +712,317 @@ async def test_history_events_are_packed_into_chunks(tmp_path: Path) -> None:
         "history.end",
     ]
     assert len(irc.sent[1][1].data["events"]) == 100
+
+
+@pytest.mark.asyncio
+async def test_pi_dedicated_create_preserves_source_and_invites_requester(tmp_path: Path) -> None:
+    bridge, irc, backend = make_bridge(
+        tmp_path,
+        channels={"#pi": "pi"},
+        backend_name="pi",
+        dedicated_channels=True,
+    )
+    backend.created_session_id = "2026-08-24T12-00-00-000Z_11111111-1111-7111-8111-111111111111"
+    await bridge._handle_topic("#pi", "agentwire:v1;account=trev;agent=bridge;backend=pi")
+    source = ChannelBinding("pi", "existing", str(tmp_path))
+    bridge.channels["#pi"].binding = source
+    await bridge.state.set("#pi", source)
+    action = new_envelope(
+        "session.create",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        data={"cwd": str(tmp_path)},
+    )
+
+    await bridge._handle_action("#pi", action, "Alice")
+
+    managed = "#pi-11111111"
+    assert bridge.channels["#pi"].binding == source
+    assert bridge.channels[managed].binding == ChannelBinding(
+        "pi", backend.created_session_id, str(tmp_path)
+    )
+    assert ("invite", managed, "Alice") in irc.operations
+    assert [
+        operation[0]
+        for operation in irc.operations
+        if operation[0] in {"join", "mode", "topic", "invite"}
+    ] == ["join", "mode", "topic", "invite"]
+    assert managed not in await bridge.state.load()
+
+    irc.sent.clear()
+    await bridge._emit_hello(managed)
+    actions = next(event.data["actions"] for _, event, _ in irc.sent if event.kind == "agent.hello")
+    assert "session.close" in actions
+    assert "session.create" not in actions
+
+    restored, restored_irc, restored_backend = make_bridge(
+        tmp_path,
+        channels={"#pi": "pi"},
+        backend_name="pi",
+        dedicated_channels=True,
+    )
+    await restored._restore_bindings()
+    assert managed not in restored_irc.accepted
+    assert managed not in restored.channels
+    assert restored_backend.attached_sessions == ["existing"]
+
+
+@pytest.mark.asyncio
+async def test_pi_dedicated_create_rolls_back_channel_and_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, irc, backend = make_bridge(
+        tmp_path,
+        channels={"#pi": "pi"},
+        backend_name="pi",
+        dedicated_channels=True,
+    )
+    backend.created_session_id = "2026-08-24T12-00-00-000Z_aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa"
+    await bridge._handle_topic("#pi", "agentwire:v1;account=trev;agent=bridge;backend=pi")
+
+    async def reject_invite(_channel: str, _nick: str) -> None:
+        raise RuntimeError("invite failed")
+
+    monkeypatch.setattr(irc, "invite", reject_invite)
+    action = new_envelope(
+        "session.create",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        data={"cwd": str(tmp_path)},
+    )
+
+    with pytest.raises(RuntimeError, match="invite failed"):
+        await bridge._action_create("#pi", action, "Alice")
+
+    assert backend.closed_sessions == [backend.created_session_id]
+    assert "#pi-aaaaaaaa" not in bridge.channels
+    assert "#pi-aaaaaaaa" not in irc.accepted
+    assert "#pi-aaaaaaaa" not in await bridge.state.load()
+
+
+@pytest.mark.asyncio
+async def test_managed_pi_reconnect_recreates_private_channel_only_when_topic_is_missing(
+    tmp_path: Path,
+) -> None:
+    bridge, irc, backend = make_bridge(
+        tmp_path,
+        channels={"#pi": "pi"},
+        backend_name="pi",
+        dedicated_channels=True,
+    )
+    backend.created_session_id = "2026-08-24T12-00-00-000Z_bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb"
+    await bridge._handle_topic("#pi", "agentwire:v1;account=trev;agent=bridge;backend=pi")
+    await bridge._action_create(
+        "#pi",
+        new_envelope(
+            "session.create",
+            "action",
+            "client",
+            epoch=bridge.epoch,
+            device="phone",
+            data={"cwd": str(tmp_path)},
+        ),
+        "Alice",
+    )
+    managed = "#pi-bbbbbbbb"
+    topic = "agentwire:v1;account=trev;agent=bridge;backend=pi"
+
+    irc.operations.clear()
+    await bridge._handle_managed_topic(IRCMessage(managed, "", "server", "", command="331"))
+    assert [operation[0] for operation in irc.operations] == ["ready", "mode", "topic"]
+    assert bridge.channels[managed].activation is not None
+
+    irc.operations.clear()
+    await bridge._handle_managed_topic(IRCMessage(managed, "", "server", topic, command="332"))
+    assert irc.operations == []
+    assert bridge.channels[managed].activation is not None
+
+
+@pytest.mark.asyncio
+async def test_pi_dedicated_create_disabled_keeps_static_binding(tmp_path: Path) -> None:
+    bridge, irc, backend = make_bridge(
+        tmp_path,
+        channels={"#pi": "pi"},
+        backend_name="pi",
+        dedicated_channels=False,
+    )
+    backend.created_session_id = "2026-08-24T12-00-00-000Z_22222222-2222-7222-8222-222222222222"
+    await bridge._handle_topic("#pi", "agentwire:v1;account=trev;agent=bridge;backend=pi")
+    action = new_envelope(
+        "session.create",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        data={"cwd": str(tmp_path)},
+    )
+
+    await bridge._handle_action("#pi", action, "Alice")
+
+    assert bridge.channels["#pi"].binding is not None
+    assert bridge.channels["#pi"].binding.session_id == backend.created_session_id
+    assert not any(operation[0] == "join" for operation in irc.operations)
+
+
+@pytest.mark.asyncio
+async def test_managed_pi_close_is_safe_and_succeeds_before_part(tmp_path: Path) -> None:
+    bridge, irc, backend = make_bridge(
+        tmp_path,
+        channels={"#pi": "pi"},
+        backend_name="pi",
+        dedicated_channels=True,
+    )
+    backend.created_session_id = "2026-08-24T12-00-00-000Z_33333333-3333-7333-8333-333333333333"
+    await bridge._handle_topic("#pi", "agentwire:v1;account=trev;agent=bridge;backend=pi")
+    create = new_envelope(
+        "session.create",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        data={"cwd": str(tmp_path)},
+    )
+    await bridge._handle_action("#pi", create, "Alice")
+    managed = "#pi-33333333"
+    irc.operations.clear()
+
+    recursive = new_envelope(
+        "session.create",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        data={"cwd": str(tmp_path)},
+    )
+    await bridge._handle_action(managed, recursive, "Alice")
+    assert irc.sent[-1][1].kind == "action.failed"
+
+    wrong = new_envelope(
+        "session.close",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        session_id="wrong",
+    )
+    await bridge._handle_action(managed, wrong, "Alice")
+    assert irc.sent[-1][1].kind == "action.failed"
+    assert managed in bridge.channels
+
+    close = new_envelope(
+        "session.close",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        session_id=backend.created_session_id,
+    )
+    queue = bridge._action_queues[managed]
+    bridge._start_action_worker(managed)
+    worker = bridge._action_workers[managed]
+    await queue.put((close, asyncio.get_running_loop().time(), "Alice"))
+    await asyncio.wait_for(queue.join(), 1)
+    await asyncio.wait_for(worker, 1)
+
+    assert backend.closed_sessions == [backend.created_session_id]
+    assert managed not in bridge.channels
+    assert managed not in bridge._action_workers
+    assert managed not in await bridge.state.load()
+    succeeded = irc.operations.index(("event", managed, "action.succeeded"))
+    parted = irc.operations.index(("part", managed))
+    assert succeeded < parted
+    assert ("topic", managed, "") in irc.operations
+
+    static_close = new_envelope(
+        "session.close",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        session_id="static",
+    )
+    bridge.channels["#pi"].binding = ChannelBinding("pi", "static", str(tmp_path))
+    await bridge._handle_action("#pi", static_close, "Alice")
+    assert backend.closed_sessions == [backend.created_session_id]
+    assert irc.sent[-1][1].kind == "action.failed"
+
+
+@pytest.mark.asyncio
+async def test_managed_pi_close_retries_after_reconnect_without_respawning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, irc, backend = make_bridge(
+        tmp_path,
+        channels={"#pi": "pi"},
+        backend_name="pi",
+        dedicated_channels=True,
+    )
+    backend.created_session_id = "2026-08-24T12-00-00-000Z_44444444-4444-7444-8444-444444444444"
+    await bridge._handle_topic("#pi", "agentwire:v1;account=trev;agent=bridge;backend=pi")
+    await bridge._action_create(
+        "#pi",
+        new_envelope(
+            "session.create",
+            "action",
+            "client",
+            epoch=bridge.epoch,
+            device="phone",
+            data={"cwd": str(tmp_path)},
+        ),
+        "Alice",
+    )
+    managed = "#pi-44444444"
+    attempts = 0
+
+    async def flaky_flush() -> None:
+        nonlocal attempts
+        attempts += 1
+        irc.operations.append(("flush-failed" if attempts == 1 else "flush",))
+        if attempts == 1:
+            raise RuntimeError("disconnected")
+
+    monkeypatch.setattr(irc, "flush", flaky_flush)
+    irc.operations.clear()
+    close = new_envelope(
+        "session.close",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        session_id=backend.created_session_id,
+    )
+    await bridge._handle_action(managed, close, "Alice")
+
+    assert [event.kind for channel, event, _ in irc.sent if channel == managed][-1] == (
+        "action.succeeded"
+    )
+    assert managed in bridge.channels
+    assert managed in bridge._closing_channels
+    assert bridge.channels[managed].binding is None
+    assert not any(operation[0] == "part" for operation in irc.operations)
+
+    await bridge._handle_managed_topic(
+        IRCMessage(
+            managed,
+            "",
+            "server",
+            "agentwire:v1;account=trev;agent=bridge;backend=pi",
+            command="332",
+        )
+    )
+
+    assert backend.closed_sessions == [backend.created_session_id]
+    assert managed not in bridge.channels
+    assert [operation[0] for operation in irc.operations[-4:]] == [
+        "ready",
+        "flush",
+        "topic",
+        "part",
+    ]
 
 
 @pytest.mark.asyncio

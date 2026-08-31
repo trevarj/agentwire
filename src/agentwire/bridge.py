@@ -51,6 +51,9 @@ READ_ACTION_KINDS = frozenset(
 # Diagnostics name channels, accounts, kinds, and reasons. They never carry
 # prompt text, tool output, tag values, or credentials.
 LOGGER = logging.getLogger("agentwire.bridge")
+_PI_SESSION_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}"
+)
 _SENSITIVE_QUESTION_RE = re.compile(
     r"\b(?:password|passphrase|secret|api[ _-]?key|access[ _-]?token|"
     r"private[ _-]?key|credential)\b",
@@ -109,18 +112,18 @@ class Bridge:
         self.irc = irc
         self.backends = backends
         self.state = StateStore(config.bridge.state_file)
-        self.channels = {
-            channel: ChannelRuntime(backend=backend)
-            for channel, backend in config.irc.channels.items()
-        }
+        self.channels: dict[str, ChannelRuntime] = {}
         self.instance = str(uuid.uuid4())
         self.epoch = secrets.token_urlsafe(24)
-        self._reassemblers = {channel: Reassembler() for channel in self.channels}
-        self._action_queues: dict[str, asyncio.Queue[tuple[Envelope, float]]] = {
-            channel: asyncio.Queue() for channel in self.channels
-        }
+        self._reassemblers: dict[str, Reassembler] = {}
+        self._action_queues: dict[str, asyncio.Queue[tuple[Envelope, float, str]]] = {}
+        self._action_workers: dict[str, asyncio.Task[None]] = {}
         self._tasks: list[asyncio.Task[None]] = []
+        self._managed_channels: set[str] = set()
+        self._closing_channels: set[str] = set()
         self._closed = False
+        for channel, backend in config.irc.channels.items():
+            self._install_channel(channel, backend)
         # Configured channels whose topic reply has been evaluated at least once, and whether
         # the post-registration summary has already been announced for this process.
         self._topics_evaluated: set[str] = set()
@@ -143,19 +146,52 @@ class Bridge:
             self._tasks = [
                 asyncio.create_task(self._irc_loop(), name="bridge-irc"),
                 *(
-                    asyncio.create_task(
-                        self._action_loop(channel), name=f"bridge-{channel}-actions"
-                    )
-                    for channel in self.channels
-                ),
-                *(
                     asyncio.create_task(self._backend_loop(backend), name=f"bridge-{name}-events")
                     for name, backend in self.backends.items()
                 ),
             ]
+            for channel in self.channels:
+                self._start_action_worker(channel)
             await asyncio.gather(*self._tasks)
         finally:
             await self.close()
+
+    def _install_channel(self, channel: str, backend: str) -> ChannelRuntime:
+        value = channel.lower()
+        runtime = self.channels.get(value)
+        if runtime is not None:
+            return runtime
+        runtime = ChannelRuntime(backend=backend)
+        self.channels[value] = runtime
+        self._reassemblers[value] = Reassembler()
+        self._action_queues[value] = asyncio.Queue()
+        if self._tasks:
+            self._start_action_worker(value)
+        return runtime
+
+    def _start_action_worker(self, channel: str) -> None:
+        if channel in self._action_workers:
+            return
+        task = asyncio.create_task(self._action_loop(channel), name=f"bridge-{channel}-actions")
+        self._action_workers[channel] = task
+        self._tasks.append(task)
+
+    async def _remove_channel(self, channel: str) -> None:
+        runtime = self.channels.pop(channel, None)
+        if runtime is not None:
+            for _payload, pending in runtime.observed_status_pending.values():
+                pending.cancel()
+            if runtime.subagents_pending is not None:
+                runtime.subagents_pending[1].cancel()
+        self._reassemblers.pop(channel, None)
+        self._action_queues.pop(channel, None)
+        self._managed_channels.discard(channel)
+        self._closing_channels.discard(channel)
+        task = self._action_workers.pop(channel, None)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     async def close(self) -> None:
         if self._closed:
@@ -209,13 +245,16 @@ class Bridge:
                 # what turns an unset topic into a stated fact rather than an
                 # absence indistinguishable from a reply that never arrived.
                 if message.command in {"TOPIC", "331", "332"}:
-                    self._topics_evaluated.add(message.channel)
-                    try:
-                        await self._handle_topic(message.channel, message.text)
-                    finally:
-                        # Runs even when validation raised, so a channel that failed for one
-                        # reason still counts toward the summary of what never came up.
-                        await self._report_inert_channels()
+                    if message.channel in self._managed_channels:
+                        await self._handle_managed_topic(message)
+                    else:
+                        self._topics_evaluated.add(message.channel)
+                        try:
+                            await self._handle_topic(message.channel, message.text)
+                        finally:
+                            # Runs even when validation raised, so a channel that failed for one
+                            # reason still counts toward the summary of what never came up.
+                            await self._report_inert_channels()
                     continue
                 value = message.tags.get(PROTOCOL_TAG)
                 if not isinstance(value, str):
@@ -238,7 +277,9 @@ class Bridge:
                     continue
                 envelope = self._reassemblers[message.channel].add(value)
                 if envelope is not None:
-                    await self._action_queues[message.channel].put((envelope, time.monotonic()))
+                    await self._action_queues[message.channel].put(
+                        (envelope, time.monotonic(), message.nick)
+                    )
                 else:
                     LOGGER.debug(
                         "%s: holding a fragment until its message is complete", message.channel
@@ -251,7 +292,7 @@ class Bridge:
     async def _action_loop(self, channel: str) -> None:
         queue = self._action_queues[channel]
         while True:
-            action, queued_at = await queue.get()
+            action, queued_at, requester_nick = await queue.get()
             try:
                 if self.channels[channel].activation is None:
                     LOGGER.info("%s: dropped queued action %s after suspension", channel, action.id)
@@ -263,7 +304,7 @@ class Bridge:
                     action.id,
                     (time.monotonic() - queued_at) * 1000,
                 )
-                await self._handle_action(channel, action)
+                await self._handle_action(channel, action, requester_nick)
             except (BackendError, ConfigError, ProtocolError, ValueError) as exc:
                 await self._emit_failure(channel, action.id, str(exc))
             except Exception:
@@ -271,6 +312,8 @@ class Bridge:
                 await self._emit_failure(channel, action.id, "unexpected bridge failure")
             finally:
                 queue.task_done()
+            if channel not in self.channels:
+                return
 
     def _is_own_message(self, message: IRCMessage) -> bool:
         return message.nick.lower() == self.config.irc.nickname.lower()
@@ -369,6 +412,33 @@ class Bridge:
                 ),
             )
 
+    async def _handle_managed_topic(self, message: IRCMessage) -> None:
+        channel = message.channel
+        runtime = self.channels[channel]
+        runtime.activation = None
+        if channel in self._closing_channels:
+            await self.irc.wait_ready()
+            await self._finish_channel_close(channel)
+            return
+        if message.command == "331":
+            topic = build_topic(
+                self.config.bridge.owner_account,
+                "pi",
+                agent=self._bridge_account,
+            )
+            try:
+                await self.irc.wait_ready()
+                await self.irc.set_private(channel)
+                await self.irc.set_topic(channel, topic)
+            except Exception as exc:
+                LOGGER.warning(
+                    "%s: private channel reconciliation failed (%s)", channel, type(exc).__name__
+                )
+                return
+            await self._handle_topic(channel, topic)
+            return
+        await self._handle_topic(channel, message.text)
+
     async def _handle_topic(self, channel: str, topic: str) -> None:
         runtime = self.channels[channel]
         # A topic change suspends the channel until the complete new marker validates.
@@ -440,7 +510,8 @@ class Bridge:
             runtime.binding = ChannelBinding(runtime.backend, summary.id, summary.cwd)
             runtime.busy = summary.busy
             runtime.active_turn = summary.active_turn_id
-            await self.state.set(channel, runtime.binding)
+            if channel not in self._managed_channels:
+                await self.state.set(channel, runtime.binding)
         # Client sync is authoritative bootstrap. Publishing the same hello and
         # snapshot here made every activation pay for both messages twice.
         if runtime.binding is not None and not runtime.busy:
@@ -448,6 +519,28 @@ class Bridge:
 
     async def _emit_hello(self, channel: str, reply: str | None = None) -> None:
         runtime = self.channels[channel]
+        actions = {
+            "sync.request",
+            "workspace.list.request",
+            "session.list.request",
+            "history.request",
+            "session.create",
+            "session.attach",
+            "session.detach",
+            "settings.update",
+            "turn.prompt",
+            "turn.steer",
+            "turn.cancel",
+            "queue.edit",
+            "queue.move",
+            "queue.delete",
+            "queue.clear",
+            "request.respond",
+            "request.skip",
+        }
+        if channel in self._managed_channels:
+            actions.difference_update({"session.create", "session.attach", "session.detach"})
+            actions.add("session.close")
         data: dict[str, Any] = {
             "protocol": "agentwire-irc-v1",
             "backend": runtime.backend,
@@ -467,27 +560,7 @@ class Bridge:
                     "requests",
                 }
             ),
-            "actions": sorted(
-                {
-                    "sync.request",
-                    "workspace.list.request",
-                    "session.list.request",
-                    "history.request",
-                    "session.create",
-                    "session.attach",
-                    "session.detach",
-                    "settings.update",
-                    "turn.prompt",
-                    "turn.steer",
-                    "turn.cancel",
-                    "queue.edit",
-                    "queue.move",
-                    "queue.delete",
-                    "queue.clear",
-                    "request.respond",
-                    "request.skip",
-                }
-            ),
+            "actions": sorted(actions),
             "limits": {
                 "contentBytes": MAX_CONTENT_BYTES,
                 "queueItems": self.config.bridge.queue_limit,
@@ -518,7 +591,9 @@ class Bridge:
             data=data,
         )
 
-    async def _handle_action(self, channel: str, action: Envelope) -> None:
+    async def _handle_action(
+        self, channel: str, action: Envelope, requester_nick: str = ""
+    ) -> None:
         if action.message_type != "action":
             # A relayed published event is never a command. Expected traffic,
             # so this stays below warning level.
@@ -553,7 +628,7 @@ class Bridge:
                 return
             await self._emit(channel, "action.accepted", reply=action.id)
         try:
-            await self._dispatch_action(channel, action)
+            await self._dispatch_action(channel, action, requester_nick)
         except (BackendError, ConfigError, ProtocolError, ValueError) as exc:
             detail = safe_one_line(str(exc), 1000)
             if tracked:
@@ -575,6 +650,8 @@ class Bridge:
         if tracked:
             await self.state.finish_action(action.id, "succeeded")
             await self._emit(channel, "action.succeeded", reply=action.id)
+        if channel in self._closing_channels:
+            await self._finish_channel_close(channel)
         LOGGER.debug(
             "%s: action %s (%s) completed in %.1f ms",
             channel,
@@ -583,13 +660,16 @@ class Bridge:
             (time.monotonic() - started) * 1000,
         )
 
-    async def _dispatch_action(self, channel: str, action: Envelope) -> None:
+    async def _dispatch_action(
+        self, channel: str, action: Envelope, requester_nick: str = ""
+    ) -> None:
         handlers = {
             "sync.request": self._action_sync,
             "workspace.list.request": self._action_workspaces,
             "session.list.request": self._action_sessions,
             "history.request": self._action_history,
             "session.create": self._action_create,
+            "session.close": self._action_close,
             "session.attach": self._action_attach,
             "session.detach": self._action_detach,
             "settings.update": self._action_settings,
@@ -606,7 +686,10 @@ class Bridge:
         handler = handlers.get(action.kind)
         if handler is None:
             raise ProtocolError(f"action is not advertised by this Agentwire: {action.kind}")
-        await handler(channel, action)
+        if action.kind == "session.create":
+            await self._action_create(channel, action, requester_nick)
+        else:
+            await handler(channel, action)
 
     async def _action_sync(self, channel: str, action: Envelope) -> None:
         await self._emit_hello(channel, reply=action.id)
@@ -811,15 +894,110 @@ class Bridge:
             chunks.append(current)
         return chunks
 
-    async def _action_create(self, channel: str, action: Envelope) -> None:
+    async def _action_create(
+        self, channel: str, action: Envelope, requester_nick: str = ""
+    ) -> None:
         cwd = str(
             resolve_workspace(self._data_string(action, "cwd"), self.config.bridge.allowed_roots)
         )
         runtime = self.channels[channel]
+        if channel in self._managed_channels:
+            raise ValueError("managed Pi channels cannot create another session")
         summary = await self.backends[runtime.backend].create_session(cwd)
-        await self._set_binding(channel, summary)
+        dedicated = (
+            runtime.backend == "pi"
+            and self.config.pi is not None
+            and self.config.pi.dedicated_channels
+            and channel in self.config.irc.channels
+        )
+        if not dedicated:
+            await self._set_binding(channel, summary)
+            return
+        if not requester_nick:
+            await self.backends[runtime.backend].close_session(summary.id)
+            raise ProtocolError("dedicated Pi session creation requires requester nickname")
+        try:
+            managed = self._pi_channel_name(summary.id)
+        except Exception:
+            await self.backends[runtime.backend].close_session(summary.id)
+            raise
+        binding = ChannelBinding("pi", summary.id, summary.cwd)
+        installed = False
+        try:
+            self.irc.register_channel(managed)
+            self._managed_channels.add(managed)
+            target = self._install_channel(managed, "pi")
+            installed = True
+            target.binding = binding
+            target.observed_sessions.add(summary.id)
+            target.busy = summary.busy
+            target.active_turn = summary.active_turn_id
+            await self.irc.join_channel(managed)
+            await self.irc.set_private(managed)
+            topic = build_topic(
+                self.config.bridge.owner_account,
+                "pi",
+                agent=self._bridge_account,
+            )
+            await self.irc.set_topic(managed, topic)
+            await self._handle_topic(managed, topic)
+            await self.irc.invite(managed, requester_nick)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await self.backends[runtime.backend].close_session(summary.id)
+            if installed:
+                with contextlib.suppress(Exception):
+                    await self.irc.set_topic(managed, "")
+                with contextlib.suppress(Exception):
+                    await self.irc.part_channel(managed)
+                await self._remove_channel(managed)
+            else:
+                self.irc.unregister_channel(managed)
+            raise
+
+    def _pi_channel_name(self, session_id: str) -> str:
+        match = _PI_SESSION_UUID_RE.search(session_id)
+        if match is None:
+            raise BackendError("pi returned a session id without a UUID")
+        value = uuid.UUID(match.group()).hex
+        for length in range(8, len(value) + 1, 4):
+            channel = f"#pi-{value[:length]}"
+            if channel not in self.channels:
+                return channel
+        raise BackendError("cannot allocate a unique Pi session channel")
+
+    async def _action_close(self, channel: str, action: Envelope) -> None:
+        if channel not in self._managed_channels:
+            raise ValueError("only a managed Pi channel can close its session")
+        runtime = self.channels[channel]
+        if action.session_id is None:
+            raise ProtocolError("session.close requires sid")
+        binding = self._require_binding(runtime, action)
+        if binding.backend != "pi":
+            raise ValueError("only a managed Pi session can be closed")
+        await self.state.set(channel, None)
+        await self.state.clear_queue(channel, binding.session_id)
+        await self.backends["pi"].close_session(binding.session_id)
+        runtime.binding = None
+        runtime.busy = False
+        runtime.active_turn = None
+        runtime.requests.clear()
+        self._reset_subagents(runtime)
+        self._closing_channels.add(channel)
+
+    async def _finish_channel_close(self, channel: str) -> None:
+        try:
+            await self.irc.flush()
+            await self.irc.set_topic(channel, "")
+            await self.irc.part_channel(channel)
+        except Exception as exc:
+            LOGGER.warning("%s: channel close deferred (%s)", channel, type(exc).__name__)
+            return
+        await self._remove_channel(channel)
 
     async def _action_attach(self, channel: str, action: Envelope) -> None:
+        if channel in self._managed_channels:
+            raise ValueError("managed Pi channels cannot switch sessions")
         runtime = self.channels[channel]
         session_id = action.session_id or self._data_string(action, "sid")
         cwd_value = action.data.get("cwd")
@@ -846,6 +1024,8 @@ class Bridge:
             await self._handle_backend_event(channel, event)
 
     async def _action_detach(self, channel: str, action: Envelope) -> None:
+        if channel in self._managed_channels:
+            raise ValueError("managed Pi channels cannot detach their session")
         runtime = self.channels[channel]
         previous = self._require_binding(runtime, action)
         runtime.binding = None
@@ -1280,7 +1460,8 @@ class Bridge:
         )
         runtime.busy = summary.busy
         runtime.active_turn = summary.active_turn_id
-        await self.state.set(channel, binding)
+        if channel not in self._managed_channels:
+            await self.state.set(channel, binding)
         await self._emit(
             channel,
             "binding.changed",

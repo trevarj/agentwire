@@ -190,7 +190,7 @@ The following kinds are defined. A client MUST enable only those listed in the `
 `agent.hello`.
 
 - Discovery: `sync.request`, `workspace.list.request`, `session.list.request`, `history.request`.
-- Binding: `session.create`, `session.attach`, `session.detach`.
+- Binding: `session.create`, `session.close`, `session.attach`, `session.detach`.
 - Optional lifecycle: `session.rename`, `session.fork`, `session.archive`, `session.unarchive`.
 - Settings: `settings.update`.
 - Turns: `turn.prompt`, `turn.steer`, `turn.cancel`.
@@ -198,11 +198,23 @@ The following kinds are defined. A client MUST enable only those listed in the `
 - Requests: `request.respond`, `request.skip`.
 
 This Agentwire advertises discovery, binding, settings, turns, queues, and requests. It does not
-advertise optional lifecycle operations until a backend can perform them safely. Session deletion
-is intentionally absent.
+advertise optional lifecycle operations until a backend can perform them safely. `session.close`
+is advertised only in a managed, dedicated Pi channel. It requires that channel's bound `sid`,
+stops only the bridge-owned `pi --mode rpc` process, preserves the session JSONL for later resume,
+then clears the topic and parts the managed channel. Static Pi channels and live TUI processes
+cannot be closed this way.
+
+With `[pi].dedicated_channels = true`, `session.create` on a configured static Pi channel leaves
+that channel's binding unchanged. Agentwire joins a collision-safe `#pi-<session-id-prefix>`
+channel, confirms invite-only and secret modes (`+is`), confirms its canonical activation topic,
+then invites the action sender's current nickname and confirms server acceptance. Managed channels
+survive IRC reconnects within the bridge process but are not restored after process restart; Pi's
+JSONL session remains resumable. They never advertise create, attach, or detach, so they cannot
+recursively provision or change their binding. Any create failure stops the new owned process and
+removes its runtime channel. The option defaults to false.
 
 Prompt and steer text is `data.content` and is capped at 64 KiB. `session.create` uses
-`data.cwd`; attach uses `sid` and optional `data.cwd`. Queue edit uses `iid` and `data.content`,
+`data.cwd`; `session.close` uses `sid`; attach uses `sid` and optional `data.cwd`. Queue edit uses `iid` and `data.content`,
 move adds a zero-based `data.position`, and deletion uses `iid`. Approval responses use `rid` and
 boolean `data.allow`; question responses use `rid` and `data.answers`, an array aligned with the
 questions. Skipping is always explicit.

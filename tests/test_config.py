@@ -160,6 +160,19 @@ def test_pi_channel_requires_pi_table_and_loads_defaults(tmp_path: Path) -> None
     assert config.pi.socket_dir.name == "pi"
     assert config.pi.socket_dir.parent.name == "agentwire"
     assert config.pi.session_root == Path("~/.pi/agent/sessions").expanduser().resolve(strict=False)
+    assert config.pi.dedicated_channels is False
+
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write("dedicated_channels = true\n")
+    assert load_config(config_path).pi.dedicated_channels is True  # type: ignore[union-attr]
+
+
+def test_pi_dedicated_channels_must_be_boolean(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, '{ "#pi" = "pi" }')
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write('\n[pi]\nbinary = "pi"\ndedicated_channels = "yes"\n')
+    with pytest.raises(ConfigError, match="dedicated_channels.*boolean"):
+        load_config(config_path)
 
 
 def test_codex_only_config_ignores_pi_table_and_rejects_unknown_backend(

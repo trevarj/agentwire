@@ -44,6 +44,10 @@ extension (see [`docs/pi-socket.md`](docs/pi-socket.md)), which the bridge disco
 live, and sessions nobody is running are created or resumed by a bridge-owned `pi --mode rpc`
 subprocess speaking the same protocol. Live TUI sessions answer their own extension dialogs in
 the terminal; only bridge-spawned sessions relay dialogs as Agentwire questions and approvals.
+Optional `[pi].dedicated_channels = true` creates each new Pi session in a private, ephemeral
+`#pi-<short-id>` channel. Channels survive IRC reconnects but not a bridge process restart; Pi's
+JSONL session remains resumable. Closing stops only its bridge-owned RPC process; static channels
+and live TUIs are never stopped.
 
 ```console
 nix run .#stack

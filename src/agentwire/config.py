@@ -52,6 +52,13 @@ def _positive_int(data: Mapping[str, Any], key: str, default: int, section: str)
     return value
 
 
+def _boolean(data: Mapping[str, Any], key: str, default: bool, section: str) -> bool:
+    value = data.get(key, default)
+    if not isinstance(value, bool):
+        raise ConfigError(f"[{section}].{key} must be a boolean")
+    return value
+
+
 @dataclass(slots=True, frozen=True)
 class BridgeConfig:
     owner_account: str
@@ -105,6 +112,7 @@ class PiConfig:
     binary: str
     socket_dir: Path
     session_root: Path
+    dedicated_channels: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -247,6 +255,7 @@ def load_config(path: str | Path) -> Config:
                 session_root=_path(
                     _optional_str(pi, "session_root", "pi") or "~/.pi/agent/sessions"
                 ),
+                dedicated_channels=_boolean(pi, "dedicated_channels", False, "pi"),
             )
             if pi is not None
             else None

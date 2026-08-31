@@ -41,6 +41,9 @@ class Backend(abc.ABC):
     async def session_busy(self, session_id: str) -> bool | None:
         return None
 
+    async def close_session(self, session_id: str) -> None:
+        raise BackendError(f"{self.name} does not support closing sessions")
+
     def count_sessions(self, cwd: str) -> int | None:
         """Return how many sessions live directly in cwd, or None when unknown.
 

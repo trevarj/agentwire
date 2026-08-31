@@ -180,6 +180,9 @@ class StateStore:
                 );
                 """
             )
+            # Dynamic Pi channels became process-local. Remove state written by
+            # older builds; orphaned bindings are cleared during bridge restore.
+            database.execute("DROP TABLE IF EXISTS managed_channels")
             event_columns = {
                 str(row[1]) for row in database.execute("PRAGMA table_info(events)").fetchall()
             }

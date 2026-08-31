@@ -30,6 +30,7 @@ _COMMAND_TIMEOUT = 30.0
 # before a second phone tap.
 _DISCOVER_SECONDS = 0.5
 _SESSION_LIST_LIMIT = 20
+_LIVE_HISTORY_PAGE = 500
 # pi-tui-kit renders questionnaire titles as "<header>: <prompt>" and appends a
 # synthetic free-form row to every select; both are undone for the clients.
 _UI_HEADER_MAX = 24
@@ -211,6 +212,7 @@ class _Session:
     updated_at: float = 0.0
     pump: asyncio.Task[None] | None = None
     busy: bool = False
+    waiting: bool = False
     turn_id: str | None = None
     last_reply: str | None = None
     # Prompts this bridge injected, whose user-message echoes must not open a
@@ -374,6 +376,7 @@ class PiBackend(Backend):
             title=safe_one_line(str(state.get("sessionName") or "") or "untitled", 100),
             updated_at=time.time(),
             busy=bool(state.get("busy")),
+            waiting=bool(state.get("waiting")),
         )
         self._sessions[session_id] = session
         session.pump = asyncio.create_task(self._pump(session), name=f"pi-{session_id}")
@@ -388,7 +391,9 @@ class PiBackend(Backend):
         pi pushes state changes, so status is reported where those arrive rather
         than polled.
         """
-        waiting = any(owner is session for owner, *_ in self._ui_requests.values())
+        waiting = session.waiting or any(
+            owner is session for owner, *_ in self._ui_requests.values()
+        )
         return BackendEvent(
             kind="status_changed",
             backend=self.name,
@@ -460,6 +465,7 @@ class PiBackend(Backend):
             await self._session_changed(session, frame)
         elif kind == "agent_start":
             session.busy = True
+            session.waiting = False
             session.updated_at = time.time()
             await self._events.put(self._status_event(session))
         elif kind == "agent_settled":
@@ -484,6 +490,9 @@ class PiBackend(Backend):
         name = str(frame.get("sessionName") or "")
         if name:
             session.title = safe_one_line(name, 100)
+        waiting = frame.get("waiting")
+        if isinstance(waiting, bool):
+            session.waiting = waiting
         session_file = frame.get("sessionFile")
         stem = _session_stem(session_file if isinstance(session_file, str) else None)
         if stem and stem != session.id:
@@ -693,6 +702,7 @@ class PiBackend(Backend):
         title = safe_one_line(str(frame.get("title") or "pi extension request"), 160)
         if method == "confirm":
             self._ui_requests[token] = (session, frame, None)
+            await self._events.put(self._status_event(session))
             message = safe_one_line(str(frame.get("message") or ""), 160)
             await self._events.put(
                 BackendEvent(
@@ -713,6 +723,7 @@ class PiBackend(Backend):
             options = options[:-1]
         header, prompt = self._split_title(title)
         self._ui_requests[token] = (session, frame, custom_row)
+        await self._events.put(self._status_event(session))
         await self._events.put(
             BackendEvent(
                 kind="question",
@@ -740,6 +751,7 @@ class PiBackend(Backend):
         await session.transport.write(
             {"type": "extension_ui_response", "id": frame.get("id"), "confirmed": allow}
         )
+        await self._events.put(self._status_event(session))
 
     @staticmethod
     def _split_title(title: str) -> tuple[str, str]:
@@ -773,6 +785,7 @@ class PiBackend(Backend):
                 value = custom_row
             response["value"] = value
         await session.transport.write(response)
+        await self._events.put(self._status_event(session))
 
     # ------------------------------------------------------------------
     # tool presentation
@@ -1022,6 +1035,28 @@ class PiBackend(Backend):
         session = self._sessions.get(session_id)
         return session.busy if session is not None else None
 
+    async def close_session(self, session_id: str) -> None:
+        session = self._require(session_id)
+        if session.tui:
+            raise BackendError("cannot close a live pi TUI session")
+        if session.transport.process is None:
+            raise BackendError("pi session is not owned by this bridge")
+        close = asyncio.create_task(self._close_session(session))
+        cancelled = False
+        try:
+            await asyncio.shield(close)
+        except asyncio.CancelledError:
+            await close
+            cancelled = True
+        self._sessions.pop(session.id, None)
+        self._ui_requests = {
+            token: request
+            for token, request in self._ui_requests.items()
+            if request[0] is not session
+        }
+        if cancelled:
+            raise asyncio.CancelledError
+
     # ------------------------------------------------------------------
     # turns
     # ------------------------------------------------------------------
@@ -1144,9 +1179,38 @@ class PiBackend(Backend):
     async def _entries(self, session_id: str) -> list[dict[str, Any]]:
         session = self._sessions.get(session_id)
         if session is not None and not session.transport.closed:
-            data = await session.transport.request({"type": "get_entries"})
+            pages: list[Any] = []
+            cursor: str | None = None
+            seen_cursors: set[str] = set()
+            while True:
+                command: dict[str, Any] = {"type": "get_entries"}
+                if session.tui:
+                    command["limit"] = _LIVE_HISTORY_PAGE
+                    if cursor is not None:
+                        command["since"] = cursor
+                data = await session.transport.request(command)
+                raw_page = data.get("entries")
+                if not isinstance(raw_page, list):
+                    raise BackendError("pi returned invalid session entries")
+                if not raw_page:
+                    break
+                next_cursor = (
+                    str(raw_page[-1].get("id") or "") if isinstance(raw_page[-1], dict) else ""
+                )
+                if not next_cursor or next_cursor in seen_cursors:
+                    break
+                pages.extend(raw_page)
+                seen_cursors.add(next_cursor)
+                if not session.tui:
+                    break
+                leaf = data.get("leafId")
+                if (isinstance(leaf, str) and next_cursor == leaf) or (
+                    leaf is None and len(raw_page) < _LIVE_HISTORY_PAGE
+                ):
+                    break
+                cursor = next_cursor
             entries: list[dict[str, Any]] = []
-            for entry in data.get("entries") or ():
+            for entry in pages:
                 if not isinstance(entry, dict):
                     continue
                 # pi's native RPC returns every entry type with raw messages;

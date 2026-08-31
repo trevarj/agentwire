@@ -44,6 +44,8 @@ api_key_env = "AGENTWIRE_CLAUDE_API_KEY"
 # channels = { "#codex" = "codex", "#pi" = "pi" }
 [pi]
 binary = "pi"
+# Create one private IRC channel per new Pi session until bridge restart. Defaults to false.
+dedicated_channels = false
 # Where running pi TUIs serve their Agentwire extension sockets. Defaults to
 # $XDG_RUNTIME_DIR/agentwire/pi, matching the extension.
 # socket_dir = "$XDG_RUNTIME_DIR/agentwire/pi"
