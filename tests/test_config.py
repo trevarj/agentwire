@@ -167,6 +167,40 @@ def test_pi_channel_requires_pi_table_and_loads_defaults(tmp_path: Path) -> None
     assert load_config(config_path).pi.dedicated_channels is True  # type: ignore[union-attr]
 
 
+def test_omp_channel_requires_table_and_loads_defaults(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = _write_config(tmp_path, '{ "#omp" = "omp" }')
+    with pytest.raises(ConfigError, match=r"missing \[omp\] table"):
+        load_config(config_path)
+
+    runtime = tmp_path / "runtime"
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n[omp]\n")
+    config = load_config(config_path)
+    assert config.codex is None
+    assert config.pi is None
+    assert config.omp is not None
+    assert config.omp.binary == "omp"
+    assert config.omp.socket_dir == runtime / "agentwire" / "omp"
+    assert config.omp.session_root == Path("~/.omp/agent/sessions").expanduser().resolve(
+        strict=False
+    )
+    assert config.omp.dedicated_channels is False
+
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write("dedicated_channels = true\n")
+    assert load_config(config_path).omp.dedicated_channels is True  # type: ignore[union-attr]
+
+
+def test_unselected_omp_table_is_ignored(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, '{ "#codex" = "codex" }')
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write('\n[omp]\nbinary = ""\n')
+    assert load_config(config_path).omp is None
+
+
 def test_pi_dedicated_channels_must_be_boolean(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, '{ "#pi" = "pi" }')
     with config_path.open("a", encoding="utf-8") as handle:

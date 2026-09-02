@@ -137,6 +137,8 @@ def doctor(config: Config) -> list[str]:
         checks["claude"] = config.claude.binary
     if config.pi is not None:
         checks["pi"] = config.pi.binary
+    if config.omp is not None:
+        checks["omp"] = config.omp.binary
     results = [f"{label}: {_binary(binary)}" for label, binary in checks.items()]
     results.append("ergo fakelag: disable privately or exempt bot with nofakelag-only oper class")
     if config.claude is not None:
@@ -144,6 +146,9 @@ def doctor(config: Config) -> list[str]:
     if config.pi is not None:
         sockets = len(list(config.pi.socket_dir.glob("*.sock")))
         results.append(f"pi sockets: {sockets} live in {config.pi.socket_dir}")
+    if config.omp is not None:
+        sockets = len(list(config.omp.socket_dir.glob("*.sock")))
+        results.append(f"omp sockets: {sockets} live in {config.omp.socket_dir}")
     return results
 
 
@@ -225,6 +230,10 @@ async def run_bridge(config: Config) -> None:
         from agentwire.backends.pi import PiBackend
 
         backends["pi"] = PiBackend(config.pi)
+    if config.omp is not None:
+        from agentwire.backends.omp import OmpBackend
+
+        backends["omp"] = OmpBackend(config.omp)
     bridge = Bridge(config, IRCClient(config.irc, irc_password), backends)
     await bridge.run()
 

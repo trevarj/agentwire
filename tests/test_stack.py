@@ -205,3 +205,34 @@ def test_claude_credentials_check_reads_auth_status(monkeypatch: pytest.MonkeyPa
     )
     with pytest.raises(StackError, match="no stored credentials"):
         _claude_credentials(stored)
+
+
+def test_doctor_reports_omp_binary_and_live_sockets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agentwire import stack
+    from agentwire.config import OmpConfig
+
+    socket_dir = tmp_path / "sockets"
+    socket_dir.mkdir()
+    (socket_dir / "live.sock").touch()
+    config = SimpleNamespace(
+        path=tmp_path / "config.toml",
+        secrets=SimpleNamespace(env_file=tmp_path / "secrets.env"),
+        irc=SimpleNamespace(ca_file=tmp_path / "ca.pem"),
+        stack=SimpleNamespace(ssh_binary="ssh"),
+        codex=None,
+        opencode=None,
+        claude=None,
+        pi=None,
+        omp=OmpConfig("omp", socket_dir, tmp_path / "sessions"),
+    )
+    monkeypatch.setattr(stack, "_private_file", lambda *_args: None)
+    monkeypatch.setattr(stack, "install_secret_env", lambda _config: None)
+    monkeypatch.setattr(stack.ssl, "create_default_context", lambda **_kwargs: None)
+    monkeypatch.setattr(stack, "_binary", lambda name: f"/bin/{name}")
+
+    results = stack.doctor(config)  # type: ignore[arg-type]
+
+    assert "omp: /bin/omp" in results
+    assert f"omp sockets: 1 live in {socket_dir}" in results

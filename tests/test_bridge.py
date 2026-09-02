@@ -19,6 +19,7 @@ from agentwire.config import (
     Config,
     IRCConfig,
     OpenCodeConfig,
+    OmpConfig,
     PiConfig,
     SecretsConfig,
     StackConfig,
@@ -212,6 +213,11 @@ def make_bridge(
         pi=(
             PiConfig("pi", tmp_path / "sockets", tmp_path / "sessions", dedicated_channels)
             if backend_name == "pi"
+            else None
+        ),
+        omp=(
+            OmpConfig("omp", tmp_path / "sockets", tmp_path / "sessions", dedicated_channels)
+            if backend_name == "omp"
             else None
         ),
     )
@@ -767,6 +773,48 @@ async def test_pi_dedicated_create_preserves_source_and_invites_requester(tmp_pa
     assert managed not in restored_irc.accepted
     assert managed not in restored.channels
     assert restored_backend.attached_sessions == ["existing"]
+
+
+@pytest.mark.asyncio
+async def test_omp_dedicated_create_routes_channel_and_close(tmp_path: Path) -> None:
+    bridge, irc, backend = make_bridge(
+        tmp_path,
+        channels={"#omp": "omp"},
+        backend_name="omp",
+        dedicated_channels=True,
+    )
+    backend.created_session_id = "2026-08-24T12-00-00-000Z_55555555-5555-7555-8555-555555555555"
+    await bridge._handle_topic("#omp", "agentwire:v1;account=trev;agent=bridge;backend=omp")
+    create = new_envelope(
+        "session.create",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        data={"cwd": str(tmp_path)},
+    )
+
+    await bridge._handle_action("#omp", create, "Alice")
+
+    managed = "#omp-55555555"
+    assert bridge.channels[managed].binding == ChannelBinding(
+        "omp", backend.created_session_id, str(tmp_path)
+    )
+    await bridge._emit_hello(managed)
+    hello = next(event for _, event, _ in irc.sent if event.kind == "agent.hello")
+    assert hello.data["backend"] == "omp"
+    assert hello.data["settings"] == ["model", "effort", "delivery"]
+
+    close = new_envelope(
+        "session.close",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        session_id=backend.created_session_id,
+    )
+    await bridge._handle_action(managed, close, "Alice")
+    assert backend.closed_sessions == [backend.created_session_id]
 
 
 @pytest.mark.asyncio

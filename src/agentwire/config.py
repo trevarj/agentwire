@@ -116,6 +116,14 @@ class PiConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class OmpConfig:
+    binary: str
+    socket_dir: Path
+    session_root: Path
+    dedicated_channels: bool = False
+
+
+@dataclass(slots=True, frozen=True)
 class StackConfig:
     ssh_binary: str
     ssh_host: str
@@ -140,6 +148,7 @@ class Config:
     # working for deployments and tests that never enable Claude.
     claude: ClaudeConfig | None = None
     pi: PiConfig | None = None
+    omp: OmpConfig | None = None
 
 
 # Only the modes that keep Agentwire's approval routing meaningful are accepted.
@@ -151,6 +160,12 @@ def _default_pi_socket_dir() -> str:
     runtime = os.environ.get("XDG_RUNTIME_DIR")
     base = runtime if runtime and runtime.startswith("/") else tempfile.gettempdir()
     return str(Path(base) / "agentwire" / "pi")
+
+
+def _default_omp_socket_dir() -> str:
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    base = runtime if runtime and runtime.startswith("/") else tempfile.gettempdir()
+    return str(Path(base) / "agentwire" / "omp")
 
 
 def load_config(path: str | Path) -> Config:
@@ -182,7 +197,7 @@ def load_config(path: str | Path) -> Config:
     for channel, backend in channels_raw.items():
         if not isinstance(channel, str) or not channel.startswith("#"):
             raise ConfigError(f"invalid IRC channel: {channel!r}")
-        if backend not in {"codex", "opencode", "claude", "pi"}:
+        if backend not in {"codex", "opencode", "claude", "pi", "omp"}:
             raise ConfigError(f"unsupported backend {backend!r} for {channel}")
         channels[channel.lower()] = backend
 
@@ -190,6 +205,7 @@ def load_config(path: str | Path) -> Config:
     opencode = _table(raw, "opencode") if "opencode" in channels.values() else None
     claude = _table(raw, "claude") if "claude" in channels.values() else None
     pi = _table(raw, "pi") if "pi" in channels.values() else None
+    omp = _table(raw, "omp") if "omp" in channels.values() else None
     stack = _table(raw, "stack")
     permission_mode = "default"
     if claude is not None:
@@ -269,6 +285,20 @@ def load_config(path: str | Path) -> Config:
             remote_cert_path=_required_str(stack, "remote_cert_path", "stack"),
             opencode_port=_positive_int(stack, "opencode_port", 14096, "stack"),
             startup_timeout=_positive_int(stack, "startup_timeout", 30, "stack"),
+        ),
+        omp=(
+            OmpConfig(
+                binary=_optional_str(omp, "binary", "omp") or "omp",
+                socket_dir=_path(
+                    _optional_str(omp, "socket_dir", "omp") or _default_omp_socket_dir()
+                ),
+                session_root=_path(
+                    _optional_str(omp, "session_root", "omp") or "~/.omp/agent/sessions"
+                ),
+                dedicated_channels=_boolean(omp, "dedicated_channels", False, "omp"),
+            )
+            if omp is not None
+            else None
         ),
     )
     _validate_cross_fields(result)

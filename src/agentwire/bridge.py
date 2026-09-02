@@ -51,7 +51,7 @@ READ_ACTION_KINDS = frozenset(
 # Diagnostics name channels, accounts, kinds, and reasons. They never carry
 # prompt text, tool output, tag values, or credentials.
 LOGGER = logging.getLogger("agentwire.bridge")
-_PI_SESSION_UUID_RE = re.compile(
+_SESSION_UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}"
 )
 _SENSITIVE_QUESTION_RE = re.compile(
@@ -424,7 +424,7 @@ class Bridge:
         if message.command == "331":
             topic = build_topic(
                 self.config.bridge.owner_account,
-                "pi",
+                runtime.backend,
                 agent=self._bridge_account,
             )
             try:
@@ -574,7 +574,7 @@ class Bridge:
                 ["model", "effort", "collaboration", "delivery", "approvalReviewer"]
                 if runtime.backend == "codex"
                 else ["model", "effort", "delivery"]
-                if runtime.backend == "pi"
+                if runtime.backend in {"pi", "omp"}
                 else ["delivery"]
             ),
         }
@@ -918,12 +918,18 @@ class Bridge:
         )
         runtime = self.channels[channel]
         if channel in self._managed_channels:
-            raise ValueError("managed Pi channels cannot create another session")
+            raise ValueError(f"managed {runtime.backend} channels cannot create another session")
         summary = await self.backends[runtime.backend].create_session(cwd)
+        backend_config = (
+            self.config.pi
+            if runtime.backend == "pi"
+            else self.config.omp
+            if runtime.backend == "omp"
+            else None
+        )
         dedicated = (
-            runtime.backend == "pi"
-            and self.config.pi is not None
-            and self.config.pi.dedicated_channels
+            backend_config is not None
+            and backend_config.dedicated_channels
             and channel in self.config.irc.channels
         )
         if not dedicated:
@@ -931,18 +937,20 @@ class Bridge:
             return
         if not requester_nick:
             await self.backends[runtime.backend].close_session(summary.id)
-            raise ProtocolError("dedicated Pi session creation requires requester nickname")
+            raise ProtocolError(
+                f"dedicated {runtime.backend} session creation requires requester nickname"
+            )
         try:
-            managed = self._pi_channel_name(summary.id)
+            managed = self._managed_channel_name(summary.id, runtime.backend)
         except Exception:
             await self.backends[runtime.backend].close_session(summary.id)
             raise
-        binding = ChannelBinding("pi", summary.id, summary.cwd)
+        binding = ChannelBinding(runtime.backend, summary.id, summary.cwd)
         installed = False
         try:
             self.irc.register_channel(managed)
             self._managed_channels.add(managed)
-            target = self._install_channel(managed, "pi")
+            target = self._install_channel(managed, runtime.backend)
             installed = True
             target.binding = binding
             target.observed_sessions.add(summary.id)
@@ -952,7 +960,7 @@ class Bridge:
             await self.irc.set_private(managed)
             topic = build_topic(
                 self.config.bridge.owner_account,
-                "pi",
+                runtime.backend,
                 agent=self._bridge_account,
             )
             await self.irc.set_topic(managed, topic)
@@ -971,29 +979,29 @@ class Bridge:
                 self.irc.unregister_channel(managed)
             raise
 
-    def _pi_channel_name(self, session_id: str) -> str:
-        match = _PI_SESSION_UUID_RE.search(session_id)
+    def _managed_channel_name(self, session_id: str, backend: str) -> str:
+        match = _SESSION_UUID_RE.search(session_id)
         if match is None:
-            raise BackendError("pi returned a session id without a UUID")
+            raise BackendError(f"{backend} returned a session id without a UUID")
         value = uuid.UUID(match.group()).hex
         for length in range(8, len(value) + 1, 4):
-            channel = f"#pi-{value[:length]}"
+            channel = f"#{backend}-{value[:length]}"
             if channel not in self.channels:
                 return channel
-        raise BackendError("cannot allocate a unique Pi session channel")
+        raise BackendError(f"cannot allocate a unique {backend} session channel")
 
     async def _action_close(self, channel: str, action: Envelope) -> None:
         if channel not in self._managed_channels:
-            raise ValueError("only a managed Pi channel can close its session")
+            raise ValueError("only a managed channel can close its session")
         runtime = self.channels[channel]
         if action.session_id is None:
             raise ProtocolError("session.close requires sid")
         binding = self._require_binding(runtime, action)
-        if binding.backend != "pi":
-            raise ValueError("only a managed Pi session can be closed")
+        if binding.backend != runtime.backend:
+            raise ValueError(f"only a managed {runtime.backend} session can be closed")
         await self.state.set(channel, None)
         await self.state.clear_queue(channel, binding.session_id)
-        await self.backends["pi"].close_session(binding.session_id)
+        await self.backends[binding.backend].close_session(binding.session_id)
         runtime.binding = None
         runtime.busy = False
         runtime.active_turn = None
@@ -1013,7 +1021,9 @@ class Bridge:
 
     async def _action_attach(self, channel: str, action: Envelope) -> None:
         if channel in self._managed_channels:
-            raise ValueError("managed Pi channels cannot switch sessions")
+            raise ValueError(
+                f"managed {self.channels[channel].backend} channels cannot switch sessions"
+            )
         runtime = self.channels[channel]
         session_id = action.session_id or self._data_string(action, "sid")
         cwd_value = action.data.get("cwd")
@@ -1041,7 +1051,9 @@ class Bridge:
 
     async def _action_detach(self, channel: str, action: Envelope) -> None:
         if channel in self._managed_channels:
-            raise ValueError("managed Pi channels cannot detach their session")
+            raise ValueError(
+                f"managed {self.channels[channel].backend} channels cannot detach their session"
+            )
         runtime = self.channels[channel]
         previous = self._require_binding(runtime, action)
         runtime.binding = None

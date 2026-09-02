@@ -24,7 +24,7 @@ agentwire:v1;account=trev;agent=agentwire;backend=codex | Human-readable title
 
 `account`, `agent`, and `backend` are required, and they answer three different questions:
 
-- `backend=` — which engine runs the session: `codex`, `opencode`, `claude`, or `pi`.
+- `backend=` — which engine runs the session: `codex`, `opencode`, `claude`, `pi`, or `omp`.
 - `account=` — the IRC account whose commands the bridge obeys (the owner).
 - `agent=` — the IRC account whose messages a client trusts as authoritative backend state
   (the bot).
@@ -199,19 +199,20 @@ The following kinds are defined. A client MUST enable only those listed in the `
 
 This Agentwire advertises discovery, binding, settings, turns, queues, and requests. It does not
 advertise optional lifecycle operations until a backend can perform them safely. `session.close`
-is advertised only in a managed, dedicated Pi channel. It requires that channel's bound `sid`,
-stops only the bridge-owned `pi --mode rpc` process, preserves the session JSONL for later resume,
-then clears the topic and parts the managed channel. Static Pi channels and live TUI processes
-cannot be closed this way.
+is advertised only in a managed, dedicated Pi or OMP channel. It requires that channel's bound
+`sid`, stops only the bridge-owned local RPC process, preserves its session JSONL for later
+resume, then clears the topic and parts the managed channel. Static channels and live TUI
+processes cannot be closed this way.
 
-With `[pi].dedicated_channels = true`, `session.create` on a configured static Pi channel leaves
-that channel's binding unchanged. Agentwire joins a collision-safe `#pi-<session-id-prefix>`
-channel, confirms invite-only and secret modes (`+is`), confirms its canonical activation topic,
-then invites the action sender's current nickname and confirms server acceptance. Managed channels
-survive IRC reconnects within the bridge process but are not restored after process restart; Pi's
+With `[pi].dedicated_channels = true` or `[omp].dedicated_channels = true`, `session.create` on a
+configured static channel leaves that channel's binding unchanged. Agentwire joins a
+collision-safe `#pi-<session-id-prefix>` or `#omp-<session-id-prefix>` channel, confirms
+invite-only and secret modes (`+is`), confirms its canonical activation topic, then invites the
+action sender's current nickname and confirms server acceptance. Managed channels survive IRC
+reconnects within the bridge process but are not restored after process restart; the backend's
 JSONL session remains resumable. They never advertise create, attach, or detach, so they cannot
-recursively provision or change their binding. Any create failure stops the new owned process and
-removes its runtime channel. The option defaults to false.
+recursively provision or change their binding. Any create failure stops the new owned process
+and removes its runtime channel. Both options default to false.
 
 Prompt and steer text is `data.content` and is capped at 64 KiB. `session.create` uses
 `data.cwd`; `session.close` uses `sid`; attach uses `sid` and optional `data.cwd`. Queue edit uses `iid` and `data.content`,
@@ -254,8 +255,9 @@ across a session switch.
 
 `agent.hello.data.settings` lists only what the bound backend accepts, so clients MUST drive their
 settings UI from that list rather than from the full safe-setting vocabulary. Codex advertises all
-five; OpenCode and Claude advertise `delivery` alone, and Claude takes its model from deployment
-configuration rather than from `settings.update`.
+five; Pi and OMP advertise `model`, `effort`, and `delivery`; OpenCode and Claude advertise
+`delivery` alone, and Claude takes its model from deployment configuration rather than from
+`settings.update`.
 
 Claude maps its `AskUserQuestion` tool onto question requests: the owner's answers return to the
 CLI through the permission callback, and a skip denies that one tool call so the turn continues

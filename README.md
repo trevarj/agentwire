@@ -1,6 +1,6 @@
 # Agentwire
 
-Agentwire exposes live Codex, OpenCode, and Claude sessions as a structured agent harness over IRCv3. A
+Agentwire exposes live Codex, OpenCode, Claude, Pi, and OMP sessions as a structured agent harness over IRCv3. A
 supporting client renders sessions, turns, plans, tool cards, approvals, questions, queues, usage,
 and history while the channel remains a useful readable transcript.
 
@@ -49,6 +49,11 @@ Optional `[pi].dedicated_channels = true` creates each new Pi session in a priva
 JSONL session remains resumable. Closing stops only its bridge-owned RPC process; static channels
 and live TUIs are never stopped.
 
+OMP uses the same static/live split under the distinct `omp` backend: its extension serves live
+TUI sockets in `$XDG_RUNTIME_DIR/agentwire/omp`, while bridge-owned sessions run `omp --mode rpc`.
+Optional `[omp].dedicated_channels = true` creates private `#omp-<short-id>` channels with the
+same lifecycle as Pi's dedicated channels. See [`docs/pi-socket.md`](docs/pi-socket.md).
+
 ```console
 nix run .#stack
 ```
@@ -68,8 +73,9 @@ agentwire:v1;account=your-account;agent=bot-account;backend=codex | Project titl
 ```
 
 The three parameters answer three different questions. `backend` picks the engine (`codex`,
-`opencode`, `claude`, or `pi`) and must match what [`config.example.toml`](config.example.toml) assigns
-to that channel. `account` and `agent` are IRC account names, never engine names: `account` is
+`opencode`, `claude`, `pi`, or `omp`) and must match what
+[`config.example.toml`](config.example.toml) assigns to that channel. `account` and `agent` are IRC
+account names, never engine names: `account` is
 the controller allowed to issue actions, and `agent` is the bot account whose messages clients
 trust as backend state. `agent=claude` would mean an IRC account literally named "claude" — the
 engine is chosen only by `backend`. The single-account form is:

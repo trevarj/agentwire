@@ -1,4 +1,4 @@
-# Pi socket protocol
+# Pi and OMP socket protocols
 
 The `pi` backend reaches sessions over two transports that speak one JSONL
 protocol:
@@ -69,3 +69,17 @@ across the TUI, the spawned RPC process, and on-disk history. The backend
 scans the socket directory a few times per second for new live sessions,
 removes sessions whose stream ends, and refuses to spawn-resume a session
 whose file a live process already owns.
+
+## OMP
+
+The distinct `omp` backend has the same two ownership modes. Install
+`agentwire-omp.ts` as `~/.omp/agent/extensions/agentwire.ts`; each live OMP TUI then serves a
+backend-tagged socket at `$XDG_RUNTIME_DIR/agentwire/omp/<pid>.sock`. The bridge requires
+`backend: "omp"` in its `hello` and keeps these sockets separate from Pi.
+
+For a static channel or an OMP session with no live owner, the bridge starts
+`omp --mode rpc --approval-mode always-ask --session-dir <cwd-bucket>` with
+`AGENTWIRE_SPAWNED=1`. OMP begins stdio RPC with
+a `ready` frame and may negotiate its chunked protocol 2; the live extension continues to expose
+the canonical `hello`/response protocol above. OMP sessions live under
+`~/.omp/agent/sessions`, and its hello advertises `model`, `effort`, and `delivery` settings.

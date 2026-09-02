@@ -7,7 +7,7 @@ import os
 import re
 import time
 import uuid
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -125,6 +125,12 @@ def _entry_millis(entry: Mapping[str, Any]) -> int:
     return 0
 
 
+class _ResponseError(BackendError):
+    def __init__(self, message: str, code: Any = None) -> None:
+        super().__init__(message)
+        self.code = code if isinstance(code, str) else None
+
+
 class _Transport:
     """One JSONL command/event stream: an extension socket or an RPC stdio pair.
 
@@ -137,32 +143,68 @@ class _Transport:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter | Any,
         process: asyncio.subprocess.Process | None = None,
+        *,
+        backend: str = "pi",
+        decoder: Callable[[bytes], dict[str, Any] | None] | None = None,
     ) -> None:
         self.reader = reader
         self.writer = writer
         self.process = process
+        self.backend = backend
+        self.decoder = decoder
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._pending_commands: dict[str, str] = {}
+        self._completed: dict[str, str] = {}
         self._sequence = 0
         self.closed = False
 
+    async def read_frame(self, timeout: float | None = None) -> dict[str, Any] | None:
+        deadline = asyncio.get_running_loop().time() + timeout if timeout is not None else None
+        while True:
+            remaining = (
+                deadline - asyncio.get_running_loop().time() if deadline is not None else None
+            )
+            if remaining is not None and remaining <= 0:
+                raise TimeoutError
+            line = (
+                await asyncio.wait_for(self.reader.readline(), remaining)
+                if remaining is not None
+                else await self.reader.readline()
+            )
+            if not line:
+                return None
+            frame = (
+                self.decoder(line) if self.decoder is not None else json.loads(line.decode("utf-8"))
+            )
+            if frame is None:
+                continue
+            if not isinstance(frame, dict):
+                raise TypeError("JSONL frame must be an object")
+            return frame
+
     async def request(self, command: dict[str, Any]) -> dict[str, Any]:
         if self.closed:
-            raise BackendError("pi session connection is closed")
+            raise BackendError(f"{self.backend} session connection is closed")
         self._sequence += 1
         token = f"aw-{self._sequence}"
         command = {**command, "id": token}
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[token] = future
+        self._pending_commands[token] = str(command.get("type") or "")
         try:
             await self.write(command)
             response = await asyncio.wait_for(future, _COMMAND_TIMEOUT)
         except TimeoutError as exc:
-            raise BackendError("pi did not answer in time") from exc
+            raise BackendError(f"{self.backend} did not answer in time") from exc
         finally:
             self._pending.pop(token, None)
+            self._pending_commands.pop(token, None)
         if not response.get("success"):
-            raise BackendError(
-                safe_one_line(str(response.get("error") or "pi rejected the command"), 180)
+            raise _ResponseError(
+                safe_one_line(
+                    str(response.get("error") or f"{self.backend} rejected the command"), 180
+                ),
+                response.get("code"),
             )
         data = response.get("data")
         return data if isinstance(data, dict) else {}
@@ -172,22 +214,31 @@ class _Transport:
             self.writer.write(json.dumps(frame).encode("utf-8") + b"\n")
             await self.writer.drain()
         except (OSError, ConnectionError) as exc:
-            raise BackendError(f"pi session connection failed: {exc}") from exc
+            raise BackendError(f"{self.backend} session connection failed: {exc}") from exc
 
     def dispatch_response(self, frame: dict[str, Any]) -> bool:
         token = frame.get("id")
         future = self._pending.get(token) if isinstance(token, str) else None
         if future is None or future.done():
             return False
+        if frame.get("success"):
+            self._completed[token] = self._pending_commands.get(token, "")
+            if len(self._completed) > 64:
+                self._completed.pop(next(iter(self._completed)))
         future.set_result(frame)
         return True
+
+    def take_completed_command(self, token: Any) -> str | None:
+        return self._completed.pop(token, None) if isinstance(token, str) else None
 
     async def close(self) -> None:
         self.closed = True
         for future in self._pending.values():
             if not future.done():
-                future.set_exception(BackendError("pi session connection closed"))
+                future.set_exception(BackendError(f"{self.backend} session connection closed"))
         self._pending.clear()
+        self._pending_commands.clear()
+        self._completed.clear()
         with contextlib.suppress(Exception):
             self.writer.close()
         if self.process is not None and self.process.returncode is None:
@@ -256,6 +307,42 @@ class PiBackend(Backend):
         # increments if transcripts outgrow a single fetch.
         self._entries_cache: tuple[str, float, list[dict[str, Any]]] | None = None
 
+    def _make_transport(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter | Any,
+        process: asyncio.subprocess.Process | None = None,
+    ) -> _Transport:
+        return _Transport(reader, writer, process, backend=self.name)
+
+    async def _initialize_transport(self, transport: _Transport) -> None:
+        return None
+
+    def _spawn_args(self, cwd: str) -> list[str]:
+        return ["--mode", "rpc"]
+
+    def _state_busy(self, state: Mapping[str, Any]) -> bool:
+        return bool(state.get("busy"))
+
+    def _session_directory(self, cwd: str) -> Path:
+        return self.config.session_root / _cwd_dir_name(cwd)
+
+    def _is_settled_frame(self, frame: Mapping[str, Any]) -> bool:
+        return frame.get("type") == "agent_settled"
+
+    def _is_approval_select(self, frame: Mapping[str, Any]) -> bool:
+        return False
+
+    def _custom_option(self, options: tuple[str, ...]) -> str | None:
+        return options[-1] if options and _UI_CUSTOM_ROW.match(options[-1]) else None
+
+    def _approval_response(self, frame: Mapping[str, Any], allow: bool) -> dict[str, Any]:
+        return {
+            "type": "extension_ui_response",
+            "id": frame.get("id"),
+            "confirmed": allow,
+        }
+
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
@@ -266,14 +353,14 @@ class PiBackend(Backend):
         self._closed = False
         self._ready.set()
         await self._discover_sockets()
-        self._discover = asyncio.create_task(self._discover_loop(), name="pi-discover")
+        self._discover = asyncio.create_task(self._discover_loop(), name=f"{self.name}-discover")
         await self._events.put(BackendEvent(kind="connected", backend=self.name))
 
     async def wait_ready(self, timeout: float = 30) -> None:
         try:
             await asyncio.wait_for(self._ready.wait(), timeout)
         except TimeoutError as exc:
-            raise BackendError("timed out waiting for pi") from exc
+            raise BackendError(f"timed out waiting for {self.name}") from exc
 
     async def close(self) -> None:
         self._closed = True
@@ -344,12 +431,17 @@ class PiBackend(Backend):
 
     async def _connect_socket(self, path: Path) -> None:
         reader, writer = await asyncio.open_unix_connection(str(path), limit=_MAX_LINE_BYTES)
-        transport = _Transport(reader, writer)
-        line = await asyncio.wait_for(reader.readline(), 10)
-        hello = json.loads(line.decode("utf-8"))
-        if not isinstance(hello, dict) or hello.get("type") != "hello":
+        transport = self._make_transport(reader, writer)
+        hello = await transport.read_frame(10)
+        if hello is None or hello.get("type") != "hello":
             await transport.close()
             raise BackendError(f"unexpected first frame from {path}")
+        backend = hello.get("backend")
+        if backend != self.name and not (self.name == "pi" and backend is None):
+            await transport.close()
+            raise BackendError(
+                f"{self.name} socket {path} identified itself as {backend or 'unknown'}"
+            )
         session = self._register(hello, transport, tui=True)
         if session is not None:
             # `hello` carries the current list, so a reconnect does not have to
@@ -382,11 +474,11 @@ class PiBackend(Backend):
             session_file=session_file if isinstance(session_file, str) else None,
             title=safe_one_line(str(state.get("sessionName") or "") or "untitled", 100),
             updated_at=time.time(),
-            busy=bool(state.get("busy")),
+            busy=self._state_busy(state),
             waiting=bool(state.get("waiting")),
         )
         self._sessions[session_id] = session
-        session.pump = asyncio.create_task(self._pump(session), name=f"pi-{session_id}")
+        session.pump = asyncio.create_task(self._pump(session), name=f"{self.name}-{session_id}")
         # The first status a client sees for this session; the queue is unbounded,
         # so a synchronous registration never blocks on it.
         self._events.put_nowait(self._status_event(session))
@@ -420,27 +512,23 @@ class PiBackend(Backend):
     async def _pump(self, session: _Session) -> None:
         try:
             while True:
-                line = await session.transport.reader.readline()
-                if not line:
-                    break
                 try:
-                    frame = json.loads(line.decode("utf-8"))
-                except json.JSONDecodeError:
+                    frame = await session.transport.read_frame()
+                except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
                     continue
-                if not isinstance(frame, dict):
-                    continue
-                if frame.get("type") == "response":
-                    session.transport.dispatch_response(frame)
+                if frame is None:
+                    break
+                if frame.get("type") == "response" and session.transport.dispatch_response(frame):
                     continue
                 await self._handle_frame(session, frame)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             if not self._closed:
-                await self._drop_session(session, f"pi session stream failed: {exc}")
+                await self._drop_session(session, f"{self.name} session stream failed: {exc}")
             return
         if not self._closed:
-            await self._drop_session(session, "pi session ended")
+            await self._drop_session(session, f"{self.name} session ended")
 
     async def _drop_session(self, session: _Session, reason: str) -> None:
         self._sessions.pop(session.id, None)
@@ -476,7 +564,7 @@ class PiBackend(Backend):
             session.waiting = False
             session.updated_at = time.time()
             await self._events.put(self._status_event(session))
-        elif kind == "agent_settled":
+        elif self._is_settled_frame(frame):
             await self._settle_turn(session)
         elif kind == "message_end":
             # The transcript grew; a cached copy would serve stale history.
@@ -610,7 +698,7 @@ class PiBackend(Backend):
             # not a reply.
             return
         if stop_reason == "error":
-            detail = str(message.get("errorMessage") or text or "pi turn failed")
+            detail = str(message.get("errorMessage") or text or f"{self.name} turn failed")
             session.turn_id = None
             session.tools.clear()
             await self._events.put(
@@ -709,11 +797,21 @@ class PiBackend(Backend):
         if not token or method not in {"select", "confirm", "input", "editor"}:
             # Fire-and-forget methods (notify, setStatus, ...) render nothing.
             return
-        title = safe_one_line(str(frame.get("title") or "pi extension request"), 160)
-        if method == "confirm":
+        raw_title = str(frame.get("title") or f"{self.name} extension request")
+        options = tuple(str(option) for option in frame.get("options") or () if str(option).strip())
+        approval_select = method == "select" and self._is_approval_select(frame)
+        if method == "confirm" or approval_select:
             self._ui_requests[token] = (session, frame, None)
             await self._events.put(self._status_event(session))
-            message = safe_one_line(str(frame.get("message") or ""), 160)
+            if approval_select:
+                title = truncate_utf8(clean_block(raw_title).strip(), _MAX_TOOL_PAYLOAD_BYTES)
+                message = truncate_utf8(
+                    clean_block(str(frame.get("message") or "")).strip(),
+                    _MAX_TOOL_PAYLOAD_BYTES,
+                )
+            else:
+                title = safe_one_line(raw_title, 160)
+                message = safe_one_line(str(frame.get("message") or ""), 160)
             await self._events.put(
                 BackendEvent(
                     kind="approval",
@@ -721,16 +819,17 @@ class PiBackend(Backend):
                     session_id=session.id,
                     turn_id=session.turn_id,
                     request_token=token,
-                    text=f"{title}: {message}" if message else title,
+                    text=f"{title}\n{message}"
+                    if approval_select and message
+                    else (f"{title}: {message}" if message else title),
                 )
             )
             return
-        options = tuple(str(option) for option in frame.get("options") or () if str(option).strip())
-        custom_row: str | None = None
-        if method == "select" and options and _UI_CUSTOM_ROW.match(options[-1]):
+        custom_row = self._custom_option(options) if method == "select" else None
+        if custom_row is not None:
             # The free-form row is an input affordance, not a real choice.
-            custom_row = options[-1]
             options = options[:-1]
+        title = safe_one_line(raw_title, 160)
         header, prompt = self._split_title(title)
         self._ui_requests[token] = (session, frame, custom_row)
         await self._events.put(self._status_event(session))
@@ -758,9 +857,7 @@ class PiBackend(Backend):
         if entry is None:
             raise BackendError("approval was already resolved")
         session, frame, _ = entry
-        await session.transport.write(
-            {"type": "extension_ui_response", "id": frame.get("id"), "confirmed": allow}
-        )
+        await session.transport.write(self._approval_response(frame, allow))
         await self._events.put(self._status_event(session))
 
     @staticmethod
@@ -866,7 +963,7 @@ class PiBackend(Backend):
         return await asyncio.to_thread(self._list_sessions_blocking, cwd)
 
     def _list_sessions_blocking(self, cwd: str) -> list[SessionSummary]:
-        directory = self.config.session_root / _cwd_dir_name(cwd)
+        directory = self._session_directory(cwd)
         try:
             files = [path for path in directory.iterdir() if path.suffix == ".jsonl"]
         except OSError:
@@ -875,7 +972,7 @@ class PiBackend(Backend):
         return [self._file_summary(path, cwd) for path in files[:_SESSION_LIST_LIMIT]]
 
     def count_sessions(self, cwd: str) -> int | None:
-        directory = self.config.session_root / _cwd_dir_name(cwd)
+        directory = self._session_directory(cwd)
         try:
             return sum(1 for path in directory.iterdir() if path.suffix == ".jsonl")
         except OSError:
@@ -946,7 +1043,7 @@ class PiBackend(Backend):
             return self._live_summary(existing)
         path = self._session_file(session_id, cwd)
         if path is None:
-            raise BackendError(f"pi session {session_id} was not found on disk")
+            raise BackendError(f"{self.name} session {session_id} was not found on disk")
         for session in self._sessions.values():
             if session.session_file and Path(session.session_file) == path:
                 # The live process renamed or rekeyed itself; never race it
@@ -955,7 +1052,7 @@ class PiBackend(Backend):
         header = await asyncio.to_thread(self._file_header, path)
         workspace = cwd or str(header.get("cwd") or "")
         if not workspace:
-            raise BackendError(f"pi session {session_id} has no recorded workspace")
+            raise BackendError(f"{self.name} session {session_id} has no recorded workspace")
         session = await self._spawn(workspace, resume_path=path)
         return self._live_summary(session)
 
@@ -963,7 +1060,7 @@ class PiBackend(Backend):
         if not session_id or "/" in session_id or session_id.startswith("."):
             return None
         if cwd:
-            candidate = self.config.session_root / _cwd_dir_name(cwd) / f"{session_id}.jsonl"
+            candidate = self._session_directory(cwd) / f"{session_id}.jsonl"
             if candidate.is_file():
                 return candidate
         matches = list(self.config.session_root.glob(f"*/{session_id}.jsonl"))
@@ -973,18 +1070,22 @@ class PiBackend(Backend):
     def _file_header(path: Path) -> dict[str, Any]:
         try:
             with path.open(encoding="utf-8") as handle:
-                line = handle.readline()
-            header = json.loads(line)
+                for line in handle:
+                    header = json.loads(line)
+                    if not isinstance(header, dict):
+                        return {}
+                    if header.get("type") == "title":
+                        continue
+                    return header if header.get("type") == "session" else {}
         except (OSError, json.JSONDecodeError):
             return {}
-        return header if isinstance(header, dict) else {}
+        return {}
 
     async def _spawn(self, cwd: str, resume_path: Path | None) -> _Session:
         try:
             process = await asyncio.create_subprocess_exec(
                 self.config.binary,
-                "--mode",
-                "rpc",
+                *self._spawn_args(cwd),
                 cwd=cwd,
                 env={**os.environ, "AGENTWIRE_SPAWNED": "1"},
                 stdin=asyncio.subprocess.PIPE,
@@ -993,13 +1094,14 @@ class PiBackend(Backend):
                 limit=_MAX_LINE_BYTES,
             )
         except OSError as exc:
-            raise BackendError(f"cannot start pi: {exc}") from exc
+            raise BackendError(f"cannot start {self.name}: {exc}") from exc
         assert process.stdout is not None and process.stdin is not None
-        transport = _Transport(process.stdout, process.stdin, process)
+        transport = self._make_transport(process.stdout, process.stdin, process)
         # The pump cannot run yet: it would consume command responses that
         # request() awaits are not registered for. Requests here read their
         # responses through the same reader sequentially.
         try:
+            await self._initialize_transport(transport)
             if resume_path is not None:
                 await self._request_direct(
                     transport, {"type": "switch_session", "sessionPath": str(resume_path)}
@@ -1011,11 +1113,12 @@ class PiBackend(Backend):
         session = self._register({**state, "cwd": cwd}, transport, tui=False)
         if session is None:
             await transport.close()
-            raise BackendError("pi session is already attached through a live process")
+            raise BackendError(f"{self.name} session is already attached through a live process")
         return session
 
-    @staticmethod
-    async def _request_direct(transport: _Transport, command: dict[str, Any]) -> dict[str, Any]:
+    async def _request_direct(
+        self, transport: _Transport, command: dict[str, Any]
+    ) -> dict[str, Any]:
         """Issue one command before the pump owns the reader, skipping events."""
         token = f"aw-setup-{uuid.uuid4().hex[:8]}"
         await transport.write({**command, "id": token})
@@ -1023,22 +1126,23 @@ class PiBackend(Backend):
         while True:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
-                raise BackendError("pi did not answer during session setup")
+                raise BackendError(f"{self.name} did not answer during session setup")
             try:
-                line = await asyncio.wait_for(transport.reader.readline(), remaining)
+                frame = await transport.read_frame(remaining)
             except TimeoutError as exc:
-                raise BackendError("pi did not answer during session setup") from exc
-            if not line:
-                raise BackendError("pi exited during session setup")
-            try:
-                frame = json.loads(line.decode("utf-8"))
-            except json.JSONDecodeError:
+                raise BackendError(f"{self.name} did not answer during session setup") from exc
+            except (json.JSONDecodeError, UnicodeDecodeError, TypeError):
                 continue
-            if not isinstance(frame, dict) or frame.get("id") != token:
+            if frame is None:
+                raise BackendError(f"{self.name} exited during session setup")
+            if frame.get("id") != token:
                 continue
             if not frame.get("success"):
-                raise BackendError(
-                    safe_one_line(str(frame.get("error") or "pi rejected the command"), 180)
+                raise _ResponseError(
+                    safe_one_line(
+                        str(frame.get("error") or f"{self.name} rejected the command"), 180
+                    ),
+                    frame.get("code"),
                 )
             data = frame.get("data")
             return data if isinstance(data, dict) else {}
@@ -1050,9 +1154,9 @@ class PiBackend(Backend):
     async def close_session(self, session_id: str) -> None:
         session = self._require(session_id)
         if session.tui:
-            raise BackendError("cannot close a live pi TUI session")
+            raise BackendError(f"cannot close a live {self.name} TUI session")
         if session.transport.process is None:
-            raise BackendError("pi session is not owned by this bridge")
+            raise BackendError(f"{self.name} session is not owned by this bridge")
         close = asyncio.create_task(self._close_session(session))
         cancelled = False
         try:
@@ -1076,7 +1180,7 @@ class PiBackend(Backend):
     def _require(self, session_id: str) -> _Session:
         session = self._sessions.get(session_id)
         if session is None:
-            raise BackendError(f"pi session {session_id} is not attached")
+            raise BackendError(f"{self.name} session {session_id} is not attached")
         return session
 
     async def send_message(self, session_id: str, text: str) -> str | None:
@@ -1101,7 +1205,7 @@ class PiBackend(Backend):
     async def steer(self, session_id: str, turn_id: str | None, text: str) -> None:
         session = self._require(session_id)
         if not session.busy:
-            raise BackendError("pi has no active turn to steer")
+            raise BackendError(f"{self.name} has no active turn to steer")
         session.expected_prompts += 1
         try:
             await session.transport.request({"type": "steer", "message": text})
@@ -1112,7 +1216,7 @@ class PiBackend(Backend):
     async def cancel(self, session_id: str, turn_id: str | None) -> None:
         session = self._require(session_id)
         if not session.busy:
-            raise BackendError("pi has no active turn to cancel")
+            raise BackendError(f"{self.name} has no active turn to cancel")
         await session.transport.request({"type": "abort"})
 
     async def get_last_reply(self, session_id: str) -> str | None:
@@ -1171,13 +1275,15 @@ class PiBackend(Backend):
         allowed = {"model", "effort", "delivery"}
         unsupported = set(settings) - allowed
         if unsupported:
-            raise BackendError(f"unsupported pi settings: {', '.join(sorted(unsupported))}")
+            raise BackendError(
+                f"unsupported {self.name} settings: {', '.join(sorted(unsupported))}"
+            )
         session = self._require(session_id)
         model = settings.get("model")
         if model:
             provider, separator, model_id = str(model).partition("/")
             if not separator:
-                raise BackendError("pi model values use provider/model form")
+                raise BackendError(f"{self.name} model values use provider/model form")
             await session.transport.request(
                 {"type": "set_model", "provider": provider, "modelId": model_id}
             )
@@ -1187,6 +1293,57 @@ class PiBackend(Backend):
     # ------------------------------------------------------------------
     # history
     # ------------------------------------------------------------------
+
+    async def _transport_entries(self, session: _Session) -> list[dict[str, Any]]:
+        pages: list[Any] = []
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        while True:
+            command: dict[str, Any] = {"type": "get_entries"}
+            if session.tui:
+                command["limit"] = _LIVE_HISTORY_PAGE
+                if cursor is not None:
+                    command["since"] = cursor
+            data = await session.transport.request(command)
+            raw_page = data.get("entries")
+            if not isinstance(raw_page, list):
+                raise BackendError(f"{self.name} returned invalid session entries")
+            if not raw_page:
+                break
+            next_cursor = (
+                str(raw_page[-1].get("id") or "") if isinstance(raw_page[-1], dict) else ""
+            )
+            if not next_cursor or next_cursor in seen_cursors:
+                break
+            pages.extend(raw_page)
+            seen_cursors.add(next_cursor)
+            if not session.tui:
+                break
+            leaf = data.get("leafId")
+            if (isinstance(leaf, str) and next_cursor == leaf) or (
+                leaf is None and len(raw_page) < _LIVE_HISTORY_PAGE
+            ):
+                break
+            cursor = next_cursor
+        entries: list[dict[str, Any]] = []
+        for entry in pages:
+            if not isinstance(entry, dict):
+                continue
+            # pi's native RPC returns every entry type with raw messages;
+            # the extension pre-filters and condenses. Normalize both.
+            if entry.get("type") not in (None, "message"):
+                continue
+            message = self._normalize_message(entry.get("message"))
+            if message is None:
+                continue
+            entries.append(
+                {
+                    "id": str(entry.get("id") or ""),
+                    "timestamp": entry.get("timestamp"),
+                    "message": message,
+                }
+            )
+        return entries
 
     async def _entries(self, session_id: str) -> list[dict[str, Any]]:
         cached = self._entries_cache
@@ -1198,59 +1355,12 @@ class PiBackend(Backend):
             return cached[2]
         session = self._sessions.get(session_id)
         if session is not None and not session.transport.closed:
-            pages: list[Any] = []
-            cursor: str | None = None
-            seen_cursors: set[str] = set()
-            while True:
-                command: dict[str, Any] = {"type": "get_entries"}
-                if session.tui:
-                    command["limit"] = _LIVE_HISTORY_PAGE
-                    if cursor is not None:
-                        command["since"] = cursor
-                data = await session.transport.request(command)
-                raw_page = data.get("entries")
-                if not isinstance(raw_page, list):
-                    raise BackendError("pi returned invalid session entries")
-                if not raw_page:
-                    break
-                next_cursor = (
-                    str(raw_page[-1].get("id") or "") if isinstance(raw_page[-1], dict) else ""
-                )
-                if not next_cursor or next_cursor in seen_cursors:
-                    break
-                pages.extend(raw_page)
-                seen_cursors.add(next_cursor)
-                if not session.tui:
-                    break
-                leaf = data.get("leafId")
-                if (isinstance(leaf, str) and next_cursor == leaf) or (
-                    leaf is None and len(raw_page) < _LIVE_HISTORY_PAGE
-                ):
-                    break
-                cursor = next_cursor
-            entries: list[dict[str, Any]] = []
-            for entry in pages:
-                if not isinstance(entry, dict):
-                    continue
-                # pi's native RPC returns every entry type with raw messages;
-                # the extension pre-filters and condenses. Normalize both.
-                if entry.get("type") not in (None, "message"):
-                    continue
-                message = self._normalize_message(entry.get("message"))
-                if message is None:
-                    continue
-                entries.append(
-                    {
-                        "id": str(entry.get("id") or ""),
-                        "timestamp": entry.get("timestamp"),
-                        "message": message,
-                    }
-                )
+            entries = await self._transport_entries(session)
             self._entries_cache = (session_id, time.monotonic(), entries)
             return entries
         path = self._session_file(session_id, session.cwd if session else None)
         if path is None:
-            raise BackendError(f"pi session {session_id} was not found on disk")
+            raise BackendError(f"{self.name} session {session_id} was not found on disk")
         entries = await asyncio.to_thread(self._file_entries, path)
         self._entries_cache = (session_id, time.monotonic(), entries)
         return entries
@@ -1292,7 +1402,7 @@ class PiBackend(Backend):
             with path.open(encoding="utf-8") as handle:
                 lines = handle.readlines()
         except OSError as exc:
-            raise BackendError(f"cannot read pi session {path.name}: {exc}") from exc
+            raise BackendError(f"cannot read {self.name} session {path.name}: {exc}") from exc
         parsed: list[dict[str, Any]] = []
         for line in lines[1:]:
             try:
@@ -1381,7 +1491,7 @@ class PiBackend(Backend):
         elif cursor.isdigit():
             offset = int(cursor)
         else:
-            raise BackendError("pi history cursor must be a non-negative integer string")
+            raise BackendError(f"{self.name} history cursor must be a non-negative integer string")
         entries = await self._entries(session_id)
         end = max(0, len(entries) - offset)
         start = max(0, end - limit)
@@ -1544,6 +1654,5 @@ class PiBackend(Backend):
             **values,
         )
 
-    @staticmethod
-    def _identifier(seed: str, kind: str) -> str:
-        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"agentwire-pi:{kind}:{seed}"))
+    def _identifier(self, seed: str, kind: str) -> str:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"agentwire-{self.name}:{kind}:{seed}"))

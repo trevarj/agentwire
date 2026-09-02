@@ -69,6 +69,34 @@ def test_single_account_topics_are_first_class() -> None:
     assert explicit.account == explicit.agent == "agentwire"
 
 
+def test_omp_topic_and_hello_fixtures() -> None:
+    topic_fixture = "agentwire:v1;account=trev;agent=agentwire;backend=omp | OMP workspace"
+    assert build_topic("trev", "omp", "OMP workspace", agent="agentwire") == topic_fixture
+    topic = parse_topic(topic_fixture)
+    assert topic is not None
+    assert topic.backend == "omp"
+
+    hello_fixture = {
+        "at": 1785400003000,
+        "data": {
+            "backend": "omp",
+            "epoch": "epoch-example",
+            "protocol": "agentwire-irc-v1",
+            "settings": ["model", "effort", "delivery"],
+        },
+        "epoch": "epoch-example",
+        "id": "77777777-7777-4777-8777-777777777777",
+        "inst": "66666666-6666-4666-8666-666666666666",
+        "k": "agent.hello",
+        "t": "event",
+        "v": 1,
+    }
+    hello = decode_envelope(json.dumps(hello_fixture))
+    assert hello.kind == "agent.hello"
+    assert hello.data["backend"] == "omp"
+    assert hello.data["settings"] == ["model", "effort", "delivery"]
+
+
 def test_envelope_round_trip_is_minified_and_validated() -> None:
     envelope = new_envelope(
         "turn.prompt",

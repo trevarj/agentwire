@@ -18,7 +18,7 @@ nickname = "agentwire"
 username = "agentwire"
 realname = "Agentwire agent bridge"
 password_env = "AGENTWIRE_IRC_PASSWORD"
-# Each channel names the backend that owns it: codex, opencode, claude, or pi.
+# Each channel names the backend that owns it: codex, opencode, claude, pi, or omp.
 channels = { "#codex" = "codex" }
 
 # Only read when a channel above is bound to the "codex" backend.
@@ -51,6 +51,18 @@ dedicated_channels = false
 # socket_dir = "$XDG_RUNTIME_DIR/agentwire/pi"
 # Where pi stores session JSONL files. Defaults to ~/.pi/agent/sessions.
 # session_root = "~/.pi/agent/sessions"
+
+# Only read when a channel above is bound to the "omp" backend, for example
+# channels = { "#codex" = "codex", "#omp" = "omp" }
+[omp]
+binary = "omp"
+# Create one private IRC channel per new OMP session until bridge restart. Defaults to false.
+dedicated_channels = false
+# Where running OMP TUIs serve their Agentwire extension sockets. Defaults to
+# $XDG_RUNTIME_DIR/agentwire/omp, matching the extension.
+# socket_dir = "$XDG_RUNTIME_DIR/agentwire/omp"
+# Where OMP stores session JSONL files. Defaults to ~/.omp/agent/sessions.
+# session_root = "~/.omp/agent/sessions"
 
 [stack]
 ssh_binary = "ssh"

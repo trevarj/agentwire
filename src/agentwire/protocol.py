@@ -331,7 +331,7 @@ def build_topic(account: str, backend: str, title: str = "", *, agent: str | Non
     ``account`` and ``agent`` are IRC account names, never engine names:
     ``account`` is the owner whose commands the bridge obeys and ``agent`` is
     the bot account whose messages clients trust as backend state. Only
-    ``backend`` names the engine (``codex``, ``opencode``, ``claude``, or ``pi``);
+    ``backend`` names the engine (``codex``, ``opencode``, ``claude``, ``pi``, or ``omp``);
     ``agent="claude"`` would mean an IRC account literally named claude.
     ``agent`` defaults to ``account``: the supported single-account deployment
     shape, where one SASL identity both issues commands and publishes state.
