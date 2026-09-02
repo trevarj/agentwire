@@ -20,7 +20,6 @@ from agentwire.config import (
     IRCConfig,
     OmpConfig,
     OpenCodeConfig,
-    OmpConfig,
     PiConfig,
     SecretsConfig,
     StackConfig,
@@ -35,7 +34,13 @@ from agentwire.models import (
     SessionOutput,
     SessionSummary,
 )
-from agentwire.protocol import PROTOCOL_TAG, Envelope, ProtocolError, encode_envelope, new_envelope
+from agentwire.protocol import (
+    PROTOCOL_TAG,
+    Envelope,
+    ProtocolError,
+    encode_envelope,
+    new_envelope,
+)
 
 
 class FakeIRC:
