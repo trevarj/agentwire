@@ -485,9 +485,27 @@ for line in sys.stdin:
         emit(response)
         emit({"type": "agent_start"})
         emit({"type": "message_end", "message": {"role": "user", "content": command["message"]}})
-        emit({"type": "tool_execution_start", "toolCallId": "tool-1", "toolName": "read", "args": {"path": "x"}})
-        emit({"type": "tool_execution_end", "toolCallId": "tool-1", "toolName": "read", "isError": False, "output": "ok"})
-        emit({"type": "message_end", "message": {"role": "assistant", "content": "done", "stopReason": "stop"}})
+        emit({
+            "type": "tool_execution_start",
+            "toolCallId": "tool-1",
+            "toolName": "read",
+            "args": {"path": "x"},
+        })
+        emit({
+            "type": "tool_execution_end",
+            "toolCallId": "tool-1",
+            "toolName": "read",
+            "isError": False,
+            "output": "ok",
+        })
+        emit({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "content": "done",
+                "stopReason": "stop",
+            },
+        })
         emit({"type": "agent_end", "messages": [], "isTerminal": False})
         time.sleep(0.1)
         emit({"type": "agent_end", "messages": [], "isTerminal": True})

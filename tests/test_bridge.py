@@ -18,6 +18,7 @@ from agentwire.config import (
     CodexConfig,
     Config,
     IRCConfig,
+    OmpConfig,
     OpenCodeConfig,
     OmpConfig,
     PiConfig,
