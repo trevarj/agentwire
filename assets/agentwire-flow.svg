@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 430" role="img" aria-labelledby="title description">
+  <title id="title">Agentwire runtime flow</title>
+  <desc id="description">An IRC controller sends authenticated actions over IRCv3 to the Agentwire bridge. The bridge routes each channel to one configured Codex, OpenCode, Claude, Pi, or OMP session. Session events and state return through the bridge and IRCv3 to the controller. Codex is highlighted as an example selection.</desc>
+  <style>
+    :root { color-scheme: light dark; }
+
+    text {
+      fill: #282720;
+      font-family: "Avenir Next", Avenir, "Segoe UI", sans-serif;
+    }
+
+    .canvas { fill: #f4f1ea; stroke: #c9c3b5; }
+    .card { fill: #fbfaf6; stroke: #c9c3b5; }
+    .muted-surface { fill: #e9e5da; }
+    .divider, .rail { stroke: #c9c3b5; }
+    .rail, .flow { fill: none; stroke-width: 2; vector-effect: non-scaling-stroke; }
+    .flow { stroke-dasharray: 7 9; animation: stream 1.5s linear infinite; }
+    .control { stroke: #2563a6; }
+    .event { stroke: #a04f22; }
+    .control-fill { fill: #2563a6; }
+    .event-fill { fill: #a04f22; }
+    .control-soft { fill: #d9e8f6; }
+    .event-soft { fill: #f5e1d5; }
+    .muted { fill: #676357; }
+    .icon { stroke: #676357; }
+    .kicker { font-size: 11px; font-weight: 700; letter-spacing: 1.5px; }
+    .heading { font-size: 22px; font-weight: 700; letter-spacing: -0.3px; }
+    .title { font-size: 18px; font-weight: 700; }
+    .body { font-size: 13px; }
+    .small { font-size: 11px; }
+    .label { font-size: 10px; font-weight: 700; letter-spacing: 1px; }
+    .chip { fill: #e9e5da; stroke: #c9c3b5; }
+    .chip-selected { fill: #d9e8f6; stroke: #2563a6; }
+    .pulse { animation: pulse 2.4s ease-in-out infinite; transform-origin: center; }
+
+    @keyframes stream { to { stroke-dashoffset: -32; } }
+    @keyframes pulse { 50% { opacity: .45; } }
+
+    @media (prefers-color-scheme: dark) {
+      text { fill: #ecedde; }
+      .canvas { fill: #171915; stroke: #454b40; }
+      .card { fill: #21241f; stroke: #454b40; }
+      .muted-surface { fill: #2b3029; }
+      .divider, .rail { stroke: #454b40; }
+      .control { stroke: #77b7e8; }
+      .event { stroke: #e69b6a; }
+      .control-fill { fill: #77b7e8; }
+      .event-fill { fill: #e69b6a; }
+      .control-soft { fill: #243b4b; }
+      .event-soft { fill: #493328; }
+      .muted { fill: #b1b5a5; }
+      .icon { stroke: #b1b5a5; }
+      .chip { fill: #2b3029; stroke: #454b40; }
+      .chip-selected { fill: #243b4b; stroke: #77b7e8; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .flow, .pulse { animation: none; }
+    }
+  </style>
+
+  <defs>
+    <marker id="control-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="control-fill"/>
+    </marker>
+    <marker id="event-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="event-fill"/>
+    </marker>
+  </defs>
+
+  <rect class="canvas" x="1" y="1" width="1118" height="428" rx="20"/>
+  <text class="kicker muted" x="48" y="43">RUNTIME FLOW</text>
+  <text class="heading" x="48" y="72">One IRC channel, one configured agent session</text>
+
+  <path class="rail" d="M 288 174 H 420"/>
+  <path class="flow control" d="M 288 174 H 414" marker-end="url(#control-arrow)"/>
+  <path class="rail" d="M 700 174 H 832"/>
+  <path class="flow control" d="M 700 174 H 826" marker-end="url(#control-arrow)"/>
+  <path class="rail" d="M 832 299 H 700"/>
+  <path class="flow event" d="M 832 299 H 706" marker-end="url(#event-arrow)"/>
+  <path class="rail" d="M 420 299 H 288"/>
+  <path class="flow event" d="M 420 299 H 294" marker-end="url(#event-arrow)"/>
+
+  <g aria-label="Control flow labels">
+    <rect class="control-soft" x="314" y="128" width="80" height="24" rx="12"/>
+    <text class="label control-fill" x="354" y="144" text-anchor="middle">IRCv3</text>
+    <text class="small muted" x="354" y="166" text-anchor="middle">control</text>
+    <rect class="control-soft" x="730" y="128" width="72" height="24" rx="12"/>
+    <text class="label control-fill" x="766" y="144" text-anchor="middle">ADAPTER</text>
+    <text class="small muted" x="766" y="166" text-anchor="middle">commands</text>
+  </g>
+
+  <g aria-label="Return flow labels">
+    <text class="small muted" x="766" y="326" text-anchor="middle">events · state</text>
+    <rect class="event-soft" x="730" y="335" width="72" height="24" rx="12"/>
+    <text class="label event-fill" x="766" y="351" text-anchor="middle">BACKEND</text>
+    <text class="small muted" x="354" y="326" text-anchor="middle">events · state</text>
+    <rect class="event-soft" x="314" y="335" width="80" height="24" rx="12"/>
+    <text class="label event-fill" x="354" y="351" text-anchor="middle">IRCv3</text>
+  </g>
+
+  <g aria-label="IRC controller or client">
+    <rect class="card" x="48" y="104" width="240" height="260" rx="14"/>
+    <rect class="muted-surface" x="72" y="132" width="34" height="34" rx="8"/>
+    <path class="icon" d="M 80 143 H 98 M 80 149 H 93 M 80 155 H 96" fill="none" stroke-width="2" stroke-linecap="round"/>
+    <text class="kicker muted" x="120" y="143">CONTROLLER</text>
+    <text class="title" x="120" y="167">IRC client</text>
+    <path class="divider" d="M 72 193 H 264"/>
+    <circle class="control-fill" cx="78" cy="220" r="3"/>
+    <text class="body" x="90" y="225">Prompts and commands</text>
+    <circle class="control-fill" cx="78" cy="250" r="3"/>
+    <text class="body" x="90" y="255">Approvals and answers</text>
+    <circle class="event-fill" cx="78" cy="280" r="3"/>
+    <text class="body" x="90" y="285">Live session state</text>
+    <rect class="muted-surface" x="72" y="314" width="152" height="26" rx="13"/>
+    <text class="small muted" x="148" y="331" text-anchor="middle">authenticated account</text>
+  </g>
+
+  <g aria-label="Agentwire bridge">
+    <rect class="card" x="420" y="88" width="280" height="292" rx="16"/>
+    <circle class="control-soft pulse" cx="450" cy="122" r="10"/>
+    <circle class="control-fill" cx="450" cy="122" r="4"/>
+    <text class="kicker muted" x="470" y="116">AGENTWIRE</text>
+    <text class="title" x="470" y="140">IRCv3 bridge</text>
+    <path class="divider" d="M 448 164 H 672"/>
+
+    <rect class="muted-surface" x="448" y="188" width="32" height="32" rx="8"/>
+    <text class="label muted" x="464" y="208" text-anchor="middle">01</text>
+    <text class="body" x="494" y="208">Authenticate protocol actions</text>
+
+    <rect class="muted-surface" x="448" y="234" width="32" height="32" rx="8"/>
+    <text class="label muted" x="464" y="254" text-anchor="middle">02</text>
+    <text class="body" x="494" y="254">Route the channel binding</text>
+
+    <rect class="muted-surface" x="448" y="280" width="32" height="32" rx="8"/>
+    <text class="label muted" x="464" y="300" text-anchor="middle">03</text>
+    <text class="body" x="494" y="300">Normalize backend events</text>
+
+    <rect class="control-soft" x="448" y="333" width="104" height="26" rx="13"/>
+    <text class="small control-fill" x="500" y="350" text-anchor="middle">Agentwire v1</text>
+  </g>
+
+  <g aria-label="One configured backend session">
+    <rect class="card" x="832" y="88" width="240" height="292" rx="16"/>
+    <text class="kicker muted" x="856" y="119">CONFIGURED SESSION</text>
+    <text class="title" x="856" y="145">One backend selected</text>
+
+    <rect class="chip-selected" x="856" y="162" width="78" height="30" rx="15"/>
+    <circle class="control-fill" cx="869" cy="177" r="3"/>
+    <text class="small" x="880" y="181">Codex</text>
+    <rect class="chip" x="942" y="162" width="102" height="30" rx="15"/>
+    <text class="small" x="993" y="181" text-anchor="middle">OpenCode</text>
+
+    <rect class="chip" x="856" y="202" width="78" height="30" rx="15"/>
+    <text class="small" x="895" y="221" text-anchor="middle">Claude</text>
+    <rect class="chip" x="942" y="202" width="42" height="30" rx="15"/>
+    <text class="small" x="963" y="221" text-anchor="middle">Pi</text>
+    <rect class="chip" x="992" y="202" width="52" height="30" rx="15"/>
+    <text class="small" x="1018" y="221" text-anchor="middle">OMP</text>
+
+    <path class="divider" d="M 856 252 H 1048"/>
+    <rect class="muted-surface" x="856" y="272" width="192" height="76" rx="10"/>
+    <circle class="event-fill" cx="876" cy="294" r="4"/>
+    <text class="label muted" x="890" y="298">ACTIVE SESSION</text>
+    <text class="body" x="876" y="325">workspace · turns · tools</text>
+  </g>
+</svg>

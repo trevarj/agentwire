@@ -4,6 +4,8 @@ Agentwire exposes live Codex, OpenCode, Claude, Pi, and OMP sessions as a struct
 supporting client renders sessions, turns, plans, tool cards, approvals, questions, queues, usage,
 and history while the channel remains a useful readable transcript.
 
+![Agentwire runtime flow](assets/agentwire-flow.svg)
+
 The canonical protocol is [`docs/agentwire-irc-v1.md`](docs/agentwire-irc-v1.md). Its JSON Schema
 and interoperability fixtures live in [`protocol/`](protocol/). The old `!command` chat interface
 has been removed; all control messages now use the authenticated protocol tag.
