@@ -15,6 +15,7 @@ from typing import Any
 
 from agentwire.backends.base import Backend, BackendError
 from agentwire.config import PiConfig
+from agentwire.diagnostics import DiagnosticCheck, backend_readiness
 from agentwire.models import (
     BackendEvent,
     HistoryPage,
@@ -306,6 +307,18 @@ class PiBackend(Backend):
         # ponytail: one-slot whole-transcript cache; move to since-cursor
         # increments if transcripts outgrow a single fetch.
         self._entries_cache: tuple[str, float, list[dict[str, Any]]] | None = None
+
+    def diagnostic_snapshot(self) -> list[DiagnosticCheck]:
+        # Adapter readiness is independent of whether any TUI session exists.
+        return [
+            backend_readiness(
+                self._ready.is_set(),
+                self._closed,
+                sessionCount=len(self._sessions),
+                socketCount=len(self._known_sockets),
+                pendingRequests=len(self._ui_requests),
+            )
+        ]
 
     def _make_transport(
         self,

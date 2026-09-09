@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Any
 
 from agentwire.bridge import Bridge
-from agentwire.config import ClaudeConfig, Config, install_secret_env
+from agentwire.config import ClaudeConfig, Config, install_secret_env, load_config, load_secret_env
+from agentwire.diagnostics import DiagnosticCheck, report
 from agentwire.irc import IRCClient
 
 LOGGER = logging.getLogger("agentwire.stack")
@@ -118,6 +119,161 @@ def _private_file(path: Path, description: str) -> None:
         raise StackError(f"{description} is not a regular file: {path}")
     if mode & 0o077:
         raise StackError(f"{description} must not be group/world accessible: {path}")
+
+
+def doctor_report(path: Path) -> dict[str, Any]:
+    """Collect independent static checks without printing paths or exception text."""
+    checks: list[DiagnosticCheck] = []
+
+    def check(code: str, operation: Any, success: str, failure: str, next_step: str) -> bool:
+        try:
+            operation()
+        except Exception:
+            checks.append(DiagnosticCheck(code, "error", failure, next_step=next_step))
+            return False
+        checks.append(DiagnosticCheck(code, "ok", success))
+        return True
+
+    check(
+        "config.permissions",
+        lambda: _private_file(path, "config"),
+        "Configuration permissions are private.",
+        "Configuration is unavailable or not private.",
+        "Use a regular configuration file accessible only to its owner.",
+    )
+    try:
+        config = load_config(path)
+    except Exception:
+        checks.extend(
+            [
+                DiagnosticCheck(
+                    "config.load",
+                    "error",
+                    "Configuration could not be loaded.",
+                    next_step="Check the local configuration syntax and required fields.",
+                ),
+                DiagnosticCheck(
+                    "config.dependent", "unknown", "Dependent checks require valid configuration."
+                ),
+                DiagnosticCheck(
+                    "runtime.live",
+                    "unknown",
+                    "Live runtime state is available through IRC diagnostics.",
+                ),
+            ]
+        )
+        return report("doctor", checks)
+    checks.append(DiagnosticCheck("config.load", "ok", "Configuration is valid."))
+    private_secrets = check(
+        "secrets.permissions",
+        lambda: _private_file(config.secrets.env_file, "secrets"),
+        "Secrets file permissions are private.",
+        "Secrets file is unavailable or not private.",
+        "Use a regular secrets file accessible only to its owner.",
+    )
+
+    def validate_secrets() -> None:
+        values = load_secret_env(config.secrets.env_file)
+        required = {config.irc.password_env}
+        if config.opencode is not None:
+            required.add(config.opencode.password_env)
+        if config.claude is not None and config.claude.api_key_env is not None:
+            required.add(config.claude.api_key_env)
+        if required - values.keys():
+            raise StackError("missing secrets")
+
+    valid_secrets = private_secrets and check(
+        "secrets.required",
+        validate_secrets,
+        "Required secrets are present.",
+        "Required secrets could not be validated.",
+        "Check required entries in the local secrets file.",
+    )
+    if not private_secrets:
+        checks.append(
+            DiagnosticCheck(
+                "secrets.required", "unknown", "Secret validation requires a private secrets file."
+            )
+        )
+    check(
+        "irc.ca",
+        lambda: ssl.create_default_context(cafile=str(config.irc.ca_file)),
+        "IRC certificate authority is valid.",
+        "IRC certificate authority could not be loaded.",
+        "Check the configured IRC certificate authority file.",
+    )
+    binaries = {"ssh": config.stack.ssh_binary}
+    for name in ("codex", "opencode", "claude", "pi", "omp"):
+        backend = getattr(config, name)
+        if backend is not None:
+            binaries[name] = backend.binary
+    available = {}
+    for name, binary in binaries.items():
+        available[name] = check(
+            f"binary.{name}",
+            lambda binary=binary: _binary(binary),
+            f"{name} executable is available.",
+            f"{name} executable is unavailable.",
+            "Check executable availability in the project environment.",
+        )
+    if config.claude is not None:
+        # CLI auth status is the existing bounded local doctor probe. Live IRC
+        # diagnostics never invoke it, and no returned text is serialized.
+        if available["claude"] and (config.claude.api_key_env is None or valid_secrets):
+            check(
+                "claude.authentication",
+                lambda: _claude_credentials(config.claude),
+                "Claude credentials are available.",
+                "Claude credentials could not be validated.",
+                "Check local Claude authentication or the configured API key.",
+            )
+        else:
+            checks.append(
+                DiagnosticCheck(
+                    "claude.authentication",
+                    "unknown",
+                    "Credential validation requires an executable and configured secrets.",
+                )
+            )
+    for name in ("pi", "omp"):
+        backend = getattr(config, name)
+        if backend is not None:
+            try:
+                # A directory entry is not proof that a session is reachable.
+                count = sum(
+                    stat.S_ISSOCK(entry.stat().st_mode)
+                    for entry in backend.socket_dir.glob("*.sock")
+                )
+                checks.append(
+                    DiagnosticCheck(
+                        f"{name}.sockets",
+                        "ok",
+                        "Local socket entries were counted; reachability was not probed.",
+                        {"socketCount": count},
+                    )
+                )
+            except OSError:
+                checks.append(
+                    DiagnosticCheck(
+                        f"{name}.sockets", "unknown", "Local socket entries could not be counted."
+                    )
+                )
+    checks.extend(
+        [
+            DiagnosticCheck(
+                "irc.fakelag",
+                "unknown",
+                "Server flood-delay policy cannot be checked locally.",
+                next_step="Check the bridge account's server flood-delay exemption.",
+            ),
+            DiagnosticCheck(
+                "runtime.live",
+                "unknown",
+                "Live runtime state is available through IRC diagnostics.",
+            ),
+        ]
+    )
+    return report("doctor", checks)
 
 
 def doctor(config: Config) -> list[str]:

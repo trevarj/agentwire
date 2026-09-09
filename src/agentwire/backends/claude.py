@@ -33,6 +33,7 @@ from claude_agent_sdk import (
 from agentwire.backends.base import Backend, BackendError
 from agentwire.backends.claude_follow import TranscriptTailer
 from agentwire.config import ClaudeConfig
+from agentwire.diagnostics import DiagnosticCheck, backend_readiness
 from agentwire.models import (
     BackendEvent,
     HistoryPage,
@@ -135,6 +136,16 @@ class ClaudeBackend(Backend):
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
+
+    def diagnostic_snapshot(self) -> list[DiagnosticCheck]:
+        return [
+            backend_readiness(
+                self._ready.is_set(),
+                self._closed,
+                sessionCount=len(self._sessions),
+                pendingRequests=len(self._approvals) + len(self._questions),
+            )
+        ]
 
     async def start(self) -> None:
         if self._ready.is_set():

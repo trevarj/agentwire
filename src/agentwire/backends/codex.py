@@ -19,6 +19,7 @@ import aiohttp
 
 from agentwire.backends.base import Backend, BackendError
 from agentwire.config import CodexConfig
+from agentwire.diagnostics import DiagnosticCheck, backend_readiness
 from agentwire.models import (
     BackendEvent,
     HistoryPage,
@@ -159,6 +160,15 @@ class CodexBackend(Backend):
         self._next_prompt_echo = 0
         self._seen_user_items: dict[str, list[str]] = {}
         self._subagents: dict[str, dict[str, dict[str, Any]]] = {}
+
+    def diagnostic_snapshot(self) -> list[DiagnosticCheck]:
+        return [
+            backend_readiness(
+                self._ready.is_set(),
+                self._closed,
+                pendingRequests=len(self._pending) + len(self._server_requests),
+            )
+        ]
 
     async def start(self) -> None:
         async with self._connect_lock:

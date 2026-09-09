@@ -183,6 +183,25 @@ a configured control channel for the same authenticated owner and backend, allow
 dedicated channel's receipt to be recovered. Receipt detail is bounded and secret-scanned; action
 payloads, device IDs, and session IDs are never returned.
 
+`diagnostics.request` has empty `data` and returns `diagnostics.snapshot` with the query UUID
+in `reply`. The `diagnostics` capability and action advertisement enable this read. It shares
+the bounded fast-read queue with receipt queries and requires the current epoch, authenticated
+account, active channel, and live delivery. Diagnostics do not execute backend operations and
+are never transcript history or durable mutation receipts.
+
+The report contains `schemaVersion: 1`, `generatedAt` (Unix milliseconds), `source: "bridge"`,
+and bounded `checks`. Each check has a stable `code`, `status` (`ok`, `warning`, `error`, or
+`unknown`), an `explanation`, allowlisted boolean/count `facts`, and optional `nextStep`.
+Checks describe cached IRC readiness and outgoing queue depth/age, backend readiness, channel
+activation/binding/busy state, pending requests, and mutation queue depth. An unavailable
+observation is `unknown`; no active Pi/OMP sessions does not mean their adapter is unready.
+Reports exclude paths, account names, credentials, prompts, tool data, and raw exception text.
+
+`agentwire doctor --json` emits the same report shape with `source: "doctor"`. It aggregates
+independent static checks, emits valid JSON even when configuration loading fails, and exits
+nonzero if any check is an error. Dependent checks become unknown. The existing human-readable
+doctor command remains available. Live state requires IRC; no local runtime socket is created.
+
 `history.request` targets the currently attached session using the envelope `sid`; older clients
 that omit it target the current binding. A supplied `sid` that differs from the binding is rejected.
 Backends with authoritative transcript pagination, including Codex and Claude, provide full
@@ -207,6 +226,7 @@ The following kinds are defined. A client MUST enable only those listed in the `
 
 - Discovery: `sync.request`, `workspace.list.request`, `session.list.request`, `history.request`.
 - Receipts: `action.status.request`.
+- Diagnostics: `diagnostics.request`.
 - Binding: `session.create`, `session.close`, `session.attach`, `session.detach`.
 - Optional lifecycle: `session.rename`, `session.fork`, `session.archive`, `session.unarchive`.
 - Settings: `settings.update`.

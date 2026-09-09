@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 
 from agentwire.config import IRCConfig
+from agentwire.diagnostics import DiagnosticCheck
 from agentwire.protocol import PROTOCOL_TAG, Envelope, fragment_envelope
 from agentwire.text import clean_text
 
@@ -20,6 +21,21 @@ from agentwire.text import clean_text
 # They never carry message text, tag values, or credentials: IRC traffic is the
 # payload this bridge is trusted with, and a log file is not a secret store.
 LOGGER = logging.getLogger("agentwire.irc")
+REQUIRED_CAPABILITIES = frozenset(
+    {
+        "sasl",
+        "account-tag",
+        "message-tags",
+        "server-time",
+        "batch",
+        "draft/multiline",
+        "labeled-response",
+        "echo-message",
+        "standard-replies",
+        "draft/chathistory",
+        "draft/event-playback",
+    }
+)
 
 
 class IRCError(RuntimeError):
@@ -144,6 +160,48 @@ class IRCClient:
         # Channels whose topic the server has answered, with 331 or 332.
         self._topics: set[str] = set()
         self._batches: dict[str, _IncomingBatch] = {}
+
+    def diagnostic_snapshot(self) -> list[DiagnosticCheck]:
+        connected = self._writer is not None and not self._writer.is_closing()
+        authenticated = connected and bool(self.account)
+        capabilities_ready = REQUIRED_CAPABILITIES - {"echo-message"} <= self._caps
+        # asyncio.Queue has no public peek. Read only its oldest item on this
+        # event loop, without dequeueing or affecting transport ordering.
+        oldest = self._outgoing._queue[0] if self._outgoing.qsize() else None
+        age = max(0, int((time.monotonic() - oldest.queued_at) * 1000)) if oldest else 0
+        return [
+            DiagnosticCheck(
+                "irc.connection",
+                "ok" if connected else "warning",
+                "IRC is connected." if connected else "IRC is disconnected.",
+                {"connected": connected},
+            ),
+            DiagnosticCheck(
+                "irc.authentication",
+                "ok" if authenticated else "warning",
+                "IRC authentication is confirmed."
+                if authenticated
+                else "IRC authentication is unconfirmed.",
+                {"authenticated": authenticated},
+            ),
+            DiagnosticCheck(
+                "irc.capabilities",
+                "ok" if connected and capabilities_ready else "warning",
+                "Required IRC capabilities are ready."
+                if connected and capabilities_ready
+                else "Required IRC capabilities are unavailable.",
+                {
+                    "capabilitiesReady": connected and capabilities_ready,
+                    "ready": self._ready.is_set(),
+                },
+            ),
+            DiagnosticCheck(
+                "irc.outgoing",
+                "warning" if age >= 10000 else "ok",
+                "Outgoing messages are queued." if oldest else "Outgoing queue is empty.",
+                {"queueDepth": self._outgoing.qsize(), "oldestQueuedMs": age},
+            ),
+        ]
 
     async def start(self) -> None:
         if self._runner is None:
@@ -363,19 +421,7 @@ class IRCClient:
         sasl_started = False
         sasl_complete = False
         welcome = False
-        required = {
-            "sasl",
-            "account-tag",
-            "message-tags",
-            "server-time",
-            "batch",
-            "draft/multiline",
-            "labeled-response",
-            "echo-message",
-            "standard-replies",
-            "draft/chathistory",
-            "draft/event-playback",
-        }
+        required = REQUIRED_CAPABILITIES
         # Bridge must prove clients can use echo-message, but enabling it on
         # this connection only sends every published event back to be discarded.
         enabled_required = required - {"echo-message"}

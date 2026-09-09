@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -12,6 +13,7 @@ from agentwire.stack import (
     StackError,
     codex_tui,
     doctor,
+    doctor_report,
     opencode_tui,
     run_bridge,
     run_stack,
@@ -40,7 +42,10 @@ def _parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("run", help="run only the bridge")
     subparsers.add_parser("stack", help="run the tunnel, backends, and bridge")
-    subparsers.add_parser("doctor", help="validate the live setup")
+    doctor_parser = subparsers.add_parser("doctor", help="validate the live setup")
+    doctor_parser.add_argument(
+        "--json", action="store_true", help="emit a structured diagnostic report"
+    )
     subparsers.add_parser("sync-cert", help="refresh the trusted Ergo certificate")
     subparsers.add_parser("codex-tui", help="attach the Codex TUI")
     opencode = subparsers.add_parser("opencode-tui", help="attach the OpenCode TUI")
@@ -66,6 +71,12 @@ def configure_logging() -> None:
 def main() -> None:
     arguments = _parser().parse_args()
     configure_logging()
+    if arguments.command == "doctor" and arguments.json:
+        result = doctor_report(arguments.config)
+        print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+        if any(check["status"] == "error" for check in result["checks"]):
+            raise SystemExit(1)
+        return
     try:
         config = load_config(arguments.config)
         if arguments.command == "run":

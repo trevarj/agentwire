@@ -57,6 +57,7 @@ def _hello(events: Envelopes) -> Envelope:
             "capabilities": [
                 "actionStatus",
                 "compressedFragments",
+                "diagnostics",
                 "history",
                 "historyChunks",
                 "queues",
@@ -74,6 +75,7 @@ def _hello(events: Envelopes) -> Envelope:
                 "session.list.request",
                 "history.request",
                 "action.status.request",
+                "diagnostics.request",
                 "session.create",
                 "session.attach",
                 "session.detach",
@@ -360,11 +362,42 @@ def _corpus(events: list[Envelope]) -> dict[str, Any]:
     return {"topic": TOPIC, "steps": steps}
 
 
+def diagnostics(events: Envelopes) -> list[Envelope]:
+    return [
+        _hello(events),
+        events.event(
+            "diagnostics.snapshot",
+            reply="diagnostics-query",
+            data={
+                "schemaVersion": 1,
+                "generatedAt": 1_785_400_000_000,
+                "source": "bridge",
+                "checks": [
+                    {
+                        "code": "backend.ready",
+                        "status": "ok",
+                        "explanation": "Backend is ready.",
+                        "facts": {"ready": True, "sessionCount": 0},
+                    },
+                    {
+                        "code": "irc.outgoing",
+                        "status": "warning",
+                        "explanation": "Outgoing messages are queued.",
+                        "facts": {"queueDepth": 2, "oldestQueuedMs": 15000},
+                        "nextStep": "Check IRC connectivity.",
+                    },
+                ],
+            },
+        ),
+    ]
+
+
 def _documents() -> dict[str, str]:
     scenarios: tuple[tuple[str, Callable[[Envelopes], list[Envelope]]], ...] = (
         ("claude-session", claude_session),
         ("queue-and-acks", queue_and_acks),
         ("action-status", action_status),
+        ("diagnostics", diagnostics),
         ("replay-and-isolation", replay_and_isolation),
     )
     events = Envelopes()

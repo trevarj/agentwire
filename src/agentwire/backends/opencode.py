@@ -12,6 +12,7 @@ import aiohttp
 
 from agentwire.backends.base import Backend, BackendError
 from agentwire.config import OpenCodeConfig
+from agentwire.diagnostics import DiagnosticCheck, backend_readiness
 from agentwire.models import BackendEvent, Question, SessionSummary
 from agentwire.text import safe_one_line
 
@@ -34,6 +35,13 @@ class OpenCodeBackend(Backend):
         self._last_replies: dict[str, str] = {}
         self._tool_states: dict[str, str] = {}
         self._requests: dict[str, tuple[str, str, tuple[Question, ...]]] = {}
+
+    def diagnostic_snapshot(self) -> list[DiagnosticCheck]:
+        return [
+            backend_readiness(
+                self._ready.is_set(), self._closed, pendingRequests=len(self._requests)
+            )
+        ]
 
     async def start(self) -> None:
         if self._reader_task is not None:

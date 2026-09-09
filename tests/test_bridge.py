@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from agentwire.backends.base import Backend, BackendError
-from agentwire.bridge import Bridge
+from agentwire.bridge import FAST_READ_ACTION_KINDS, Bridge
 from agentwire.config import (
     BridgeConfig,
     CodexConfig,
@@ -257,8 +257,8 @@ async def test_hello_advertisements_match_dispatch_and_backend_settings(
     handler_kinds = set(
         re.findall(r'"([^\"]+)": self\._action_', inspect.getsource(Bridge._dispatch_action))
     )
-    assert set(hello.data["actions"]) <= handler_kinds <= ACTION_KINDS
-    assert ACTION_KINDS - handler_kinds == {
+    assert set(hello.data["actions"]) <= handler_kinds | FAST_READ_ACTION_KINDS <= ACTION_KINDS
+    assert ACTION_KINDS - (handler_kinds | FAST_READ_ACTION_KINDS) == {
         "session.rename",
         "session.fork",
         "session.archive",

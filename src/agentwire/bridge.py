@@ -14,6 +14,7 @@ from typing import Any
 
 from agentwire.backends.base import Backend, BackendError
 from agentwire.config import Config, ConfigError, resolve_workspace
+from agentwire.diagnostics import DiagnosticCheck, report
 from agentwire.irc import IRCClient, IRCMessage
 from agentwire.models import BackendEvent, ChannelBinding, Question, SessionSummary
 from agentwire.protocol import (
@@ -49,6 +50,8 @@ READ_ACTION_KINDS = frozenset(
     {"sync.request", "workspace.list.request", "session.list.request", "history.request"}
 )
 STATUS_ACTION_KIND = "action.status.request"
+DIAGNOSTICS_ACTION_KIND = "diagnostics.request"
+FAST_READ_ACTION_KINDS = frozenset({STATUS_ACTION_KIND, DIAGNOSTICS_ACTION_KIND})
 STATUS_QUEUE_LIMIT = 32
 # Diagnostics name channels, accounts, kinds, and reasons. They never carry
 # prompt text, tool output, tag values, or credentials.
@@ -353,7 +356,8 @@ class Bridge:
             if (
                 isinstance(raw, dict)
                 and raw.get("t") == "action"
-                and raw.get("k") == STATUS_ACTION_KIND
+                and isinstance(raw.get("k"), str)
+                and raw.get("k") in FAST_READ_ACTION_KINDS
                 and isinstance(action_id, str)
             ):
                 uuid.UUID(action_id)
@@ -407,7 +411,7 @@ class Bridge:
                         channel, action.id, "channel was suspended before execution"
                     )
                     continue
-                await self._action_status(channel, action, descriptor)
+                await self._fast_read(channel, action, descriptor)
             except (BackendError, ConfigError, ProtocolError, ValueError) as exc:
                 await self._emit_failure(channel, action.id, str(exc))
             except Exception:
@@ -629,6 +633,7 @@ class Bridge:
             "session.list.request",
             "history.request",
             STATUS_ACTION_KIND,
+            DIAGNOSTICS_ACTION_KIND,
             "session.create",
             "session.attach",
             "session.detach",
@@ -664,6 +669,7 @@ class Bridge:
                     "queues",
                     "requests",
                     "actionStatus",
+                    "diagnostics",
                 }
             ),
             "actions": sorted(actions),
@@ -709,8 +715,8 @@ class Bridge:
         descriptor = await self._prepare_action(channel, action, requester_nick)
         if descriptor is None:
             return
-        if action.kind == STATUS_ACTION_KIND:
-            await self._action_status(channel, action, descriptor)
+        if action.kind in FAST_READ_ACTION_KINDS:
+            await self._fast_read(channel, action, descriptor)
         else:
             await self._execute_action(channel, descriptor)
 
@@ -724,7 +730,7 @@ class Bridge:
         if not self._descriptor_is_trusted(channel, descriptor):
             await self._fail_unqueued_action(descriptor, "channel changed before execution")
             return
-        if action.kind == STATUS_ACTION_KIND:
+        if action.kind in FAST_READ_ACTION_KINDS:
             try:
                 queue = self._status_queues.get(channel)
                 if queue is None:
@@ -732,7 +738,12 @@ class Bridge:
                     return
                 queue.put_nowait(descriptor)
             except asyncio.QueueFull:
-                await self._emit_failure(channel, action.id, "too many action status requests")
+                reason = (
+                    "too many action status requests"
+                    if action.kind == STATUS_ACTION_KIND
+                    else "too many diagnostics requests"
+                )
+                await self._emit_failure(channel, action.id, reason)
             return
         queue = self._action_queues.get(channel)
         if queue is None:
@@ -769,7 +780,7 @@ class Bridge:
         runtime_identity = runtime.identity
         owner_account = activation.account
         backend = runtime.backend
-        tracked = action.kind not in READ_ACTION_KINDS and action.kind != STATUS_ACTION_KIND
+        tracked = action.kind not in READ_ACTION_KINDS and action.kind not in FAST_READ_ACTION_KINDS
         if tracked:
             LOGGER.info("%s: journaling action %s (%s)", channel, action.kind, action.id)
             duplicate = await self.state.claim_action(action, channel, owner_account, backend)
@@ -915,6 +926,73 @@ class Bridge:
     async def _action_sync(self, channel: str, action: Envelope) -> None:
         await self._emit_hello(channel, reply=action.id)
         await self._emit_snapshot(channel, reply=action.id)
+
+    async def _fast_read(
+        self, channel: str, action: Envelope, descriptor: ActionDescriptor
+    ) -> None:
+        if action.kind == STATUS_ACTION_KIND:
+            await self._action_status(channel, action, descriptor)
+        else:
+            await self._action_diagnostics(channel, action, descriptor)
+
+    async def _action_diagnostics(
+        self, channel: str, action: Envelope, descriptor: ActionDescriptor
+    ) -> None:
+        if not self._descriptor_is_trusted(channel, descriptor):
+            return
+        runtime = self.channels[channel]
+        snapshot = getattr(self.irc, "diagnostic_snapshot", None)
+        checks = (
+            snapshot()
+            if snapshot is not None
+            else [DiagnosticCheck("irc.connection", "unknown", "IRC diagnostics are unavailable.")]
+        )
+        try:
+            backend_checks = self.backends[runtime.backend].diagnostic_snapshot()
+            # Validate extension snapshots before including any values on IRC.
+            report("bridge", backend_checks)
+            # Reserve room for the channel checks and an explicit truncation
+            # notice, even when an extension fills the entire report budget.
+            backend_limit = 64 - len(checks) - 3
+            if len(backend_checks) > backend_limit:
+                backend_checks = backend_checks[: backend_limit - 1] + [
+                    DiagnosticCheck(
+                        "backend.truncated",
+                        "warning",
+                        "Additional backend checks were omitted to keep the report bounded.",
+                    )
+                ]
+            checks.extend(backend_checks)
+        except Exception:
+            checks.append(
+                DiagnosticCheck("backend.ready", "unknown", "Backend diagnostics are unavailable.")
+            )
+        checks.extend(
+            [
+                DiagnosticCheck("channel.activation", "ok", "Channel is active.", {"active": True}),
+                DiagnosticCheck(
+                    "channel.binding",
+                    "ok",
+                    "Channel has a session."
+                    if runtime.binding
+                    else "Channel has no bound session.",
+                    {
+                        "bound": runtime.binding is not None,
+                        "busy": runtime.busy,
+                        "pendingRequests": len(runtime.requests),
+                    },
+                ),
+                DiagnosticCheck(
+                    "channel.mutations",
+                    "ok",
+                    "Mutation queue depth is observed locally.",
+                    {"queueDepth": self._action_queues[channel].qsize()},
+                ),
+            ]
+        )
+        await self._emit(
+            channel, "diagnostics.snapshot", reply=action.id, data=report("bridge", checks)
+        )
 
     async def _action_status(
         self, channel: str, action: Envelope, descriptor: ActionDescriptor

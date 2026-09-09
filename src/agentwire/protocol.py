@@ -70,6 +70,7 @@ ACTION_KINDS = frozenset(
         "session.list.request",
         "history.request",
         "action.status.request",
+        "diagnostics.request",
         "session.create",
         "session.close",
         "session.attach",
@@ -108,6 +109,7 @@ EVENT_KINDS = frozenset(
         "action.failed",
         "action.uncertain",
         "action.status",
+        "diagnostics.snapshot",
         "queue.snapshot",
         "queue.item.added",
         "queue.item.updated",
@@ -260,10 +262,10 @@ class Envelope:
             raise ProtocolError("data must be an object")
         if (
             message_type == "event"
-            and kind == "action.status"
+            and kind in {"action.status", "diagnostics.snapshot"}
             and not isinstance(value.get("reply"), str)
         ):
-            raise ProtocolError("action.status requires reply")
+            raise ProtocolError(f"{kind} requires reply")
         _validate_kind_data(kind, message_type, data)
         revision = _wire_integer(value.get("rev"))
         if "rev" in value and (revision is None or not 0 <= revision <= 2**63 - 1):
@@ -292,6 +294,17 @@ class Envelope:
 
 def _validate_kind_data(kind: str, message_type: str, data: dict[str, Any]) -> None:
     """Validate payloads whose shape is part of the v1 interoperability contract."""
+    if message_type == "action" and kind == "diagnostics.request" and data:
+        raise ProtocolError("diagnostics.request data must be empty")
+    if message_type == "event" and kind == "diagnostics.snapshot":
+        from agentwire.diagnostics import validate_report
+
+        try:
+            validate_report(data)
+        except ValueError as exc:
+            raise ProtocolError(str(exc)) from exc
+        if data["source"] != "bridge":
+            raise ProtocolError("diagnostics.snapshot source must be bridge")
     if message_type == "action" and kind == "action.status.request":
         if set(data) - {"actionId", "channel"}:
             raise ProtocolError("action.status.request has unsupported data fields")

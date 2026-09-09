@@ -4,6 +4,7 @@ import abc
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 
+from agentwire.diagnostics import DiagnosticCheck
 from agentwire.models import BackendEvent, HistoryPage, Question, SessionSummary
 
 
@@ -16,6 +17,10 @@ class Backend(abc.ABC):
     # True when list_history serves authoritative transcript pages. The bridge
     # journal is never read for such a backend, so it is not written either.
     has_authoritative_history = False
+
+    def diagnostic_snapshot(self) -> list[DiagnosticCheck]:
+        """Read cached state only; adapters may honestly report no observation."""
+        return [DiagnosticCheck("backend.ready", "unknown", "Backend readiness is unavailable.")]
 
     @abc.abstractmethod
     async def start(self) -> None: ...
