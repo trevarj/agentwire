@@ -55,6 +55,7 @@ def _hello(events: Envelopes) -> Envelope:
             "backend": "claude",
             "epoch": EPOCH,
             "capabilities": [
+                "actionStatus",
                 "compressedFragments",
                 "history",
                 "historyChunks",
@@ -72,6 +73,7 @@ def _hello(events: Envelopes) -> Envelope:
                 "workspace.list.request",
                 "session.list.request",
                 "history.request",
+                "action.status.request",
                 "session.create",
                 "session.attach",
                 "session.detach",
@@ -196,6 +198,51 @@ def queue_and_acks(events: Envelopes) -> list[Envelope]:
     ]
 
 
+def action_status(events: Envelopes) -> list[Envelope]:
+    action_id = "00000000-0000-4000-8000-00000000cafe"
+    return [
+        _hello(events),
+        events.event(
+            "action.status",
+            reply="00000000-0000-4000-8000-00000000a001",
+            data={
+                "actionId": action_id,
+                "status": "accepted",
+                "kind": "turn.prompt",
+                "channel": "#claude",
+                "receivedAt": 1_785_400_000_100,
+            },
+        ),
+        # A delayed accepted acknowledgement and a stale unknown lookup must
+        # never hide the terminal receipt already rendered by a client.
+        events.event("action.accepted", reply=action_id, data={}),
+        events.event(
+            "action.status",
+            reply="00000000-0000-4000-8000-00000000a004",
+            data={"actionId": action_id, "status": "unknown"},
+        ),
+        events.event(
+            "action.status",
+            reply="00000000-0000-4000-8000-00000000a002",
+            data={
+                "actionId": action_id,
+                "status": "succeeded",
+                "kind": "turn.prompt",
+                "channel": "#claude",
+                "receivedAt": 1_785_400_000_100,
+            },
+        ),
+        events.event(
+            "action.status",
+            reply="00000000-0000-4000-8000-00000000a003",
+            data={
+                "actionId": "00000000-0000-4000-8000-00000000dead",
+                "status": "unknown",
+            },
+        ),
+    ]
+
+
 def replay_and_isolation(events: Envelopes) -> list[Envelope]:
     live_start = events.event(
         "tool.started",
@@ -317,6 +364,7 @@ def _documents() -> dict[str, str]:
     scenarios: tuple[tuple[str, Callable[[Envelopes], list[Envelope]]], ...] = (
         ("claude-session", claude_session),
         ("queue-and-acks", queue_and_acks),
+        ("action-status", action_status),
         ("replay-and-isolation", replay_and_isolation),
     )
     events = Envelopes()

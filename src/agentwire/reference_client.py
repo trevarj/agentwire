@@ -34,6 +34,7 @@ class HarnessState:
     requests: dict[str, dict[str, Any]] = field(default_factory=dict)
     assistant: list[dict[str, Any]] = field(default_factory=list)
     tools: dict[str, dict[str, Any]] = field(default_factory=dict)
+    action_status: dict[str, dict[str, Any]] = field(default_factory=dict)
     plan: dict[str, Any] | None = None
     # Replace-not-merge: every `subagent.updated` carries the full current list.
     subagents: list[dict[str, Any]] = field(default_factory=list)
@@ -87,6 +88,21 @@ class HarnessState:
                 else event.session_id
             )
             self._reset_timeline()
+        elif event.kind in {
+            "action.accepted",
+            "action.succeeded",
+            "action.failed",
+            "action.uncertain",
+        }:
+            if event.reply and not event.history:
+                receipt: dict[str, Any] = {"status": event.kind.removeprefix("action.")}
+                if isinstance(event.data.get("message"), str):
+                    receipt["message"] = event.data["message"]
+                self._merge_action_status(event.reply, receipt)
+        elif event.kind == "action.status":
+            action_id = event.data.get("actionId")
+            if isinstance(action_id, str) and not event.history:
+                self._merge_action_status(action_id, dict(event.data))
         elif event.kind in {"session.snapshot", "session.status"} and self._is_bound(event):
             self.settings.update(event.data.get("settings") or {})
             if "busy" in event.data:
@@ -182,6 +198,23 @@ class HarnessState:
         self.subagents = []
         self._seen_event_ids.clear()
 
+    def _merge_action_status(self, action_id: str, incoming: dict[str, Any]) -> None:
+        """Never let delayed acceptance or unknown lookup hide a terminal receipt."""
+        previous = self.action_status.get(action_id)
+        if previous is not None and self._receipt_rank(incoming) < self._receipt_rank(previous):
+            return
+        self.action_status[action_id] = incoming
+
+    @staticmethod
+    def _receipt_rank(receipt: dict[str, Any]) -> int:
+        return {
+            "unknown": 0,
+            "accepted": 1,
+            "succeeded": 2,
+            "failed": 2,
+            "uncertain": 2,
+        }.get(receipt.get("status"), -1)
+
     def _is_queue_relevant(self, event: Envelope) -> bool:
         # Queue operations remain useful before the first binding snapshot.
         # Once a channel is bound, a delayed queue event from another session
@@ -238,6 +271,7 @@ class HarnessState:
             "requests": self.requests,
             "assistant": self.assistant,
             "tools": self.tools,
+            "actionStatus": self.action_status,
             "plan": self.plan,
             "subagents": self.subagents,
         }

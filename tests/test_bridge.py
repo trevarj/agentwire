@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import json
 import logging
 import re
 from collections.abc import AsyncIterator, Mapping, Sequence
@@ -44,6 +45,7 @@ from agentwire.protocol import (
     encode_envelope,
     new_envelope,
 )
+from agentwire.state import StateStore
 
 
 class FakeIRC:
@@ -284,11 +286,10 @@ async def test_action_workers_preserve_channel_independence(tmp_path: Path) -> N
     bridge._dispatch_action = dispatch  # type: ignore[method-assign]
     workers = [asyncio.create_task(bridge._action_loop(channel)) for channel in bridge.channels]
     try:
-        now = asyncio.get_running_loop().time()
         action = new_envelope("sync.request", "action", "client", device="phone")
-        await bridge._action_queues["#first"].put((action, now, "trev"))
+        await bridge._ingest_action("#first", action, "trev")
         await first_started.wait()
-        await bridge._action_queues["#second"].put((action, now, "trev"))
+        await bridge._ingest_action("#second", action, "trev")
         await asyncio.wait_for(second_done.wait(), 0.5)
         assert not release_first.is_set()
     finally:
@@ -1131,7 +1132,7 @@ async def test_managed_pi_close_is_safe_and_succeeds_before_part(tmp_path: Path)
     queue = bridge._action_queues[managed]
     bridge._start_action_worker(managed)
     worker = bridge._action_workers[managed]
-    await queue.put((close, asyncio.get_running_loop().time(), "Alice"))
+    await bridge._ingest_action(managed, close, "Alice")
     await asyncio.wait_for(queue.join(), 1)
     await asyncio.wait_for(worker, 1)
 
@@ -1988,3 +1989,372 @@ async def test_subagent_updates_are_bound_session_state_and_coalesced(
     await update("s1", "a5")
     assert sent()[-1] == ("subagent.updated", ["a5"])
     assert len(irc.sent) == 5
+
+
+@pytest.mark.asyncio
+async def test_status_query_reads_accepted_queued_mutation_without_backend_work(
+    tmp_path: Path,
+) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stalled(_channel: str, _action: Envelope, _nick: str = "") -> None:
+        started.set()
+        await release.wait()
+
+    bridge._dispatch_action = stalled  # type: ignore[method-assign]
+    action_worker = asyncio.create_task(bridge._action_loop("#codex"))
+    status_worker = asyncio.create_task(bridge._status_loop("#codex"))
+    irc_worker = asyncio.create_task(bridge._irc_loop())
+    try:
+        mutation = new_envelope(
+            "turn.prompt", "action", "client", epoch=bridge.epoch, device="phone"
+        )
+        await irc.incoming.put(
+            IRCMessage(
+                "#codex",
+                "trev",
+                "trev",
+                "",
+                MappingProxyType({PROTOCOL_TAG: encode_envelope(mutation)}),
+                "TAGMSG",
+            )
+        )
+        await started.wait()
+        query = new_envelope(
+            "action.status.request",
+            "action",
+            "client",
+            epoch=bridge.epoch,
+            device="phone",
+            data={"actionId": mutation.id},
+        )
+        await irc.incoming.put(
+            IRCMessage(
+                "#codex",
+                "trev",
+                "trev",
+                "",
+                MappingProxyType({PROTOCOL_TAG: encode_envelope(query)}),
+                "TAGMSG",
+            )
+        )
+        status_events: list[Envelope] = []
+        for _ in range(50):
+            status_events = [
+                event for _target, event, _preview in irc.sent if event.kind == "action.status"
+            ]
+            if status_events:
+                break
+            await asyncio.sleep(0.01)
+        status = status_events[-1]
+        assert status.kind == "action.status"
+        assert status.data["status"] == "accepted"
+        assert status.data["kind"] == "turn.prompt"
+        release.set()
+    finally:
+        release.set()
+        for worker in (action_worker, status_worker, irc_worker):
+            worker.cancel()
+        await asyncio.gather(action_worker, status_worker, irc_worker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_status_query_cross_channel_is_scoped_to_configured_control_channel(
+    tmp_path: Path,
+) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    mutation = new_envelope("turn.prompt", "action", "client", epoch=bridge.epoch, device="phone")
+    assert await bridge.state.claim_action(mutation, "#closed", "trev", "codex") is None
+    await bridge.state.finish_action(mutation.id, "succeeded")
+    query = new_envelope(
+        "action.status.request",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        data={"actionId": mutation.id, "channel": "#closed"},
+    )
+    await bridge._handle_action("#codex", query)
+    assert irc.sent[-1][1].data["status"] == "succeeded"
+
+    unknown = new_envelope(
+        "action.status.request",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        data={"actionId": mutation.id, "channel": "#wrong"},
+    )
+    await bridge._handle_action("#codex", unknown)
+    assert irc.sent[-1][1].data == {"actionId": mutation.id, "status": "unknown"}
+
+
+@pytest.mark.asyncio
+async def test_status_query_does_not_publish_after_scope_changes(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    mutation = new_envelope("turn.prompt", "action", "client", epoch=bridge.epoch, device="phone")
+    await bridge.state.claim_action(mutation, "#codex", "trev", "codex")
+    original_lookup = bridge.state.action_status
+
+    async def lose_scope(*args: Any) -> Any:
+        receipt = await original_lookup(*args)
+        bridge.channels["#codex"].activation = None
+        return receipt
+
+    bridge.state.action_status = lose_scope  # type: ignore[method-assign]
+    query = new_envelope(
+        "action.status.request",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        data={"actionId": mutation.id},
+    )
+    await bridge._handle_action("#codex", query)
+    assert not any(event.reply == query.id for _channel, event, _preview in irc.sent)
+
+
+@pytest.mark.asyncio
+async def test_ingress_collision_is_suppressed_without_cross_scope_status_leak(
+    tmp_path: Path,
+) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    action = new_envelope("turn.prompt", "action", "client", epoch=bridge.epoch, device="phone")
+    assert await bridge.state.claim_action(action, "#other", "trev", "codex") is None
+    await bridge.state.finish_action(action.id, "succeeded")
+    await bridge._ingest_action("#codex", action, "trev")
+    event = irc.sent[-1][1]
+    assert event.kind == "action.failed"
+    assert event.reply == action.id
+    assert event.data == {"message": "action UUID is already reserved"}
+    assert bridge._action_queues["#codex"].empty()
+
+
+@pytest.mark.asyncio
+async def test_irc_ingress_correlates_malformed_status_lookup_failure(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    action_id = "00000000-0000-4000-8000-00000000a201"
+    malformed = {
+        "v": 1,
+        "k": "action.status.request",
+        "t": "action",
+        "id": action_id,
+        "at": 1,
+        "inst": "client",
+        "epoch": bridge.epoch,
+        "device": "phone",
+        "data": {"channel": "#codex"},
+    }
+    task = asyncio.create_task(bridge._irc_loop())
+    try:
+        await irc.incoming.put(
+            IRCMessage(
+                "#codex",
+                "trev",
+                "trev",
+                "",
+                MappingProxyType({PROTOCOL_TAG: json.dumps(malformed)}),
+                "TAGMSG",
+            )
+        )
+        for _ in range(20):
+            if irc.sent:
+                break
+            await asyncio.sleep(0.01)
+        event = irc.sent[-1][1]
+        assert (event.kind, event.reply) == ("action.failed", action_id)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def _send_irc_action(irc: FakeIRC, channel: str, action: Envelope) -> None:
+    await irc.incoming.put(
+        IRCMessage(
+            channel,
+            "trev",
+            "trev",
+            "",
+            MappingProxyType({PROTOCOL_TAG: encode_envelope(action)}),
+            "TAGMSG",
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_irc_status_queue_is_bounded_without_blocking_mutation_worker(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    worker = asyncio.create_task(bridge._irc_loop())
+    try:
+        for number in range(33):
+            await _send_irc_action(
+                irc,
+                "#codex",
+                new_envelope(
+                    "action.status.request",
+                    "action",
+                    "client",
+                    epoch=bridge.epoch,
+                    device="phone",
+                    data={"actionId": f"00000000-0000-4000-8000-{number:012d}"},
+                ),
+            )
+        for _ in range(50):
+            if bridge._status_queues["#codex"].qsize() == 32 and irc.sent:
+                break
+            await asyncio.sleep(0.01)
+        assert bridge._status_queues["#codex"].qsize() == 32
+        overload = irc.sent[-1][1]
+        assert overload.kind == "action.failed"
+        assert overload.data == {"message": "too many action status requests"}
+    finally:
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_irc_ingress_terminalizes_claim_when_channel_is_removed_mid_claim(
+    tmp_path: Path,
+) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_claim = bridge.state.claim_action
+
+    async def stalled_claim(*args: object, **kwargs: object) -> str | None:
+        entered.set()
+        await release.wait()
+        return await original_claim(*args, **kwargs)  # type: ignore[arg-type]
+
+    bridge.state.claim_action = stalled_claim  # type: ignore[method-assign]
+    action = new_envelope("turn.prompt", "action", "client", epoch=bridge.epoch, device="phone")
+    worker = asyncio.create_task(bridge._irc_loop())
+    try:
+        await _send_irc_action(irc, "#codex", action)
+        await entered.wait()
+        await bridge._remove_channel("#codex")
+        release.set()
+        for _ in range(50):
+            receipt = await bridge.state.action_status(action.id, "#codex", "trev", "codex")
+            if receipt is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert receipt is not None and receipt.status == "failed"
+    finally:
+        release.set()
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_irc_ingress_executes_after_accepted_send_failure(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    executed = asyncio.Event()
+
+    async def dispatch(_channel: str, _action: Envelope, _nick: str = "") -> None:
+        executed.set()
+
+    original_send = irc.send_protocol
+
+    async def fail_accepted(channel: str, envelope: Envelope, preview: str | None = None) -> None:
+        if envelope.kind == "action.accepted":
+            raise OSError("network write failed")
+        await original_send(channel, envelope, preview)
+
+    bridge._dispatch_action = dispatch  # type: ignore[method-assign]
+    irc.send_protocol = fail_accepted  # type: ignore[method-assign]
+    action_worker = asyncio.create_task(bridge._action_loop("#codex"))
+    ingress_worker = asyncio.create_task(bridge._irc_loop())
+    try:
+        action = new_envelope("turn.prompt", "action", "client", epoch=bridge.epoch, device="phone")
+        await _send_irc_action(irc, "#codex", action)
+        await asyncio.wait_for(executed.wait(), 1)
+        await asyncio.wait_for(bridge._action_queues["#codex"].join(), 1)
+        assert any(event.kind == "action.succeeded" for _target, event, _preview in irc.sent)
+    finally:
+        action_worker.cancel()
+        ingress_worker.cancel()
+        await asyncio.gather(action_worker, ingress_worker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_close_marks_queued_receipt_failed_but_recovers_inflight_as_uncertain(
+    tmp_path: Path,
+) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    started = asyncio.Event()
+
+    async def stalled(_channel: str, _action: Envelope, _nick: str = "") -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    bridge._dispatch_action = stalled  # type: ignore[method-assign]
+    bridge._start_action_worker("#codex")
+    ingress = asyncio.create_task(bridge._irc_loop())
+    inflight = new_envelope("turn.prompt", "action", "client", epoch=bridge.epoch, device="phone")
+    queued = new_envelope("turn.steer", "action", "client", epoch=bridge.epoch, device="phone")
+    try:
+        await _send_irc_action(irc, "#codex", inflight)
+        await started.wait()
+        await _send_irc_action(irc, "#codex", queued)
+        for _ in range(50):
+            if bridge._action_queues["#codex"].qsize() == 1:
+                break
+            await asyncio.sleep(0.01)
+        await bridge.close()
+        recovered = StateStore(bridge.config.bridge.state_file)
+        queued_receipt = await recovered.action_status(queued.id, "#codex", "trev", "codex")
+        assert queued_receipt is not None and queued_receipt.status == "failed"
+        assert await recovered.claim_action(inflight, "#codex", "trev", "codex") == "uncertain"
+    finally:
+        ingress.cancel()
+        await asyncio.gather(ingress, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_irc_ingress_terminalizes_claim_when_suspended_during_accepted_emit(
+    tmp_path: Path,
+) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_send = irc.send_protocol
+
+    async def stalled_accept(channel: str, envelope: Envelope, preview: str | None = None) -> None:
+        if envelope.kind == "action.accepted":
+            entered.set()
+            await release.wait()
+        await original_send(channel, envelope, preview)
+
+    irc.send_protocol = stalled_accept  # type: ignore[method-assign]
+    action = new_envelope("turn.prompt", "action", "client", epoch=bridge.epoch, device="phone")
+    worker = asyncio.create_task(bridge._irc_loop())
+    try:
+        await _send_irc_action(irc, "#codex", action)
+        await entered.wait()
+        await bridge._handle_topic("#codex", "ordinary topic")
+        release.set()
+        await asyncio.sleep(0.05)
+        for _ in range(50):
+            receipt = await bridge.state.action_status(action.id, "#codex", "trev", "codex")
+            if receipt is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert receipt is not None and receipt.status == "failed"
+        assert bridge._action_queues["#codex"].empty()
+    finally:
+        release.set()
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)

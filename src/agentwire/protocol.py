@@ -69,6 +69,7 @@ ACTION_KINDS = frozenset(
         "workspace.list.request",
         "session.list.request",
         "history.request",
+        "action.status.request",
         "session.create",
         "session.close",
         "session.attach",
@@ -106,6 +107,7 @@ EVENT_KINDS = frozenset(
         "action.succeeded",
         "action.failed",
         "action.uncertain",
+        "action.status",
         "queue.snapshot",
         "queue.item.added",
         "queue.item.updated",
@@ -256,6 +258,13 @@ class Envelope:
         data = value.get("data", {})
         if not isinstance(data, dict):
             raise ProtocolError("data must be an object")
+        if (
+            message_type == "event"
+            and kind == "action.status"
+            and not isinstance(value.get("reply"), str)
+        ):
+            raise ProtocolError("action.status requires reply")
+        _validate_kind_data(kind, message_type, data)
         revision = _wire_integer(value.get("rev"))
         if "rev" in value and (revision is None or not 0 <= revision <= 2**63 - 1):
             raise ProtocolError("rev must be a non-negative integer")
@@ -279,6 +288,66 @@ class Envelope:
             history=history,
             data=data,
         )
+
+
+def _validate_kind_data(kind: str, message_type: str, data: dict[str, Any]) -> None:
+    """Validate payloads whose shape is part of the v1 interoperability contract."""
+    if message_type == "action" and kind == "action.status.request":
+        if set(data) - {"actionId", "channel"}:
+            raise ProtocolError("action.status.request has unsupported data fields")
+        action_id = data.get("actionId")
+        if not isinstance(action_id, str):
+            raise ProtocolError("action.status.request requires data.actionId UUID")
+        try:
+            uuid.UUID(action_id)
+        except ValueError as exc:
+            raise ProtocolError("data.actionId must be a UUID") from exc
+        channel = data.get("channel")
+        if "channel" in data and not _is_channel_name(channel):
+            raise ProtocolError("data.channel must be a syntactically valid IRC channel")
+    elif message_type == "event" and kind == "action.status":
+        action_id = data.get("actionId")
+        status = data.get("status")
+        if not isinstance(action_id, str) or not isinstance(status, str):
+            raise ProtocolError("action.status requires actionId and status")
+        try:
+            uuid.UUID(action_id)
+        except ValueError as exc:
+            raise ProtocolError("action.status actionId must be a UUID") from exc
+        if status not in {"accepted", "succeeded", "failed", "uncertain", "unknown"}:
+            raise ProtocolError("action.status has unsupported status")
+        found = {"kind", "channel", "receivedAt"}
+        if status == "unknown":
+            if set(data) != {"actionId", "status"}:
+                raise ProtocolError("unknown action.status cannot disclose receipt metadata")
+        else:
+            if set(data) - {"actionId", "status", "kind", "channel", "receivedAt", "message"}:
+                raise ProtocolError("known action.status has unsupported data fields")
+            if not found <= data.keys():
+                raise ProtocolError("known action.status requires receipt metadata")
+            receipt_kind = data["kind"]
+            receipt_channel = data["channel"]
+            if (
+                not isinstance(receipt_kind, str)
+                or receipt_kind not in ACTION_KINDS
+                or not _is_channel_name(receipt_channel)
+            ):
+                raise ProtocolError("known action.status has invalid receipt metadata")
+            received_at = _wire_integer(data["receivedAt"])
+            if received_at is None or not 0 <= received_at <= 2**63 - 1:
+                raise ProtocolError("known action.status receivedAt must be a timestamp")
+            message = data.get("message")
+            if "message" in data and (not isinstance(message, str) or not 1 <= len(message) <= 200):
+                raise ProtocolError("known action.status message must be a bounded string")
+
+
+def _is_channel_name(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 1 < len(value) <= 200
+        and value[0] in {"#", "&"}
+        and not any(char in value for char in " ,:\x00\r\n")
+    )
 
 
 def new_envelope(

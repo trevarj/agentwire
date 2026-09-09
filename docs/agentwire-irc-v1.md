@@ -173,6 +173,16 @@ and session listing, and history) are safe to repeat and return only their reply
 `history.end` terminates a history response. Any action can still return `action.failed`. Clients
 MUST NOT automatically retry a mutation merely because an acknowledgement is missing.
 
+`action.status.request` is a fast, reply-correlated read. Its `data.actionId` is a mutation UUID
+and its optional `data.channel` selects the original channel; omitting it selects the receiving
+channel. `action.status` returns `unknown` without receipt metadata when the UUID is absent,
+expired, legacy, or outside the authenticated owner/backend/channel scope. Known receipts include
+their kind, channel, receipt time, and `accepted`, `succeeded`, `failed`, or `uncertain` status.
+The same channel may always query its receipt. A different original channel is queryable only from
+a configured control channel for the same authenticated owner and backend, allowing a closed
+dedicated channel's receipt to be recovered. Receipt detail is bounded and secret-scanned; action
+payloads, device IDs, and session IDs are never returned.
+
 `history.request` targets the currently attached session using the envelope `sid`; older clients
 that omit it target the current binding. A supplied `sid` that differs from the binding is rejected.
 Backends with authoritative transcript pagination, including Codex and Claude, provide full
@@ -196,6 +206,7 @@ The following kinds are defined. A client MUST enable only those listed in the `
 `agent.hello`.
 
 - Discovery: `sync.request`, `workspace.list.request`, `session.list.request`, `history.request`.
+- Receipts: `action.status.request`.
 - Binding: `session.create`, `session.close`, `session.attach`, `session.detach`.
 - Optional lifecycle: `session.rename`, `session.fork`, `session.archive`, `session.unarchive`.
 - Settings: `settings.update`.

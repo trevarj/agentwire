@@ -48,6 +48,8 @@ SUBAGENT_UPDATE_SECONDS = 0.5
 READ_ACTION_KINDS = frozenset(
     {"sync.request", "workspace.list.request", "session.list.request", "history.request"}
 )
+STATUS_ACTION_KIND = "action.status.request"
+STATUS_QUEUE_LIMIT = 32
 # Diagnostics name channels, accounts, kinds, and reasons. They never carry
 # prompt text, tool output, tag values, or credentials.
 LOGGER = logging.getLogger("agentwire.bridge")
@@ -70,9 +72,26 @@ class PendingRequest:
     redacted: bool = False
 
 
+@dataclass(slots=True, frozen=True)
+class ActionDescriptor:
+    """Ingress-authenticated work which may outlive the IRC receive turn."""
+
+    envelope: Envelope
+    requester_nick: str
+    queued_at: float
+    owner_account: str
+    backend: str
+    claimed: bool
+    runtime_identity: object
+    activation: TopicActivation
+
+
 @dataclass(slots=True)
 class ChannelRuntime:
     backend: str
+    # A channel name can be removed and later reinstalled. Queued work belongs
+    # to this exact runtime, never merely to a same-named successor.
+    identity: object = field(default_factory=object, repr=False)
     activation: TopicActivation | None = None
     binding: ChannelBinding | None = None
     busy: bool = False
@@ -118,8 +137,10 @@ class Bridge:
         self.instance = str(uuid.uuid4())
         self.epoch = secrets.token_urlsafe(24)
         self._reassemblers: dict[str, Reassembler] = {}
-        self._action_queues: dict[str, asyncio.Queue[tuple[Envelope, float, str]]] = {}
+        self._action_queues: dict[str, asyncio.Queue[ActionDescriptor]] = {}
         self._action_workers: dict[str, asyncio.Task[None]] = {}
+        self._status_queues: dict[str, asyncio.Queue[ActionDescriptor]] = {}
+        self._status_workers: dict[str, asyncio.Task[None]] = {}
         self._tasks: list[asyncio.Task[None]] = []
         self._managed_channels: set[str] = set()
         self._closing_channels: set[str] = set()
@@ -154,6 +175,7 @@ class Bridge:
             ]
             for channel in self.channels:
                 self._start_action_worker(channel)
+                self._start_status_worker(channel)
             await asyncio.gather(*self._tasks)
         finally:
             await self.close()
@@ -167,8 +189,10 @@ class Bridge:
         self.channels[value] = runtime
         self._reassemblers[value] = Reassembler()
         self._action_queues[value] = asyncio.Queue()
+        self._status_queues[value] = asyncio.Queue(maxsize=STATUS_QUEUE_LIMIT)
         if self._tasks:
             self._start_action_worker(value)
+            self._start_status_worker(value)
         return runtime
 
     def _start_action_worker(self, channel: str) -> None:
@@ -178,7 +202,15 @@ class Bridge:
         self._action_workers[channel] = task
         self._tasks.append(task)
 
+    def _start_status_worker(self, channel: str) -> None:
+        if channel in self._status_workers:
+            return
+        task = asyncio.create_task(self._status_loop(channel), name=f"bridge-{channel}-status")
+        self._status_workers[channel] = task
+        self._tasks.append(task)
+
     async def _remove_channel(self, channel: str) -> None:
+        await self._fail_queued_mutations(channel, "channel was removed before execution")
         runtime = self.channels.pop(channel, None)
         if runtime is not None:
             for _payload, pending in runtime.observed_status_pending.values():
@@ -187,9 +219,15 @@ class Bridge:
                 runtime.subagents_pending[1].cancel()
         self._reassemblers.pop(channel, None)
         self._action_queues.pop(channel, None)
+        self._status_queues.pop(channel, None)
         self._managed_channels.discard(channel)
         self._closing_channels.discard(channel)
         task = self._action_workers.pop(channel, None)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        task = self._status_workers.pop(channel, None)
         if task is not None and task is not asyncio.current_task():
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -207,6 +245,15 @@ class Bridge:
             if runtime.subagents_pending is not None:
                 runtime.subagents_pending[1].cancel()
                 runtime.subagents_pending = None
+        # Only descriptors still waiting in a queue are known not to have
+        # reached a backend. The in-flight descriptor is left accepted so a
+        # restart records it uncertain rather than claiming it failed.
+        await asyncio.gather(
+            *(
+                self._fail_queued_mutations(channel, "bridge closed before execution")
+                for channel in self.channels
+            )
+        )
         for task in self._tasks:
             if task is not current:
                 task.cancel()
@@ -243,6 +290,7 @@ class Bridge:
     async def _irc_loop(self) -> None:
         while True:
             message = await self.irc.recv()
+            value: str | None = None
             try:
                 # 331 is "no topic is set". Treating it as an empty topic is
                 # what turns an unset topic into a stated fact rather than an
@@ -280,38 +328,90 @@ class Bridge:
                     continue
                 envelope = self._reassemblers[message.channel].add(value)
                 if envelope is not None:
-                    await self._action_queues[message.channel].put(
-                        (envelope, time.monotonic(), message.nick)
-                    )
+                    await self._ingest_action(message.channel, envelope, message.nick)
                 else:
                     LOGGER.debug(
                         "%s: holding a fragment until its message is complete", message.channel
                     )
-            except (BackendError, ConfigError, ProtocolError, ValueError) as exc:
+            except ProtocolError as exc:
+                await self._emit_failure(
+                    message.channel, self._malformed_status_reply(value), str(exc)
+                )
+            except (BackendError, ConfigError, ValueError) as exc:
                 await self._emit_failure(message.channel, None, str(exc))
             except Exception:
                 await self._emit_failure(message.channel, None, "unexpected bridge failure")
 
+    @staticmethod
+    def _malformed_status_reply(value: str | None) -> str | None:
+        """Recover only a validated lookup UUID from a rejected direct envelope."""
+        if not value:
+            return None
+        try:
+            raw = json.loads(value)
+            action_id = raw.get("id") if isinstance(raw, dict) else None
+            if (
+                isinstance(raw, dict)
+                and raw.get("t") == "action"
+                and raw.get("k") == STATUS_ACTION_KIND
+                and isinstance(action_id, str)
+            ):
+                uuid.UUID(action_id)
+                return action_id
+        except (json.JSONDecodeError, ValueError, AttributeError):
+            pass
+        return None
+
     async def _action_loop(self, channel: str) -> None:
         queue = self._action_queues[channel]
         while True:
-            action, queued_at, requester_nick = await queue.get()
+            descriptor = await queue.get()
+            action = descriptor.envelope
             try:
-                if self.channels[channel].activation is None:
-                    LOGGER.info("%s: dropped queued action %s after suspension", channel, action.id)
+                if not self._descriptor_is_trusted(channel, descriptor):
+                    LOGGER.info("%s: failed queued action %s after suspension", channel, action.id)
+                    if descriptor.claimed:
+                        await self.state.finish_action(
+                            action.id, "failed", "channel was suspended before execution"
+                        )
+                    await self._emit_failure(
+                        channel, action.id, "channel was suspended before execution"
+                    )
                     continue
                 LOGGER.debug(
                     "%s: action %s (%s) waited %.1f ms",
                     channel,
                     action.kind,
                     action.id,
-                    (time.monotonic() - queued_at) * 1000,
+                    (time.monotonic() - descriptor.queued_at) * 1000,
                 )
-                await self._handle_action(channel, action, requester_nick)
+                await self._execute_action(channel, descriptor)
             except (BackendError, ConfigError, ProtocolError, ValueError) as exc:
                 await self._emit_failure(channel, action.id, str(exc))
             except Exception:
                 LOGGER.exception("%s: unexpected action worker failure", channel)
+                await self._emit_failure(channel, action.id, "unexpected bridge failure")
+            finally:
+                queue.task_done()
+            if channel not in self.channels:
+                return
+
+    async def _status_loop(self, channel: str) -> None:
+        queue = self._status_queues[channel]
+        while True:
+            descriptor = await queue.get()
+            action = descriptor.envelope
+            try:
+                if not self._descriptor_is_trusted(channel, descriptor):
+                    await self._emit_failure(
+                        channel, action.id, "channel was suspended before execution"
+                    )
+                    continue
+                await self._action_status(channel, action, descriptor)
+            except (BackendError, ConfigError, ProtocolError, ValueError) as exc:
+                await self._emit_failure(channel, action.id, str(exc))
+            except Exception:
+                LOGGER.exception("%s: unexpected status worker failure", channel)
                 await self._emit_failure(channel, action.id, "unexpected bridge failure")
             finally:
                 queue.task_done()
@@ -356,6 +456,7 @@ class Bridge:
 
     async def _suspend(self, channel: str, reason: str, repair: str | None = None) -> None:
         runtime = self.channels[channel]
+        await self._fail_queued_mutations(channel, "channel was suspended before execution")
         # The reason is bounded, but a repair is appended afterwards so it is
         # never truncated: a half-printed topic is not pasteable.
         detail = safe_one_line(reason, MAX_REASON_BYTES)
@@ -527,6 +628,7 @@ class Bridge:
             "workspace.list.request",
             "session.list.request",
             "history.request",
+            STATUS_ACTION_KIND,
             "session.create",
             "session.attach",
             "session.detach",
@@ -561,6 +663,7 @@ class Bridge:
                     "steering",
                     "queues",
                     "requests",
+                    "actionStatus",
                 }
             ),
             "actions": sorted(actions),
@@ -597,6 +700,49 @@ class Bridge:
     async def _handle_action(
         self, channel: str, action: Envelope, requester_nick: str = ""
     ) -> None:
+        """Synchronous test and embedding entry point.
+
+        IRC production uses ``_ingest_action`` so a durable mutation is
+        claimed before it waits behind earlier work.  Keeping this method
+        immediate preserves the public test helper used by backend adapters.
+        """
+        descriptor = await self._prepare_action(channel, action, requester_nick)
+        if descriptor is None:
+            return
+        if action.kind == STATUS_ACTION_KIND:
+            await self._action_status(channel, action, descriptor)
+        else:
+            await self._execute_action(channel, descriptor)
+
+    async def _ingest_action(
+        self, channel: str, action: Envelope, requester_nick: str = ""
+    ) -> None:
+        """Claim mutations at authenticated ingress before serial dispatch."""
+        descriptor = await self._prepare_action(channel, action, requester_nick)
+        if descriptor is None:
+            return
+        if not self._descriptor_is_trusted(channel, descriptor):
+            await self._fail_unqueued_action(descriptor, "channel changed before execution")
+            return
+        if action.kind == STATUS_ACTION_KIND:
+            try:
+                queue = self._status_queues.get(channel)
+                if queue is None:
+                    await self._fail_unqueued_action(descriptor, "channel changed before execution")
+                    return
+                queue.put_nowait(descriptor)
+            except asyncio.QueueFull:
+                await self._emit_failure(channel, action.id, "too many action status requests")
+            return
+        queue = self._action_queues.get(channel)
+        if queue is None:
+            await self._fail_unqueued_action(descriptor, "channel changed before execution")
+            return
+        await queue.put(descriptor)
+
+    async def _prepare_action(
+        self, channel: str, action: Envelope, requester_nick: str
+    ) -> ActionDescriptor | None:
         if action.message_type != "action":
             # A relayed published event is never a command. Expected traffic,
             # so this stays below warning level.
@@ -606,32 +752,103 @@ class Bridge:
                 action.message_type,
                 action.kind,
             )
-            return
+            return None
         if action.history:
             await self._emit_failure(channel, action.id, "historic actions cannot be executed")
-            return
+            return None
         if not action.device:
             await self._emit_failure(channel, action.id, "actions require device")
-            return
+            return None
         if action.kind != "sync.request" and action.epoch != self.epoch:
             await self._emit_failure(channel, action.id, "stale or missing live epoch")
-            return
-        started = time.monotonic()
-        tracked = action.kind not in READ_ACTION_KINDS
+            return None
+        runtime = self.channels.get(channel)
+        if runtime is None or runtime.activation is None:
+            return None
+        activation = runtime.activation
+        runtime_identity = runtime.identity
+        owner_account = activation.account
+        backend = runtime.backend
+        tracked = action.kind not in READ_ACTION_KINDS and action.kind != STATUS_ACTION_KIND
         if tracked:
             LOGGER.info("%s: journaling action %s (%s)", channel, action.kind, action.id)
-            duplicate = await self.state.claim_action(action, channel)
+            duplicate = await self.state.claim_action(action, channel, owner_account, backend)
             if duplicate is not None:
+                scoped = await self.state.action_status(action.id, channel, owner_account, backend)
+                if not self._captured_runtime_is_current(channel, runtime_identity, activation):
+                    return None
+                if scoped is None:
+                    # UUIDs are global replay tombstones, including old rows
+                    # without scope fields. Do not disclose their status to a
+                    # different channel, owner, or backend.
+                    await self._emit_failure(channel, action.id, "action UUID is already reserved")
+                    return None
                 await self._emit(
                     channel,
                     f"action.{duplicate}" if duplicate != "accepted" else "action.accepted",
                     reply=action.id,
                     data={"duplicate": True},
                 )
-                return
-            await self._emit(channel, "action.accepted", reply=action.id)
+                return None
+            # Once SQLite accepted this UUID, a temporary IRC send failure must
+            # not abandon it.  The serial worker will still execute it.
+            try:
+                await self._emit(channel, "action.accepted", reply=action.id)
+            except Exception:
+                LOGGER.warning("%s: could not publish accepted receipt for %s", channel, action.id)
+            if not self._captured_runtime_is_current(channel, runtime_identity, activation):
+                await self._fail_unqueued_action(
+                    ActionDescriptor(
+                        action,
+                        requester_nick,
+                        time.monotonic(),
+                        owner_account,
+                        backend,
+                        True,
+                        runtime_identity,
+                        activation,
+                    ),
+                    "channel changed before execution",
+                )
+                return None
+        return ActionDescriptor(
+            envelope=action,
+            requester_nick=requester_nick,
+            queued_at=time.monotonic(),
+            owner_account=owner_account,
+            backend=backend,
+            claimed=tracked,
+            runtime_identity=runtime_identity,
+            activation=activation,
+        )
+
+    def _descriptor_is_trusted(self, channel: str, descriptor: ActionDescriptor) -> bool:
+        return self._captured_runtime_is_current(
+            channel, descriptor.runtime_identity, descriptor.activation
+        )
+
+    def _captured_runtime_is_current(
+        self, channel: str, runtime_identity: object, activation: TopicActivation
+    ) -> bool:
+        runtime = self.channels.get(channel)
+        return bool(
+            runtime is not None
+            and runtime.identity is runtime_identity
+            and runtime.activation is activation
+            and activation.account == self.config.bridge.owner_account
+            and activation.backend == runtime.backend
+        )
+
+    async def _fail_unqueued_action(self, descriptor: ActionDescriptor, detail: str) -> None:
+        if descriptor.claimed:
+            await self.state.finish_action(descriptor.envelope.id, "failed", detail)
+
+    async def _execute_action(self, channel: str, descriptor: ActionDescriptor) -> None:
+        action = descriptor.envelope
+        started = time.monotonic()
+        tracked = descriptor.claimed
         try:
-            await self._dispatch_action(channel, action, requester_nick)
+            await self._dispatch_action(channel, action, descriptor.requester_nick)
         except (BackendError, ConfigError, ProtocolError, ValueError) as exc:
             detail = safe_one_line(str(exc), 1000)
             if tracked:
@@ -671,6 +888,7 @@ class Bridge:
             "workspace.list.request": self._action_workspaces,
             "session.list.request": self._action_sessions,
             "history.request": self._action_history,
+            "action.status.request": self._action_status_request,
             "session.create": self._action_create,
             "session.close": self._action_close,
             "session.attach": self._action_attach,
@@ -697,6 +915,94 @@ class Bridge:
     async def _action_sync(self, channel: str, action: Envelope) -> None:
         await self._emit_hello(channel, reply=action.id)
         await self._emit_snapshot(channel, reply=action.id)
+
+    async def _action_status(
+        self, channel: str, action: Envelope, descriptor: ActionDescriptor
+    ) -> None:
+        action_id = action.data.get("actionId")
+        if not isinstance(action_id, str):
+            raise ProtocolError("action.status.request requires data.actionId UUID")
+        try:
+            uuid.UUID(action_id)
+        except ValueError as exc:
+            raise ProtocolError("data.actionId must be a UUID") from exc
+        requested_channel = action.data.get("channel")
+        if "channel" in action.data and (
+            not isinstance(requested_channel, str)
+            or len(requested_channel) < 2
+            or requested_channel[0] not in {"#", "&"}
+            or any(value in requested_channel for value in " ,:\x00\r\n")
+        ):
+            raise ProtocolError("data.channel must be a syntactically valid IRC channel")
+        target = (requested_channel or channel).lower()
+        if target != channel and channel not in self.config.irc.channels:
+            # A static configured channel is the authenticated control point
+            # for its backend. Managed dedicated channels may have closed by
+            # the time a client needs to recover a receipt.
+            raise ProtocolError("cross-channel status queries require a configured control channel")
+        receipt = await self.state.action_status(
+            action_id, target, descriptor.owner_account, descriptor.backend
+        )
+        # A lookup can yield while the receiving channel loses its trust scope.
+        if not self._descriptor_is_trusted(channel, descriptor):
+            return
+        data: dict[str, Any] = {"actionId": action_id, "status": "unknown"}
+        if receipt is not None:
+            data.update(
+                {
+                    "status": receipt.status,
+                    "kind": receipt.kind,
+                    "channel": receipt.channel,
+                    "receivedAt": receipt.received_at,
+                }
+            )
+            message = self._safe_receipt_detail(receipt.detail)
+            if message:
+                data["message"] = message
+        await self._emit(channel, "action.status", reply=action.id, data=data)
+
+    async def _action_status_request(self, channel: str, action: Envelope) -> None:
+        runtime = self.channels[channel]
+        activation = runtime.activation
+        if activation is None:
+            raise ProtocolError("channel is not active")
+        await self._action_status(
+            channel,
+            action,
+            ActionDescriptor(
+                action,
+                "",
+                time.monotonic(),
+                activation.account,
+                runtime.backend,
+                False,
+                runtime.identity,
+                activation,
+            ),
+        )
+
+    @staticmethod
+    def _safe_receipt_detail(detail: str) -> str | None:
+        # Scan before truncation: a secret can begin beyond the visible prefix.
+        if not detail or scan_secrets(detail):
+            return None
+        value = safe_one_line(detail, MAX_REASON_BYTES)
+        return value or None
+
+    async def _fail_queued_mutations(self, channel: str, detail: str) -> None:
+        queue = self._action_queues.get(channel)
+        if queue is None:
+            return
+        while True:
+            try:
+                descriptor = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                if descriptor.claimed:
+                    await self.state.finish_action(descriptor.envelope.id, "failed", detail)
+            finally:
+                queue.task_done()
 
     async def _action_workspaces(self, channel: str, action: Envelope) -> None:
         parent_value = action.data.get("parent")

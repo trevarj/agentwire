@@ -393,3 +393,86 @@ def test_every_committed_envelope_fixture_re_encodes_byte_for_byte() -> None:
     ):
         raw = (fixtures / name).read_text(encoding="utf-8").strip()
         assert encode_envelope(decode_envelope(raw)) == raw
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        {},
+        {"actionId": "not-a-uuid"},
+        {"actionId": "00000000-0000-4000-8000-00000000cafe", "channel": None},
+        {"actionId": "00000000-0000-4000-8000-00000000cafe", "extra": True},
+    ],
+)
+def test_action_status_request_payload_matches_schema_and_codec(data: dict[str, object]) -> None:
+    raw = new_envelope(
+        "action.status.request", "action", "client", device="phone", data=data
+    ).to_dict()
+    assert list(_schema_validator().iter_errors(raw))
+    with pytest.raises(ProtocolError):
+        decode_envelope(json.dumps(raw))
+
+
+def test_action_status_unknown_never_carries_receipt_metadata() -> None:
+    raw = new_envelope(
+        "action.status",
+        "event",
+        "agent",
+        reply="00000000-0000-4000-8000-00000000a101",
+        data={
+            "actionId": "00000000-0000-4000-8000-00000000cafe",
+            "status": "unknown",
+            "message": "leak",
+        },
+    ).to_dict()
+    assert list(_schema_validator().iter_errors(raw))
+    with pytest.raises(ProtocolError, match="unknown"):
+        decode_envelope(json.dumps(raw))
+
+
+@pytest.mark.parametrize("channel", ["#codex", "#pi", "#omp", "#claude", "#control"])
+def test_status_channel_names_are_schema_valid(channel: str) -> None:
+    raw = new_envelope(
+        "action.status.request",
+        "action",
+        "client",
+        device="phone",
+        data={"actionId": "00000000-0000-4000-8000-00000000cafe", "channel": channel},
+    ).to_dict()
+    assert not list(_schema_validator().iter_errors(raw))
+    assert decode_envelope(json.dumps(raw)).data["channel"] == channel
+
+
+@pytest.mark.parametrize("channel", ["#bad\n", "#bad\r", "#bad\x00"])
+def test_status_channel_controls_are_rejected_by_schema_and_codec(channel: str) -> None:
+    raw = new_envelope(
+        "action.status.request",
+        "action",
+        "client",
+        device="phone",
+        data={"actionId": "00000000-0000-4000-8000-00000000cafe", "channel": channel},
+    ).to_dict()
+    assert list(_schema_validator().iter_errors(raw))
+    with pytest.raises(ProtocolError):
+        decode_envelope(json.dumps(raw))
+
+
+@pytest.mark.parametrize("value", [None, [], {"kind": "turn.prompt"}])
+def test_known_status_receipt_rejects_nullable_or_wrong_metadata(value: object) -> None:
+    raw = new_envelope(
+        "action.status",
+        "event",
+        "agent",
+        reply="00000000-0000-4000-8000-00000000a302",
+        data={
+            "actionId": "00000000-0000-4000-8000-00000000cafe",
+            "status": "succeeded",
+            "kind": value,
+            "channel": "#codex",
+            "receivedAt": 1,
+            "message": None,
+        },
+    ).to_dict()
+    assert list(_schema_validator().iter_errors(raw))
+    with pytest.raises(ProtocolError):
+        decode_envelope(json.dumps(raw))

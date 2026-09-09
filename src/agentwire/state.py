@@ -24,6 +24,18 @@ class QueuedPrompt:
     created_at: int
 
 
+@dataclass(slots=True, frozen=True)
+class ActionReceipt:
+    """The scoped, non-sensitive part of a durable mutation receipt."""
+
+    id: str
+    kind: str
+    channel: str
+    received_at: int
+    status: str
+    detail: str
+
+
 class StateStore:
     """Private SQLite journal for bindings, actions, events, and prompt queues."""
 
@@ -55,11 +67,19 @@ class StateStore:
         async with self._lock:
             await asyncio.to_thread(self._set_binding, channel.lower(), binding)
 
-    async def claim_action(self, envelope: Envelope, channel: str) -> str | None:
+    async def claim_action(
+        self,
+        envelope: Envelope,
+        channel: str,
+        owner_account: str | None = None,
+        backend: str | None = None,
+    ) -> str | None:
         """Insert an action, returning its existing status when it is a duplicate."""
         await self.initialize()
         async with self._lock:
-            return await asyncio.to_thread(self._claim_action, envelope, channel.lower())
+            return await asyncio.to_thread(
+                self._claim_action, envelope, channel.lower(), owner_account, backend
+            )
 
     async def finish_action(self, action_id: str, status: str, detail: str = "") -> None:
         if status not in {"succeeded", "failed", "uncertain"}:
@@ -67,6 +87,17 @@ class StateStore:
         await self.initialize()
         async with self._lock:
             await asyncio.to_thread(self._finish_action, action_id, status, detail)
+
+    async def action_status(
+        self, action_id: str, channel: str, owner_account: str, backend: str
+    ) -> ActionReceipt | None:
+        """Return a receipt only when it belongs to this trusted scope."""
+        await self.initialize()
+        async with self._lock:
+            row = await asyncio.to_thread(
+                self._action_status, action_id, channel.lower(), owner_account, backend
+            )
+        return ActionReceipt(*row) if row else None
 
     async def append_event(self, channel: str, envelope: Envelope) -> None:
         await self.initialize()
@@ -173,7 +204,9 @@ class StateStore:
                     received_at INTEGER NOT NULL,
                     status TEXT NOT NULL,
                     detail TEXT NOT NULL DEFAULT '',
-                    payload TEXT NOT NULL
+                    payload TEXT NOT NULL,
+                    owner_account TEXT,
+                    backend TEXT
                 );
                 CREATE TABLE IF NOT EXISTS events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -205,6 +238,20 @@ class StateStore:
             }
             if "session_id" not in event_columns:
                 database.execute("ALTER TABLE events ADD COLUMN session_id TEXT")
+            action_columns = {
+                str(row[1]) for row in database.execute("PRAGMA table_info(actions)").fetchall()
+            }
+            # Rows written before scoped status were not authenticated against
+            # an owner/backend pair.  They remain replay tombstones but cannot
+            # disclose status through the new query API.
+            if "owner_account" not in action_columns:
+                database.execute("ALTER TABLE actions ADD COLUMN owner_account TEXT")
+            if "backend" not in action_columns:
+                database.execute("ALTER TABLE actions ADD COLUMN backend TEXT")
+            database.execute(
+                """CREATE INDEX IF NOT EXISTS actions_scoped_status
+                   ON actions(id, channel, owner_account, backend, received_at)"""
+            )
             for sequence, payload in database.execute(
                 "SELECT sequence, payload FROM events WHERE session_id IS NULL"
             ).fetchall():
@@ -300,7 +347,9 @@ class StateStore:
                     (channel, binding.backend, binding.session_id, binding.cwd, _now_ms()),
                 )
 
-    def _claim_action(self, envelope: Envelope, channel: str) -> str | None:
+    def _claim_action(
+        self, envelope: Envelope, channel: str, owner_account: str | None, backend: str | None
+    ) -> str | None:
         payload = encode_envelope(envelope)
         # The channel is the receiving channel, never a client-supplied field:
         # forensics need to know where an action actually arrived.
@@ -311,9 +360,10 @@ class StateStore:
             if row:
                 return str(row[0])
             database.execute(
-                """INSERT INTO actions(id, kind, channel, received_at, status, payload)
-                   VALUES (?, ?, ?, ?, 'accepted', ?)""",
-                (envelope.id, envelope.kind, channel, _now_ms(), payload),
+                """INSERT INTO actions
+                   (id, kind, channel, received_at, status, payload, owner_account, backend)
+                   VALUES (?, ?, ?, ?, 'accepted', ?, ?, ?)""",
+                (envelope.id, envelope.kind, channel, _now_ms(), payload, owner_account, backend),
             )
         return None
 
@@ -323,6 +373,18 @@ class StateStore:
                 "UPDATE actions SET status = ?, detail = ? WHERE id = ?",
                 (status, detail, action_id),
             )
+
+    def _action_status(
+        self, action_id: str, channel: str, owner_account: str, backend: str
+    ) -> tuple[str, str, str, int, str, str] | None:
+        cutoff = _now_ms() - 30 * 24 * 60 * 60 * 1000
+        with self._connect() as database:
+            return database.execute(
+                """SELECT id, kind, channel, received_at, status, detail FROM actions
+                   WHERE id = ? AND channel = ? AND owner_account = ? AND backend = ?
+                   AND received_at >= ?""",
+                (action_id, channel, owner_account, backend, cutoff),
+            ).fetchone()
 
     def _append_event(self, channel: str, envelope: Envelope) -> None:
         with self._connect() as database:

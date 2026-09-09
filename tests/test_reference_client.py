@@ -341,3 +341,23 @@ def test_jsonl_prompt_defaults_to_readable_privmsg() -> None:
     message = json.loads(output_stream.getvalue())["messages"][0]
     assert message["command"] == "PRIVMSG"
     assert message["body"] == "hello"
+
+
+def test_receipt_projection_keeps_terminal_status_over_late_control_events() -> None:
+    client = ProtocolClient()
+    action_id = "00000000-0000-4000-8000-00000000cafe"
+    client.state.apply(new_envelope("action.succeeded", "event", "agent", reply=action_id))
+    client.state.apply(new_envelope("action.accepted", "event", "agent", reply=action_id))
+    client.state.apply(
+        new_envelope(
+            "action.status",
+            "event",
+            "agent",
+            reply="00000000-0000-4000-8000-00000000a301",
+            data={"actionId": action_id, "status": "unknown"},
+        )
+    )
+    client.state.apply(
+        new_envelope("action.failed", "event", "agent", reply=action_id, history=True)
+    )
+    assert client.state.action_status[action_id] == {"status": "succeeded"}

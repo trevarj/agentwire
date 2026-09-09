@@ -131,3 +131,72 @@ async def test_legacy_json_binding_is_migrated_with_private_backup(tmp_path: Pat
     backup = tmp_path / "state.json.legacy-json"
     assert backup.exists()
     assert os.stat(backup).st_mode & 0o777 == 0o600
+
+
+@pytest.mark.asyncio
+async def test_action_status_is_scoped_and_legacy_rows_stay_replay_tombstones(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    action = new_envelope("turn.prompt", "action", "client", device="phone")
+    store = StateStore(path)
+    assert await store.claim_action(action, "#dedicated", "trev", "codex") is None
+    await store.finish_action(action.id, "failed", "safe detail")
+    receipt = await store.action_status(action.id, "#dedicated", "trev", "codex")
+    assert receipt is not None and (receipt.status, receipt.detail) == ("failed", "safe detail")
+    assert await store.action_status(action.id, "#dedicated", "other", "codex") is None
+    assert await store.action_status(action.id, "#other", "trev", "codex") is None
+
+    await store.close()
+    legacy_id = str(uuid.uuid4())
+    with sqlite3.connect(path) as database:
+        database.execute(
+            """INSERT INTO actions(id, kind, channel, received_at, status, detail, payload)
+               VALUES (?, 'turn.prompt', '#legacy', ?, 'succeeded', '', '{}')""",
+            (legacy_id, int(time.time() * 1000)),
+        )
+    reloaded = StateStore(path)
+    assert await reloaded.action_status(legacy_id, "#legacy", "trev", "codex") is None
+    # Legacy values remain global UUID tombstones and cannot be re-executed.
+    duplicate = new_envelope("turn.prompt", "action", "client", id=legacy_id, device="phone")
+    assert await reloaded.claim_action(duplicate, "#legacy", "trev", "codex") == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_action_status_honors_30_day_cutoff(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite3"
+    action = new_envelope("turn.prompt", "action", "client", device="phone")
+    store = StateStore(path)
+    assert await store.claim_action(action, "#codex", "trev", "codex") is None
+    await store.close()
+    with sqlite3.connect(path) as database:
+        database.execute(
+            "UPDATE actions SET received_at = ? WHERE id = ?",
+            (int(time.time() * 1000) - 31 * 24 * 60 * 60 * 1000, action.id),
+        )
+    assert await StateStore(path).action_status(action.id, "#codex", "trev", "codex") is None
+
+
+@pytest.mark.asyncio
+async def test_actions_table_migrates_scope_columns_without_exposing_old_receipts(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.sqlite3"
+    action_id = str(uuid.uuid4())
+    with sqlite3.connect(path) as database:
+        database.execute(
+            """CREATE TABLE actions (
+                id TEXT PRIMARY KEY, kind TEXT NOT NULL, channel TEXT,
+                received_at INTEGER NOT NULL, status TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '', payload TEXT NOT NULL
+            )"""
+        )
+        database.execute(
+            """INSERT INTO actions VALUES (?, 'turn.prompt', '#c', ?, 'accepted', '', '{}')""",
+            (action_id, int(time.time() * 1000)),
+        )
+    store = StateStore(path)
+    assert await store.action_status(action_id, "#c", "trev", "codex") is None
+    with sqlite3.connect(path) as database:
+        columns = {row[1] for row in database.execute("PRAGMA table_info(actions)")}
+    assert {"owner_account", "backend"} <= columns
