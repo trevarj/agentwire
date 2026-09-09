@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from agentwire.backends.base import Backend
+from agentwire.backends.base import Backend, BackendError
 from agentwire.bridge import Bridge
 from agentwire.config import (
     BridgeConfig,
@@ -211,7 +211,7 @@ def make_bridge(
             "IRC_PASSWORD",
             MappingProxyType(configured_channels),
         ),
-        codex=CodexConfig(tmp_path / "codex.sock", "codex"),
+        codex=CodexConfig(tmp_path / "codex.sock", "codex", dedicated_channels),
         opencode=OpenCodeConfig(
             "http://127.0.0.1:14096", "opencode", "OPENCODE_PASSWORD", "opencode"
         ),
@@ -782,15 +782,21 @@ async def test_pi_dedicated_create_preserves_source_and_invites_requester(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_omp_dedicated_create_routes_channel_and_close(tmp_path: Path) -> None:
+@pytest.mark.parametrize("backend_name", ["omp", "codex"])
+async def test_dedicated_create_routes_channel_and_close(tmp_path: Path, backend_name: str) -> None:
+    channel = f"#{backend_name}"
     bridge, irc, backend = make_bridge(
         tmp_path,
-        channels={"#omp": "omp"},
-        backend_name="omp",
+        channels={channel: backend_name},
+        backend_name=backend_name,
         dedicated_channels=True,
     )
-    backend.created_session_id = "2026-08-24T12-00-00-000Z_55555555-5555-7555-8555-555555555555"
-    await bridge._handle_topic("#omp", "agentwire:v1;account=trev;agent=bridge;backend=omp")
+    backend.created_session_id = "55555555-5555-7555-8555-555555555555"
+    await bridge._handle_topic(
+        channel, f"agentwire:v1;account=trev;agent=bridge;backend={backend_name}"
+    )
+    source = ChannelBinding(backend_name, "existing", str(tmp_path))
+    bridge.channels[channel].binding = source
     create = new_envelope(
         "session.create",
         "action",
@@ -800,16 +806,22 @@ async def test_omp_dedicated_create_routes_channel_and_close(tmp_path: Path) -> 
         data={"cwd": str(tmp_path)},
     )
 
-    await bridge._handle_action("#omp", create, "Alice")
+    await bridge._handle_action(channel, create, "Alice")
 
-    managed = "#omp-55555555"
+    managed = f"#{backend_name}-55555555"
+    assert bridge.channels[channel].binding == source
     assert bridge.channels[managed].binding == ChannelBinding(
-        "omp", backend.created_session_id, str(tmp_path)
+        backend_name, backend.created_session_id, str(tmp_path)
     )
+    assert ("invite", managed, "Alice") in irc.operations
     await bridge._emit_hello(managed)
     hello = next(event for _, event, _ in irc.sent if event.kind == "agent.hello")
-    assert hello.data["backend"] == "omp"
-    assert hello.data["settings"] == ["model", "effort", "delivery"]
+    assert hello.data["backend"] == backend_name
+    assert "model" in hello.data["settings"]
+    managed_hello = next(
+        event for target, event, _ in irc.sent if target == managed and event.kind == "agent.hello"
+    )
+    assert "session.close" in managed_hello.data["actions"]
 
     close = new_envelope(
         "session.close",
@@ -821,6 +833,112 @@ async def test_omp_dedicated_create_routes_channel_and_close(tmp_path: Path) -> 
     )
     await bridge._handle_action(managed, close, "Alice")
     assert backend.closed_sessions == [backend.created_session_id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reject_close, send_fails", [(True, False), (True, True), (False, False)])
+async def test_codex_close_holds_queue_until_backend_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reject_close: bool, send_fails: bool
+) -> None:
+    bridge, irc, backend = make_bridge(tmp_path, dedicated_channels=True)
+    backend.created_session_id = "66666666-6666-7666-8666-666666666666"
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    create = new_envelope(
+        "session.create",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        data={"cwd": str(tmp_path)},
+    )
+    await bridge._handle_action("#codex", create, "Alice")
+    managed = "#codex-66666666"
+    sid = backend.created_session_id
+    runtime = bridge.channels[managed]
+    binding = runtime.binding
+    await bridge.state.enqueue("pending", managed, sid, "keep this prompt", 2)
+
+    async def reject(session_id: str) -> None:
+        await bridge._handle_backend_event(
+            managed, BackendEvent("turn_done", "codex", session_id=sid)
+        )
+        assert backend.sent == []
+        if reject_close:
+            raise BackendError("Codex unsubscribe failed")
+
+    monkeypatch.setattr(backend, "close_session", reject)
+    if send_fails:
+
+        async def fail_send(session_id: str, text: str) -> str | None:
+            raise BackendError("Codex disconnected")
+
+        monkeypatch.setattr(backend, "send_message", fail_send)
+    close = new_envelope(
+        "session.close",
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        session_id=sid,
+    )
+    await bridge._handle_action(managed, close, "Alice")
+    assert irc.sent[-1][1].kind == ("action.failed" if reject_close else "action.succeeded")
+    assert runtime.binding == (binding if reject_close else None)
+    assert (managed in bridge.channels) is reject_close
+    assert [item.id for item in await bridge.state.list_queue(managed, sid)] == (
+        ["pending"] if send_fails else []
+    )
+    assert backend.sent == ([(sid, "keep this prompt")] if reject_close and not send_fails else [])
+    assert not runtime.closing_session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_method", ["set", "clear_queue"])
+async def test_codex_close_retries_state_cleanup_without_releasing_backend_twice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_method: str
+) -> None:
+    bridge, irc, backend = make_bridge(tmp_path, dedicated_channels=True)
+    backend.created_session_id = "77777777-7777-7777-8777-777777777777"
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    await bridge._handle_action(
+        "#codex",
+        new_envelope(
+            "session.create",
+            "action",
+            "client",
+            epoch=bridge.epoch,
+            device="phone",
+            data={"cwd": str(tmp_path)},
+        ),
+        "Alice",
+    )
+    managed = "#codex-77777777"
+    sid = backend.created_session_id
+    await bridge.state.enqueue("pending", managed, sid, "queued", 2)
+    original = getattr(bridge.state, cleanup_method)
+
+    async def unavailable(*args: Any) -> None:
+        raise OSError("state store unavailable")
+
+    monkeypatch.setattr(bridge.state, cleanup_method, unavailable)
+    await bridge._handle_action(
+        managed,
+        new_envelope(
+            "session.close", "action", "client", epoch=bridge.epoch, device="phone", session_id=sid
+        ),
+        "Alice",
+    )
+    assert irc.sent[-1][1].kind == "action.succeeded"
+    assert backend.closed_sessions == [sid]
+    assert bridge.channels[managed].binding is None
+    assert bridge.channels[managed].released_session_id == sid
+    assert managed in bridge._closing_channels
+
+    monkeypatch.setattr(bridge.state, cleanup_method, original)
+    await bridge._finish_channel_close(managed)
+    assert managed not in bridge.channels
+    assert await bridge.state.list_queue(managed, sid) == []
+    assert backend.closed_sessions == [sid]
 
 
 @pytest.mark.asyncio
@@ -1393,6 +1511,34 @@ async def test_topic_reactivation_reconciles_idle_backend_and_drains_queue(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("action_kind", ["turn.steer", "turn.prompt"])
+async def test_steering_announces_user_prompt_once(tmp_path: Path, action_kind: str) -> None:
+    bridge, irc, backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    runtime = bridge.channels["#codex"]
+    runtime.binding = ChannelBinding("codex", "s1", str(tmp_path))
+    runtime.busy = True
+    runtime.active_turn = "t1"
+    runtime.settings["delivery"] = "steer"
+    action = new_envelope(
+        action_kind,
+        "action",
+        "client",
+        epoch=bridge.epoch,
+        device="phone",
+        session_id="s1",
+        data={"content": "focus on the failing test"},
+    )
+    await bridge._handle_action("#codex", action, "Alice")
+    assert backend.steered == [("s1", "focus on the failing test")]
+    prompts = [event for _, event, _ in irc.sent if event.kind == "user.prompt"]
+    assert len(prompts) == 1
+    assert prompts[0].turn_id == "t1"
+    assert prompts[0].item_id == action.id
+    assert prompts[0].data == {"content": "focus on the failing test"}
+
+
+@pytest.mark.asyncio
 async def test_secret_assistant_message_is_wholly_omitted(tmp_path: Path) -> None:
     bridge, irc, _backend = make_bridge(tmp_path)
     await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
@@ -1703,6 +1849,30 @@ async def test_observed_session_status_is_coalesced_per_session(
     # Coalescing is per session: another session is not held back by the first.
     await status("s8", True)
     assert sent()[-1] == ("s8", True, [])
+
+
+@pytest.mark.asyncio
+async def test_subagent_descriptions_apply_secret_filter(tmp_path: Path) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    bridge.channels["#codex"].binding = ChannelBinding("codex", "s1", str(tmp_path))
+    agents = [
+        {
+            "id": "child-1",
+            "type": "agent",
+            "status": "running",
+            "description": "API_TOKEN=abcdefghijklmno",
+            "isBackground": True,
+        }
+    ]
+    await bridge._handle_backend_event(
+        "#codex", BackendEvent("subagent_update", "codex", session_id="s1", data={"agents": agents})
+    )
+    event = irc.sent[-1][1]
+    assert event.kind == "subagent.updated"
+    assert event.data["agents"][0]["description"] == "[omitted]"
+    assert "API_TOKEN" not in str(event.to_dict())
+    assert agents[0]["description"].startswith("API_TOKEN")
 
 
 @pytest.mark.asyncio

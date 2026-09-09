@@ -30,8 +30,12 @@ from agentwire.models import (
 from agentwire.text import safe_one_line, truncate_utf8
 
 _MAX_WEBSOCKET_MESSAGE_BYTES = 8 * 1024 * 1024
+_MAX_TOOL_PAYLOAD_BYTES = 32 * 1024
 _OVERLOAD_ERROR_CODE = -32001
 _OVERLOAD_RETRIES = 3
+_PROMPT_ECHO_SECONDS = 60
+_MAX_PROMPT_ECHOES = 32
+_MAX_SEEN_USER_ITEMS = 128
 
 
 class _CodexRPCError(BackendError):
@@ -150,6 +154,11 @@ class CodexBackend(Backend):
         self._last_plan_updates: dict[tuple[str, str], tuple[str, str, int, int]] = {}
         self._session_settings: dict[str, dict[str, Any]] = {}
         self._setting_options: dict[str, Any] | None = None
+        self._created_threads: set[str] = set()
+        self._pending_prompt_echoes: dict[str, list[tuple[int, str, float]]] = {}
+        self._next_prompt_echo = 0
+        self._seen_user_items: dict[str, list[str]] = {}
+        self._subagents: dict[str, dict[str, dict[str, Any]]] = {}
 
     async def start(self) -> None:
         async with self._connect_lock:
@@ -493,6 +502,22 @@ class CodexBackend(Backend):
                 return
             turn_id = str(params.get("turnId") or "") or None
             item_type = item.get("type")
+            if item_type == "userMessage":
+                if self._seen_user_item(thread_id, str(item.get("id") or "")):
+                    return
+                text = self._user_message_text(item)
+                if text and not self._consume_prompt_echo(thread_id, text):
+                    await self._events.put(
+                        BackendEvent(
+                            kind="user_prompt",
+                            backend=self.name,
+                            session_id=thread_id,
+                            turn_id=turn_id,
+                            item_id=str(item.get("id") or "") or None,
+                            text=text,
+                        )
+                    )
+                return
             if item_type == "agentMessage" and method == "item/completed" and turn_id:
                 self._turn_messages.setdefault((thread_id, turn_id), []).append(item)
                 if item.get("phase") == "commentary":
@@ -509,6 +534,18 @@ class CodexBackend(Backend):
                             )
                         )
                 return
+            if item_type in {"collabAgentToolCall", "subAgentActivity"}:
+                agents = self._update_subagents(thread_id, item)
+                if agents is not None:
+                    await self._events.put(
+                        BackendEvent(
+                            kind="subagent_update",
+                            backend=self.name,
+                            session_id=thread_id,
+                            turn_id=turn_id,
+                            data={"agents": agents},
+                        )
+                    )
             tool_kind = self._tool_kind(str(item_type))
             if tool_kind:
                 success = self._tool_success(item) if method == "item/completed" else None
@@ -553,7 +590,8 @@ class CodexBackend(Backend):
             text = (
                 safe_one_line(str(error.get("message") or status)) if kind == "turn_failed" else ""
             )
-            self._active_turns.pop(thread_id, None)
+            if self._active_turns.get(thread_id) == turn_id:
+                self._active_turns.pop(thread_id, None)
             if turn_id:
                 self._last_plan_updates.pop((thread_id, turn_id), None)
             await self._events.put(
@@ -642,6 +680,21 @@ class CodexBackend(Backend):
             tool = str(item.get("tool") or "").strip()
             if server or tool:
                 data["label"] = safe_one_line(" / ".join(part for part in (server, tool) if part))
+            if payload := CodexBackend._payload_text(item.get("arguments")):
+                data["input"] = payload
+            result = item.get("result")
+            output = (
+                CodexBackend._content_text(result.get("content"))
+                if isinstance(result, dict)
+                else ""
+            )
+            if not output and isinstance(result, dict):
+                output = CodexBackend._payload_text(result.get("structuredContent"))
+            error = item.get("error")
+            if not output and isinstance(error, dict):
+                output = str(error.get("message") or "").strip()
+            if output:
+                data["output"] = truncate_utf8(output, _MAX_TOOL_PAYLOAD_BYTES)
         elif item_type == "dynamicToolCall":
             namespace = str(item.get("namespace") or "").strip()
             tool = str(item.get("tool") or "").strip()
@@ -649,11 +702,42 @@ class CodexBackend(Backend):
                 data["label"] = safe_one_line(
                     " / ".join(part for part in (namespace, tool) if part)
                 )
+            if payload := CodexBackend._payload_text(item.get("arguments")):
+                data["input"] = payload
+            output = CodexBackend._content_text(item.get("contentItems"))
+            if output:
+                data["output"] = truncate_utf8(output, _MAX_TOOL_PAYLOAD_BYTES)
         elif item_type == "webSearch":
             query = str(item.get("query") or "").strip()
             if query:
                 data["label"] = safe_one_line(f"Search: {query}", 160)
         return data
+
+    @staticmethod
+    def _payload_text(value: Any) -> str:
+        """Render protocol JSON for the bridge's bounded text-only tool contract."""
+        if isinstance(value, str):
+            return truncate_utf8(value.strip(), _MAX_TOOL_PAYLOAD_BYTES)
+        if value is None:
+            return ""
+        try:
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return ""
+        return truncate_utf8(text, _MAX_TOOL_PAYLOAD_BYTES)
+
+    @staticmethod
+    def _content_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if not isinstance(content, list):
+            return ""
+        parts = [
+            str(item.get("text") or "").strip()
+            for item in content
+            if isinstance(item, Mapping) and item.get("type") in {"text", "inputText"}
+        ]
+        return "\n\n".join(part for part in parts if part)
 
     @staticmethod
     def _git_diff(change: dict[str, Any]) -> str:
@@ -970,6 +1054,124 @@ class CodexBackend(Backend):
                     parts.append(text)
         return "\n\n".join(parts)
 
+    def _remember_prompt_echo(self, session_id: str, text: str) -> int | None:
+        normalized = text.strip()
+        if not normalized:
+            return None
+        self._next_prompt_echo += 1
+        token = self._next_prompt_echo
+        now = time.monotonic()
+        echoes = self._pending_prompt_echoes.setdefault(session_id, [])
+        echoes[:] = [entry for entry in echoes if entry[2] > now]
+        echoes.append((token, normalized, now + _PROMPT_ECHO_SECONDS))
+        del echoes[:-_MAX_PROMPT_ECHOES]
+        return token
+
+    def _forget_prompt_echo(self, session_id: str, token: int | None) -> None:
+        if token is None:
+            return
+        echoes = self._pending_prompt_echoes.get(session_id)
+        if echoes is None:
+            return
+        echoes[:] = [entry for entry in echoes if entry[0] != token]
+        if not echoes:
+            self._pending_prompt_echoes.pop(session_id, None)
+
+    def _consume_prompt_echo(self, session_id: str, text: str) -> bool:
+        echoes = self._pending_prompt_echoes.get(session_id)
+        if echoes is None:
+            return False
+        now = time.monotonic()
+        normalized = text.strip()
+        kept: list[tuple[int, str, float]] = []
+        consumed = False
+        for entry in echoes:
+            if entry[2] <= now:
+                continue
+            if not consumed and entry[1] == normalized:
+                consumed = True
+                continue
+            kept.append(entry)
+        if kept:
+            self._pending_prompt_echoes[session_id] = kept
+        else:
+            self._pending_prompt_echoes.pop(session_id, None)
+        return consumed
+
+    def _seen_user_item(self, session_id: str, item_id: str) -> bool:
+        if not item_id:
+            return False
+        items = self._seen_user_items.setdefault(session_id, [])
+        if item_id in items:
+            return True
+        items.append(item_id)
+        del items[:-_MAX_SEEN_USER_ITEMS]
+        return False
+
+    @staticmethod
+    def _subagent_status(value: Any) -> str:
+        return {
+            "pendingInit": "queued",
+            "inProgress": "queued",
+            "running": "running",
+            "completed": "completed",
+            "interrupted": "failed",
+            "errored": "failed",
+            "shutdown": "failed",
+            "notFound": "failed",
+            "started": "running",
+            "interacted": "running",
+        }.get(str(value), "failed")
+
+    def _update_subagents(
+        self, session_id: str, item: Mapping[str, Any]
+    ) -> list[dict[str, Any]] | None:
+        item_type = item.get("type")
+        agents = self._subagents.setdefault(session_id, {})
+        updated = False
+        if item_type == "collabAgentToolCall":
+            states = item.get("agentsStates")
+            raw_ids = item.get("receiverThreadIds")
+            if not isinstance(raw_ids, list):
+                return None
+            for raw_id in raw_ids:
+                identifier = str(raw_id or "").strip()
+                if not identifier:
+                    continue
+                state = states.get(identifier) if isinstance(states, Mapping) else {}
+                message = state.get("message") if isinstance(state, Mapping) else ""
+                state_status = state.get("status") if isinstance(state, Mapping) else None
+                previous = agents.get(identifier, {})
+                agents[identifier] = {
+                    "id": safe_one_line(identifier, 200),
+                    "type": safe_one_line(
+                        str(item.get("model") or previous.get("type") or "agent"), 200
+                    ),
+                    "description": safe_one_line(str(message or item.get("prompt") or ""), 200),
+                    "status": self._subagent_status(state_status or item.get("status")),
+                    "isBackground": True,
+                }
+                updated = True
+        elif item_type == "subAgentActivity":
+            identifier = str(item.get("agentThreadId") or "").strip()
+            if not identifier:
+                return None
+            previous = agents.get(identifier, {})
+            agents[identifier] = {
+                "id": safe_one_line(identifier, 200),
+                "type": str(previous.get("type") or "agent"),
+                "description": safe_one_line(
+                    str(item.get("agentPath") or previous.get("description") or ""), 200
+                ),
+                "status": self._subagent_status(item.get("kind")),
+                "isBackground": bool(previous.get("isBackground", True)),
+            }
+            updated = True
+        return self._subagent_list(session_id) if updated else None
+
+    def _subagent_list(self, session_id: str) -> list[dict[str, Any]]:
+        return list(self._subagents.get(session_id, {}).values())
+
     @staticmethod
     def _timestamp_ms(value: Any, fallback: int) -> int:
         if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -1107,7 +1309,9 @@ class CodexBackend(Backend):
         thread = (result or {}).get("thread") or {}
         if not thread.get("id"):
             raise BackendError("Codex thread/start returned no thread id")
-        return self._summary(thread)
+        summary = self._summary(thread)
+        self._created_threads.add(summary.id)
+        return summary
 
     async def attach_session(self, session_id: str, cwd: str | None = None) -> SessionSummary:
         params: dict[str, Any] = {
@@ -1137,6 +1341,10 @@ class CodexBackend(Backend):
         )
         if active_turn_id:
             self._active_turns[session_id] = active_turn_id
+        else:
+            # A resume snapshot is authoritative even if an earlier connection
+            # missed the turn completion notification.
+            self._active_turns.pop(session_id, None)
         recent_activity = await self._active_turn_activity(
             session_id,
             active_turn_id,
@@ -1182,6 +1390,27 @@ class CodexBackend(Backend):
         last_reply = self._select_final_message(messages) or None
         if last_reply:
             self._last_replies[session_id] = last_reply
+        hydrated_subagents = False
+        # App-server returns the initial page newest first; replay its state
+        # oldest first so a completed child never becomes running again.
+        for turn in reversed(turns):
+            if not isinstance(turn, dict):
+                continue
+            for item in turn.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                hydrated_subagents = (
+                    self._update_subagents(session_id, item) is not None or hydrated_subagents
+                )
+        if hydrated_subagents:
+            await self._events.put(
+                BackendEvent(
+                    kind="subagent_update",
+                    backend=self.name,
+                    session_id=session_id,
+                    data={"agents": self._subagent_list(session_id)},
+                )
+            )
         return SessionSummary(
             id=summary.id,
             cwd=summary.cwd,
@@ -1287,7 +1516,12 @@ class CodexBackend(Backend):
         params: dict[str, Any] = {"threadId": session_id, "input": self._input(text)}
         settings = self._session_settings.get(session_id, {})
         params.update(self._codex_settings(settings))
-        result = await self._request("turn/start", params)
+        echo = self._remember_prompt_echo(session_id, text)
+        try:
+            result = await self._request("turn/start", params)
+        except BaseException:
+            self._forget_prompt_echo(session_id, echo)
+            raise
         turn = (result or {}).get("turn") or {}
         turn_id = str(turn.get("id") or "") or None
         if turn_id:
@@ -1371,20 +1605,59 @@ class CodexBackend(Backend):
         expected = turn_id or self._active_turns.get(session_id)
         if not expected:
             raise BackendError("Codex has no active turn to steer")
-        await self._request(
-            "turn/steer",
-            {
-                "threadId": session_id,
-                "expectedTurnId": expected,
-                "input": self._input(text),
-            },
-        )
+        echo = self._remember_prompt_echo(session_id, text)
+        try:
+            await self._request(
+                "turn/steer",
+                {
+                    "threadId": session_id,
+                    "expectedTurnId": expected,
+                    "input": self._input(text),
+                },
+            )
+        except BaseException:
+            self._forget_prompt_echo(session_id, echo)
+            raise
 
     async def cancel(self, session_id: str, turn_id: str | None) -> None:
         active = turn_id or self._active_turns.get(session_id)
         if not active:
             raise BackendError("Codex has no active turn to cancel")
         await self._request("turn/interrupt", {"threadId": session_id, "turnId": active})
+
+    async def close_session(self, session_id: str) -> None:
+        if session_id not in self._created_threads:
+            raise BackendError("Codex only closes threads created by this bridge")
+        if session_id in self._tui_session_ids():
+            raise BackendError("close the attached Codex TUI before closing this thread")
+        active = self._active_turns.get(session_id)
+        if active:
+            await self._request("turn/interrupt", {"threadId": session_id, "turnId": active})
+            if self._active_turns.get(session_id) == active:
+                self._active_turns.pop(session_id, None)
+        if self._active_turns.get(session_id) is not None:
+            raise BackendError("Codex started a new turn while closing this thread")
+        result = await self._request("thread/unsubscribe", {"threadId": session_id})
+        status = str((result or {}).get("status") or "")
+        if status not in {"unsubscribed", "notLoaded", "notSubscribed"}:
+            raise BackendError(
+                f"Codex thread/unsubscribe returned unexpected status: {status or 'none'}"
+            )
+        # Once unsubscribed, finalize local close even if another client started
+        # work during the request; its subscription owns that new turn.
+        self._created_threads.discard(session_id)
+        self._active_turns.pop(session_id, None)
+        self._last_replies.pop(session_id, None)
+        self._session_settings.pop(session_id, None)
+        self._pending_prompt_echoes.pop(session_id, None)
+        self._seen_user_items.pop(session_id, None)
+        self._subagents.pop(session_id, None)
+        for key in tuple(self._turn_messages):
+            if key[0] == session_id:
+                self._turn_messages.pop(key, None)
+        for key in tuple(self._last_plan_updates):
+            if key[0] == session_id:
+                self._last_plan_updates.pop(key, None)
 
     async def resolve_approval(self, request_token: str | int, allow: bool) -> None:
         try:

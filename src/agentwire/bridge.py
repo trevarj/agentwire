@@ -77,6 +77,8 @@ class ChannelRuntime:
     binding: ChannelBinding | None = None
     busy: bool = False
     active_turn: str | None = None
+    closing_session: bool = False
+    released_session_id: str | None = None
     settings: dict[str, Any] = field(
         default_factory=lambda: {"delivery": "queue", "approvalReviewer": "manual"}
     )
@@ -921,7 +923,9 @@ class Bridge:
             raise ValueError(f"managed {runtime.backend} channels cannot create another session")
         summary = await self.backends[runtime.backend].create_session(cwd)
         backend_config = (
-            self.config.pi
+            self.config.codex
+            if runtime.backend == "codex"
+            else self.config.pi
             if runtime.backend == "pi"
             else self.config.omp
             if runtime.backend == "omp"
@@ -999,9 +1003,23 @@ class Bridge:
         binding = self._require_binding(runtime, action)
         if binding.backend != runtime.backend:
             raise ValueError(f"only a managed {runtime.backend} session can be closed")
-        await self.state.set(channel, None)
-        await self.state.clear_queue(channel, binding.session_id)
-        await self.backends[binding.backend].close_session(binding.session_id)
+        # Interrupting Codex emits turn completion while close is still pending.
+        # Hold the queue until the session has been released successfully.
+        runtime.closing_session = True
+        try:
+            await self.backends[binding.backend].close_session(binding.session_id)
+        except Exception:
+            runtime.closing_session = False
+            # A completion may have arrived while closing held the queue.
+            # Restore normal delivery if closing failed and the backend is usable.
+            with contextlib.suppress(BackendError):
+                await self._drain_queue(channel)
+            raise
+        finally:
+            runtime.closing_session = False
+        # Backend release has succeeded. Persistence and IRC cleanup can retry,
+        # but must never restore a binding to a thread we no longer subscribe to.
+        runtime.released_session_id = binding.session_id
         runtime.binding = None
         runtime.busy = False
         runtime.active_turn = None
@@ -1011,6 +1029,11 @@ class Bridge:
 
     async def _finish_channel_close(self, channel: str) -> None:
         try:
+            runtime = self.channels[channel]
+            if runtime.released_session_id is not None:
+                await self.state.set(channel, None)
+                await self.state.clear_queue(channel, runtime.released_session_id)
+                runtime.released_session_id = None
             await self.irc.flush()
             await self.irc.set_topic(channel, "")
             await self.irc.part_channel(channel)
@@ -1147,8 +1170,15 @@ class Bridge:
         binding = self._require_binding(runtime, action)
         if not runtime.busy:
             raise ValueError("session has no active turn")
-        await self.backends[runtime.backend].steer(
-            binding.session_id, runtime.active_turn, self._content(action)
+        text = self._content(action)
+        await self.backends[runtime.backend].steer(binding.session_id, runtime.active_turn, text)
+        await self._emit(
+            channel,
+            "user.prompt",
+            session_id=binding.session_id,
+            turn_id=runtime.active_turn,
+            item_id=action.item_id or action.id,
+            data=self._safe_user_prompt(text),
         )
 
     async def _action_cancel(self, channel: str, action: Envelope) -> None:
@@ -1307,9 +1337,8 @@ class Bridge:
                 },
             )
         elif event.kind == "user_prompt":
-            # Only follow mode relays prompts through the backend: prompts the
-            # owner sends over IRC are emitted by the action path and never
-            # come back this way, so this cannot double-render them.
+            # Backends suppress echoes of IRC prompts, which the action path
+            # already emitted. These prompts originated in another client.
             prompt = self._safe_user_prompt(event.text)
             content = prompt.get("content")
             await self._emit(
@@ -1448,18 +1477,30 @@ class Bridge:
 
     async def _drain_queue(self, channel: str) -> None:
         runtime = self.channels[channel]
-        if runtime.activation is None or runtime.binding is None or runtime.busy:
+        if (
+            runtime.activation is None
+            or runtime.binding is None
+            or runtime.busy
+            or runtime.closing_session
+        ):
             return
-        items = await self.state.list_queue(channel, runtime.binding.session_id)
-        if not items:
-            return
-        item = items[0]
+        # Claim delivery before awaiting so completion and close recovery cannot
+        # both dispatch the same queue head. Keep it until the backend accepts it.
+        runtime.busy = True
+        try:
+            items = await self.state.list_queue(channel, runtime.binding.session_id)
+            if not items:
+                runtime.busy = False
+                return
+            item = items[0]
+            runtime.active_turn = await self.backends[runtime.backend].send_message(
+                runtime.binding.session_id, item.text
+            )
+        except BaseException:
+            runtime.busy = False
+            raise
         await self.state.delete_queue(item.id)
         await self._emit_queue_item(channel, "queue.item.removed", item)
-        runtime.active_turn = await self.backends[runtime.backend].send_message(
-            runtime.binding.session_id, item.text
-        )
-        runtime.busy = True
         await self._emit(
             channel,
             "user.prompt",
@@ -1678,7 +1719,19 @@ class Bridge:
         channel because this state only ever describes the bound session.
         """
         agents = event.data.get("agents")
-        data: dict[str, Any] = {"agents": list(agents) if isinstance(agents, list) else []}
+        safe_agents = []
+        for agent in agents if isinstance(agents, list) else []:
+            if not isinstance(agent, dict):
+                continue
+            row = dict(agent)
+            # Codex descriptions can contain delegated prompts and results.
+            # Apply the same secret filter as ordinary prompts and tool output.
+            for key in ("id", "type", "description"):
+                value = row.get(key)
+                if isinstance(value, str) and scan_secrets(value):
+                    row[key] = "[omitted]"
+            safe_agents.append(row)
+        data: dict[str, Any] = {"agents": safe_agents}
         now = time.monotonic()
         last = runtime.subagents
         pending = runtime.subagents_pending

@@ -146,6 +146,24 @@ def test_opencode_channel_still_requires_opencode_table(tmp_path: Path) -> None:
         load_config(config_path)
 
 
+@pytest.mark.parametrize("value", [None, "true", "false", '"yes"'])
+def test_codex_dedicated_channels_config(tmp_path: Path, value: str | None) -> None:
+    config_path = _write_config(tmp_path, '{ "#codex" = "codex" }')
+    if value is not None:
+        text = config_path.read_text(encoding="utf-8")
+        config_path.write_text(
+            text.replace("[codex]\n", f"[codex]\ndedicated_channels = {value}\n"),
+            encoding="utf-8",
+        )
+    if value == '"yes"':
+        with pytest.raises(ConfigError, match="dedicated_channels.*boolean"):
+            load_config(config_path)
+    else:
+        config = load_config(config_path)
+        assert config.codex is not None
+        assert config.codex.dedicated_channels is (value == "true")
+
+
 def test_pi_channel_requires_pi_table_and_loads_defaults(tmp_path: Path) -> None:
     config_path = _write_config(tmp_path, '{ "#pi" = "pi" }')
     with pytest.raises(ConfigError, match=r"missing \[pi\] table"):

@@ -25,6 +25,8 @@ channels = { "#codex" = "codex" }
 [codex]
 socket_path = "$XDG_RUNTIME_DIR/agentwire/codex.sock"
 binary = "codex"
+# Create one private IRC channel per new Codex session until bridge restart.
+dedicated_channels = false
 
 # Only read when a channel above is bound to the "claude" backend, for example
 # channels = { "#codex" = "codex", "#claude" = "claude" }

@@ -89,6 +89,7 @@ class IRCConfig:
 class CodexConfig:
     socket_path: Path
     binary: str
+    dedicated_channels: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -240,6 +241,7 @@ def load_config(path: str | Path) -> Config:
             CodexConfig(
                 socket_path=_path(_required_str(codex, "socket_path", "codex")),
                 binary=_required_str(codex, "binary", "codex"),
+                dedicated_channels=_boolean(codex, "dedicated_channels", False, "codex"),
             )
             if codex is not None
             else None
