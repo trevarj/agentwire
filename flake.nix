@@ -14,7 +14,7 @@
         pyproject = true;
         build-system = [ pkgs.python3Packages.setuptools ];
         dependencies = with pkgs.python3Packages; [ aiohttp claude-agent-sdk ];
-        nativeCheckInputs = with pkgs.python3Packages; [ pytest pytest-asyncio ] ++ [ pkgs.ruff ];
+        nativeCheckInputs = with pkgs.python3Packages; [ jsonschema pytest pytest-asyncio ] ++ [ pkgs.ruff ];
         checkPhase = ''
           runHook preCheck
           ruff check src tests
@@ -74,6 +74,7 @@
               (pkgs.python3.withPackages (pythonPackages: with pythonPackages; [
                 aiohttp
                 claude-agent-sdk
+                jsonschema
                 pytest
                 pytest-asyncio
               ]))

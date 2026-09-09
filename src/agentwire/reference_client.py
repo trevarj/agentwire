@@ -37,11 +37,15 @@ class HarnessState:
     plan: dict[str, Any] | None = None
     # Replace-not-merge: every `subagent.updated` carries the full current list.
     subagents: list[dict[str, Any]] = field(default_factory=list)
+    _seen_event_ids: set[str] = field(default_factory=set, repr=False)
+    _assistant_positions: dict[str, int] = field(default_factory=dict, repr=False)
 
     def apply(self, event: Envelope) -> None:
         if event.message_type != "event":
             return
         if event.kind == "agent.hello":
+            if event.epoch != self.epoch:
+                self._seen_event_ids.clear()
             self.active = True
             self.backend = str(event.data.get("backend") or "") or None
             self.epoch = event.epoch or str(event.data.get("epoch") or "") or None
@@ -49,11 +53,14 @@ class HarnessState:
             self.active = bool(event.data.get("active", True))
             self.backend = str(event.data.get("backend") or "") or self.backend
             binding = event.data.get("binding")
-            self.session_id = (
+            session_id = (
                 str(binding.get("sid"))
                 if isinstance(binding, dict) and binding.get("sid")
                 else None
             )
+            if session_id != self.session_id:
+                self._reset_timeline()
+            self.session_id = session_id
             self.turn_id = str(event.data.get("tid") or "") or None
             self.busy = bool(event.data.get("busy"))
             self.settings = dict(event.data.get("settings") or {})
@@ -79,13 +86,8 @@ class HarnessState:
                 if isinstance(session, dict) and session.get("sid")
                 else event.session_id
             )
-            self.turn_id = None
-            self.busy = False
-            self.assistant.clear()
-            self.tools.clear()
-            self.plan = None
-            self.subagents = []
-        elif event.kind in {"session.snapshot", "session.status"}:
+            self._reset_timeline()
+        elif event.kind in {"session.snapshot", "session.status"} and self._is_bound(event):
             self.settings.update(event.data.get("settings") or {})
             if "busy" in event.data:
                 self.busy = bool(event.data["busy"])
@@ -95,30 +97,126 @@ class HarnessState:
                     for item in event.data.get("recentOutputs") or []
                     if isinstance(item, dict)
                 ]
-        elif event.kind == "turn.started":
+                self._assistant_positions = {
+                    self._output_key(event, item): index
+                    for index, item in enumerate(self.assistant)
+                    if item.get("iid")
+                }
+        elif event.kind == "turn.started" and not event.history and self._is_bound(event):
             self.busy = True
             self.turn_id = event.turn_id
-        elif event.kind in {"turn.completed", "turn.failed"}:
+        elif (
+            event.kind in {"turn.completed", "turn.failed"}
+            and not event.history
+            and self._is_bound(event)
+        ):
             self.busy = False
             self.turn_id = None
-        elif event.kind == "assistant.completed":
-            self.assistant.append({"iid": event.item_id, **event.data})
-        elif event.kind == "plan.updated":
+        elif event.kind == "assistant.completed" and self._is_bound(event):
+            if not self._mark_once(event):
+                return
+            item = {"iid": event.item_id, **event.data}
+            key = self._item_key(event) if event.item_id else event.id
+            position = self._assistant_positions.get(key)
+            if position is None:
+                self._assistant_positions[key] = len(self.assistant)
+                self.assistant.append(item)
+            else:
+                self.assistant[position] = item
+        elif event.kind == "plan.updated" and not event.history and self._is_bound(event):
             self.plan = dict(event.data)
-        elif event.kind == "subagent.updated":
+        elif event.kind == "subagent.updated" and not event.history and self._is_bound(event):
             self.subagents = [
                 dict(agent) for agent in event.data.get("agents") or [] if isinstance(agent, dict)
             ]
-        elif event.kind.startswith("tool.") and event.item_id:
-            self.tools[event.item_id] = {"kind": event.kind, **event.data}
-        elif event.kind == "request.opened" and event.request_id:
+        elif event.kind.startswith("tool.") and event.item_id and self._is_bound(event):
+            if not self._mark_once(event):
+                return
+            key = self._tool_key(event)
+            previous = self.tools.get(key, {})
+            if event.history and self._tool_rank(event.kind) < self._tool_rank(
+                previous.get("event")
+            ):
+                return
+            self.tools[key] = {
+                **previous,
+                **event.data,
+                "sid": event.session_id,
+                "tid": event.turn_id,
+                "iid": event.item_id,
+                "event": event.kind,
+            }
+        elif (
+            event.kind == "request.opened"
+            and event.request_id
+            and not event.history
+            and self._is_bound(event)
+        ):
             self.requests[event.request_id] = dict(event.data)
-        elif event.kind == "request.resolved" and event.request_id:
+        elif (
+            event.kind == "request.resolved"
+            and event.request_id
+            and not event.history
+            and self._is_bound(event)
+        ):
             self.requests.pop(event.request_id, None)
-        elif event.kind.startswith("queue.item."):
+        elif event.kind.startswith("queue.item.") and self._is_queue_relevant(event):
             self._apply_queue(event)
-        elif event.kind == "queue.snapshot":
+        elif event.kind == "queue.snapshot" and self._is_queue_relevant(event):
             self.queue = list(event.data.get("items") or [])
+
+    def _is_bound(self, event: Envelope) -> bool:
+        """Whether an event may affect the channel's selected-session state."""
+
+        return event.session_id is None or (
+            self.session_id is not None and event.session_id == self.session_id
+        )
+
+    def _reset_timeline(self) -> None:
+        self.turn_id = None
+        self.busy = False
+        self.assistant.clear()
+        self._assistant_positions.clear()
+        self.tools.clear()
+        self.plan = None
+        self.subagents = []
+        self._seen_event_ids.clear()
+
+    def _is_queue_relevant(self, event: Envelope) -> bool:
+        # Queue operations remain useful before the first binding snapshot.
+        # Once a channel is bound, a delayed queue event from another session
+        # must not replace the selected session's pending work.
+        return self.session_id is None or self._is_bound(event)
+
+    def _mark_once(self, event: Envelope) -> bool:
+        # Ignore only events we actually applied.  An observed-session event
+        # can arrive before a binding, then be received again after a user
+        # attaches it; the early ignored copy must not suppress that update.
+        if event.id in self._seen_event_ids:
+            return False
+        self._seen_event_ids.add(event.id)
+        return True
+
+    @staticmethod
+    def _item_key(event: Envelope) -> str:
+        # JSON is a stable, reversible representation of the full identity.
+        # ``iid`` alone collides when backends reuse tool ids across turns.
+        return json.dumps([event.session_id, event.turn_id, event.item_id], separators=(",", ":"))
+
+    @classmethod
+    def _output_key(cls, event: Envelope, item: dict[str, Any]) -> str:
+        return json.dumps(
+            [event.session_id, item.get("tid") or event.turn_id, item.get("iid")],
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def _tool_key(cls, event: Envelope) -> str:
+        return cls._item_key(event)
+
+    @staticmethod
+    def _tool_rank(kind: object) -> int:
+        return {"tool.started": 0, "tool.updated": 1, "tool.completed": 2}.get(kind, -1)
 
     def _apply_queue(self, event: Envelope) -> None:
         item_id = event.item_id or str(event.data.get("iid") or "")

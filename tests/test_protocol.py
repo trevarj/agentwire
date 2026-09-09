@@ -8,8 +8,11 @@ import zlib
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator, FormatChecker
 
 from agentwire.protocol import (
+    ACTION_KINDS,
+    EVENT_KINDS,
     MAX_PAYLOAD_BYTES,
     MAX_TAG_SECTION_BYTES,
     PROTOCOL_TAG,
@@ -23,6 +26,12 @@ from agentwire.protocol import (
     parse_topic,
     tag_wire_size,
 )
+
+
+def _schema_validator() -> Draft202012Validator:
+    schema_path = Path(__file__).parents[1] / "protocol" / "agentwire-v1.schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    return Draft202012Validator(schema, format_checker=FormatChecker())
 
 
 def test_topic_activation_is_exact_and_percent_decoded() -> None:
@@ -117,6 +126,23 @@ def test_envelope_round_trip_is_minified_and_validated() -> None:
         decode_envelope(json.dumps(invalid))
 
 
+@pytest.mark.parametrize(
+    ("change", "error"),
+    [
+        (lambda envelope: envelope.update({"unexpected": True}), "unsupported envelope fields"),
+        (lambda envelope: envelope.pop("device"), "actions require device"),
+        (lambda envelope: envelope.update({"t": "event"}), "unsupported event kind"),
+        (lambda envelope: envelope.update({"v": True}), "unsupported protocol version"),
+        (lambda envelope: envelope.update({"device": None}), "device must be a non-empty string"),
+    ],
+)
+def test_reference_decoder_matches_strict_v1_envelope_rules(change, error: str) -> None:
+    raw = new_envelope("sync.request", "action", "client", device="phone").to_dict()
+    change(raw)
+    with pytest.raises(ProtocolError, match=error):
+        decode_envelope(json.dumps(raw))
+
+
 def test_checked_fragment_round_trip_and_conflict_rejection() -> None:
     compressed = new_envelope(
         "assistant.completed",
@@ -154,6 +180,19 @@ def test_checked_fragment_round_trip_and_conflict_rejection() -> None:
     conflicting["b64"] += "A"
     with pytest.raises(ProtocolError, match="conflicting"):
         reassembler.add(json.dumps(conflicting, separators=(",", ":")))
+
+
+def test_fragments_reject_unknown_fields_and_invalid_metadata_types() -> None:
+    envelope = new_envelope("assistant.completed", "event", "agent", data={"content": "x" * 2_000})
+    fragment = json.loads(fragment_envelope(envelope, max_tag_bytes=500)[0])
+    fragment["extra"] = True
+    with pytest.raises(ProtocolError, match="unsupported fragment fields"):
+        Reassembler().add(json.dumps(fragment))
+
+    fragment.pop("extra")
+    fragment["parts"] = True
+    with pytest.raises(ProtocolError, match="invalid fragment count"):
+        Reassembler().add(json.dumps(fragment))
 
 
 def test_compressed_fragments_reject_oversized_output() -> None:
@@ -196,7 +235,7 @@ def test_payload_limit_is_enforced_before_fragmentation() -> None:
 
 def test_committed_fixtures_decode_with_reference_codec() -> None:
     protocol_dir = Path(__file__).parents[1] / "protocol"
-    json.loads((protocol_dir / "agentwire-v1.schema.json").read_text(encoding="utf-8"))
+    validator = _schema_validator()
     fixtures = protocol_dir / "fixtures"
     assert parse_topic((fixtures / "topic.txt").read_text(encoding="utf-8").strip()) is not None
     hello = decode_envelope((fixtures / "hello.json").read_text(encoding="utf-8"))
@@ -247,6 +286,99 @@ def test_committed_fixtures_decode_with_reference_codec() -> None:
         "isBackground": True,
     }
     assert (agents[1]["toolUses"], agents[1]["durationMs"], agents[1]["tokens"]) == (7, 4200, 1234)
+
+    for path in sorted(fixtures.glob("*.json")):
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert not list(validator.iter_errors(raw)), path.name
+        decode_envelope(json.dumps(raw))
+
+    for path in sorted((fixtures / "invalid").glob("*.json")):
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        assert list(validator.iter_errors(raw)), path.name
+        with pytest.raises(ProtocolError):
+            Reassembler().add(json.dumps(raw))
+
+
+def test_schema_kind_sets_match_the_reference_codec() -> None:
+    schema = json.loads(
+        (Path(__file__).parents[1] / "protocol" / "agentwire-v1.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    definitions = schema["$defs"]
+    assert set(definitions["actionKind"]["enum"]) == ACTION_KINDS
+    assert set(definitions["eventKind"]["enum"]) == EVENT_KINDS
+
+
+def test_integral_json_numbers_match_schema_and_jvm_clients() -> None:
+    raw = new_envelope("assistant.completed", "event", "agent", at=1).to_dict()
+    raw.update(v=1.0, at=1.0, rev=2.0)
+    assert not list(_schema_validator().iter_errors(raw))
+    decoded = decode_envelope(json.dumps(raw))
+    assert decoded.at == 1 and type(decoded.at) is int
+    assert decoded.revision == 2 and type(decoded.revision) is int
+    for field in ("at", "rev"):
+        invalid = {**raw, field: 2**63}
+        assert list(_schema_validator().iter_errors(invalid))
+        with pytest.raises(ProtocolError):
+            decode_envelope(json.dumps(invalid))
+
+
+def test_conformance_corpus_is_current_and_schema_valid() -> None:
+    protocol_dir = Path(__file__).parents[1] / "protocol"
+    generator = protocol_dir / "conformance" / "generate.py"
+    # Importing the generator directly avoids a subprocess and keeps this test
+    # usable by downstream packagers that run pytest without a console script.
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("agentwire_conformance", generator)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.main(["--check"]) == 0
+
+    validator = _schema_validator()
+    for path in sorted((protocol_dir / "conformance").glob("*.json")):
+        if path.name == "manifest.json":
+            continue
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if "envelope" in document:
+            assert not list(validator.iter_errors(json.loads(document["envelope"]))), path.name
+            for fragment in document["fragments"]:
+                assert not list(validator.iter_errors(json.loads(fragment))), path.name
+            continue
+        for step in document["steps"]:
+            assert not list(validator.iter_errors(json.loads(step["tag"]))), path.name
+
+
+def test_replay_corpus_asserts_live_state_isolation_and_full_tool_identity() -> None:
+    document = json.loads(
+        (
+            Path(__file__).parents[1] / "protocol" / "conformance" / "replay-and-isolation.json"
+        ).read_text(encoding="utf-8")
+    )
+    history_state = document["steps"][4]["state"]
+    assert (history_state["busy"], history_state["tid"]) == (True, "turn-1")
+    final_state = document["steps"][-1]["state"]
+    assert (final_state["busy"], final_state["tid"]) == (True, "turn-1")
+    assert set(final_state["tools"]) == {
+        '["sess-conformance",null,"shared-tool"]',
+        '["sess-conformance","another-turn","shared-tool"]',
+        '["sess-conformance","turn-1","call-1"]',
+        '["sess-conformance","turn-1","preserved"]',
+    }
+    preserved = final_state["tools"]['["sess-conformance","turn-1","preserved"]']
+    assert preserved == {
+        "event": "tool.completed",
+        "iid": "preserved",
+        "input": "pytest -q",
+        "kind": "shell",
+        "label": "run tests",
+        "output": "passed",
+        "sid": "sess-conformance",
+        "success": True,
+        "tid": "turn-1",
+    }
 
 
 def test_every_committed_envelope_fixture_re_encodes_byte_for_byte() -> None:

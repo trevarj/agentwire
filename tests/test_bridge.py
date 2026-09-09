@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
+import re
 from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
 from types import MappingProxyType
@@ -35,6 +37,7 @@ from agentwire.models import (
     SessionSummary,
 )
 from agentwire.protocol import (
+    ACTION_KINDS,
     PROTOCOL_TAG,
     Envelope,
     ProtocolError,
@@ -228,6 +231,38 @@ def make_bridge(
         ),
     )
     return Bridge(config, irc, {backend_name: backend}), irc, backend  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("backend_name", "expected_settings"),
+    [
+        ("codex", ["model", "effort", "collaboration", "delivery", "approvalReviewer"]),
+        ("pi", ["model", "effort", "delivery"]),
+        ("omp", ["model", "effort", "delivery"]),
+        ("opencode", ["delivery"]),
+        ("claude", ["delivery"]),
+    ],
+)
+async def test_hello_advertisements_match_dispatch_and_backend_settings(
+    tmp_path: Path, backend_name: str, expected_settings: list[str]
+) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path, backend_name=backend_name)
+    channel = f"#{backend_name}"
+    await bridge._emit_hello(channel)
+    hello = next(event for target, event, _ in irc.sent if target == channel)
+
+    handler_kinds = set(
+        re.findall(r'"([^\"]+)": self\._action_', inspect.getsource(Bridge._dispatch_action))
+    )
+    assert set(hello.data["actions"]) <= handler_kinds <= ACTION_KINDS
+    assert ACTION_KINDS - handler_kinds == {
+        "session.rename",
+        "session.fork",
+        "session.archive",
+        "session.unarchive",
+    }
+    assert hello.data["settings"] == expected_settings
 
 
 @pytest.mark.asyncio

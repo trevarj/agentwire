@@ -134,6 +134,12 @@ Strings are UTF-8. IDs are opaque except that envelope `id` is a UUID. Timestamp
 establish liveness or ordering. Clients order revisions by `rev` where present and otherwise use
 arrival order, reconciling from snapshots.
 
+Optional envelope fields are omitted, not `null`; unknown envelope fields are rejected.
+Integer fields accept integral JSON numbers such as `1.0`, but never booleans or fractions.
+`at` and `rev` range from zero through the signed 64-bit maximum. A tool lifecycle is identified
+by `(sid, tid, iid)`, using `(sid, iid)` when the backend supplies no turn ID. Distinct explicit
+turn IDs are never merged. Assistant outputs without an item ID remain separate events.
+
 ## Fragmentation
 
 If the encoded tag name, separator, and escaped value fit IRCv3's 4094-byte tag-section limit,
@@ -378,6 +384,11 @@ Agentwire tag value and outputs the decoded event plus render state. `action` ou
 body, and tags for each required fragment. The interface is deterministic except for generated
 IDs and timestamps and is intended for mobile-client fixtures and automated interoperability
 tests.
+
+Canonical interoperability scenarios and their content manifest live in `protocol/conformance`.
+Run `PYTHONPATH=src python protocol/conformance/generate.py --check` in the Nix development shell
+to verify them. Downstream clients copy these fixtures and record the source revision and hashes;
+their normal builds do not require a sibling Agentwire checkout.
 
 ## Ergo deployment profile
 

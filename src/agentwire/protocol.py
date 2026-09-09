@@ -21,6 +21,48 @@ MAX_INFLIGHT_MESSAGES = 16
 MAX_INFLIGHT_BYTES = 2 * 1024 * 1024
 FRAGMENT_TIMEOUT_SECONDS = 30.0
 
+# Keep this in step with ``protocol/agentwire-v1.schema.json``.  Envelope
+# decoders are intentionally as strict as schema-based clients: accepting an
+# unrecognised top-level member would make a future v1 extension silently mean
+# different things to different clients.
+ENVELOPE_FIELDS = frozenset(
+    {
+        "v",
+        "k",
+        "t",
+        "id",
+        "at",
+        "inst",
+        "epoch",
+        "device",
+        "sid",
+        "tid",
+        "iid",
+        "rid",
+        "rev",
+        "reply",
+        "hist",
+        "data",
+    }
+)
+FRAGMENT_FIELDS = frozenset(
+    {
+        "v",
+        "k",
+        "id",
+        "of",
+        "t",
+        "epoch",
+        "sid",
+        "part",
+        "parts",
+        "bytes",
+        "sha256",
+        "encoding",
+        "b64",
+    }
+)
+
 ACTION_KINDS = frozenset(
     {
         "sync.request",
@@ -187,7 +229,11 @@ class Envelope:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> Envelope:
-        if value.get("v") != PROTOCOL_VERSION:
+        unknown = set(value) - ENVELOPE_FIELDS
+        if unknown:
+            raise ProtocolError(f"unsupported envelope fields: {', '.join(sorted(unknown))}")
+        version = _wire_integer(value.get("v"))
+        if version != PROTOCOL_VERSION:
             raise ProtocolError("unsupported protocol version")
         kind = _required_string(value, "k")
         message_type = _required_string(value, "t")
@@ -201,17 +247,17 @@ class Envelope:
             uuid.UUID(message_id)
         except ValueError as exc:
             raise ProtocolError("id must be a UUID") from exc
-        at = value.get("at")
-        if not isinstance(at, int) or isinstance(at, bool) or at < 0:
+        at = _wire_integer(value.get("at"))
+        if at is None or not 0 <= at <= 2**63 - 1:
             raise ProtocolError("at must be a non-negative integer timestamp")
         instance = _required_string(value, "inst")
+        if message_type == "action" and "device" not in value:
+            raise ProtocolError("actions require device")
         data = value.get("data", {})
         if not isinstance(data, dict):
             raise ProtocolError("data must be an object")
-        revision = value.get("rev")
-        if revision is not None and (
-            not isinstance(revision, int) or isinstance(revision, bool) or revision < 0
-        ):
+        revision = _wire_integer(value.get("rev"))
+        if "rev" in value and (revision is None or not 0 <= revision <= 2**63 - 1):
             raise ProtocolError("rev must be a non-negative integer")
         history = value.get("hist", False)
         if not isinstance(history, bool):
@@ -418,6 +464,18 @@ class _PartialMessage:
     chunks: dict[int, str] = field(default_factory=dict)
 
 
+def _wire_integer(value: Any) -> int | None:
+    # JSON Schema and JVM clients treat 1.0 as an integer value. Booleans,
+    # fractions, and non-finite numbers are never protocol integers.
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
 class Reassembler:
     def __init__(self) -> None:
         self._messages: dict[str, _PartialMessage] = {}
@@ -436,26 +494,39 @@ class Reassembler:
             # payload ceiling, so the parsed object is validated directly
             # instead of round-tripping through a second json.loads.
             return Envelope.from_dict(raw)
-        if raw.get("v") != PROTOCOL_VERSION:
+        unknown = set(raw) - FRAGMENT_FIELDS
+        if unknown:
+            raise ProtocolError(f"unsupported fragment fields: {', '.join(sorted(unknown))}")
+        version = _wire_integer(raw.get("v"))
+        if version != PROTOCOL_VERSION:
             raise ProtocolError("unsupported fragment version")
         message_id = _required_string(raw, "id")
-        parts = raw.get("parts")
-        part = raw.get("part")
-        size = raw.get("bytes")
+        parts = _wire_integer(raw.get("parts"))
+        part = _wire_integer(raw.get("part"))
+        size = _wire_integer(raw.get("bytes"))
         digest = _required_string(raw, "sha256")
         kind = _required_string(raw, "of")
         message_type = _required_string(raw, "t")
+        if message_type not in {"action", "event"}:
+            raise ProtocolError("fragment t must be action or event")
+        allowed = ACTION_KINDS if message_type == "action" else EVENT_KINDS
+        if kind not in allowed:
+            raise ProtocolError(f"unsupported fragmented {message_type} kind: {kind}")
         epoch = _optional_string(raw, "epoch")
         session_id = _optional_string(raw, "sid")
         encoding = _optional_string(raw, "encoding")
         if encoding not in {None, "zlib"}:
             raise ProtocolError("unsupported fragment encoding")
         chunk = _required_string(raw, "b64")
-        if not isinstance(parts, int) or not 1 <= parts <= MAX_FRAGMENTS:
+        if not isinstance(parts, int) or isinstance(parts, bool) or not 1 <= parts <= MAX_FRAGMENTS:
             raise ProtocolError("invalid fragment count")
-        if not isinstance(part, int) or not 0 <= part < parts:
+        if not isinstance(part, int) or isinstance(part, bool) or not 0 <= part < parts:
             raise ProtocolError("invalid fragment index")
-        if not isinstance(size, int) or not 1 <= size <= MAX_PAYLOAD_BYTES:
+        if (
+            not isinstance(size, int)
+            or isinstance(size, bool)
+            or not 1 <= size <= MAX_PAYLOAD_BYTES
+        ):
             raise ProtocolError("invalid reconstructed byte count")
         existing = self._messages.get(message_id)
         if existing is None:
@@ -545,9 +616,9 @@ def _required_string(value: dict[str, Any], key: str) -> str:
 
 
 def _optional_string(value: dict[str, Any], key: str) -> str | None:
-    item = value.get(key)
-    if item is None:
+    if key not in value:
         return None
+    item = value[key]
     if not isinstance(item, str) or not item:
         raise ProtocolError(f"{key} must be a non-empty string when present")
     return item
