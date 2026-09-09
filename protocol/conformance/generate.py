@@ -362,6 +362,102 @@ def _corpus(events: list[Envelope]) -> dict[str, Any]:
     return {"topic": TOPIC, "steps": steps}
 
 
+def tool_activity(events: Envelopes) -> list[Envelope]:
+    started = events.event(
+        "tool.started",
+        session_id=SESSION,
+        turn_id=TURN,
+        item_id="reused",
+        data={"kind": "shell", "input": "pytest -q", "label": "Run checks"},
+    )
+    completed = events.event(
+        "tool.completed",
+        session_id=SESSION,
+        turn_id=TURN,
+        item_id="reused",
+        data={"success": False, "output": "failed", "kind": "shell"},
+    )
+    return [
+        _hello(events),
+        events.event(
+            "channel.snapshot", data={"binding": {"sid": SESSION}, "busy": True, "tid": TURN}
+        ),
+        events.event(
+            "user.prompt", session_id=SESSION, turn_id=TURN, data={"content": "Inspect the code"}
+        ),
+        started,
+        completed,
+        completed,
+        events.event(
+            "tool.completed",
+            session_id=SESSION,
+            turn_id=TURN,
+            item_id="edit",
+            data={"kind": "file edit", "diff": "+replacement", "success": True},
+        ),
+        events.event(
+            "assistant.completed",
+            session_id=SESSION,
+            turn_id=TURN,
+            item_id="narration",
+            data={"content": "The first check failed. I will inspect the source."},
+        ),
+        events.event(
+            "tool.completed",
+            session_id=SESSION,
+            turn_id=TURN,
+            item_id="read",
+            data={"kind": "file read", "input": "source.py", "output": "source", "success": True},
+        ),
+        events.event(
+            "request.opened",
+            session_id=SESSION,
+            turn_id=TURN,
+            request_id="question",
+            data={
+                "type": "question",
+                "title": "Continue?",
+                "questions": [{"id": "continue", "prompt": "Continue?", "options": []}],
+            },
+        ),
+        events.event(
+            "tool.updated",
+            session_id=SESSION,
+            turn_id=TURN,
+            item_id="web",
+            data={"kind": "web search", "label": "Search reference"},
+        ),
+        events.event(
+            "tool.completed",
+            session_id=SESSION,
+            turn_id=TURN,
+            item_id="agent",
+            data={"kind": "agent", "success": True},
+        ),
+        events.event(
+            "tool.completed",
+            session_id=SESSION,
+            turn_id=TURN,
+            item_id="other",
+            data={"kind": "MCP tool", "label": "shell", "output": "tests passed"},
+        ),
+        events.event(
+            "tool.completed",
+            session_id=SESSION,
+            item_id="no-turn",
+            data={"kind": "shell", "success": False},
+        ),
+        events.event(
+            "tool.completed",
+            session_id=SESSION,
+            turn_id="turn-2",
+            item_id="reused",
+            data={"kind": "file edit", "success": True},
+        ),
+        events.event("turn.completed", session_id=SESSION, turn_id=TURN),
+    ]
+
+
 def diagnostics(events: Envelopes) -> list[Envelope]:
     return [
         _hello(events),
@@ -398,6 +494,7 @@ def _documents() -> dict[str, str]:
         ("queue-and-acks", queue_and_acks),
         ("action-status", action_status),
         ("diagnostics", diagnostics),
+        ("tool-activity", tool_activity),
         ("replay-and-isolation", replay_and_isolation),
     )
     events = Envelopes()

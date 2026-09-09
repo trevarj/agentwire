@@ -416,6 +416,15 @@ body, and tags for each required fragment. The interface is deterministic except
 IDs and timestamps and is intended for mobile-client fixtures and automated interoperability
 tests.
 
+The reference projection includes derived `turnActivity` for loaded tools with explicit session
+and turn IDs: total, explicit failures (`success: false`), and counts by category.
+Normalized kinds map `shell` to commands, `file edit` to edits, `file read` to reads, `web` and
+`web search` to web, and `agent` to agents; other kinds map to other. Labels, commands, diffs,
+and outputs never determine categories or claims about files, tests, or decisions.
+These are observed activity counts, not a complete transcript summary. Tools without a turn ID
+remain available for run-level presentation. Counts derive from the current deduplicated tool
+projection, with no new wire events or separate summary store; full tool details remain intact.
+
 Canonical interoperability scenarios and their content manifest live in `protocol/conformance`.
 Run `PYTHONPATH=src python protocol/conformance/generate.py --check` in the Nix development shell
 to verify them. Downstream clients copy these fixtures and record the source revision and hashes;

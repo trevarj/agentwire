@@ -20,6 +20,24 @@ from agentwire.protocol import (
 )
 from agentwire.text import truncate_utf8
 
+TOOL_CATEGORIES = ("commands", "edits", "reads", "web", "agents", "other")
+
+
+def tool_category(kind: object) -> str:
+    """Classify normalized tool kinds, never labels or command contents."""
+    return (
+        {
+            "shell": "commands",
+            "file edit": "edits",
+            "file read": "reads",
+            "web": "web",
+            "web search": "web",
+            "agent": "agents",
+        }.get(kind, "other")
+        if isinstance(kind, str)
+        else "other"
+    )
+
 
 @dataclass(slots=True)
 class HarnessState:
@@ -258,6 +276,28 @@ class HarnessState:
             self.queue.append(dict(event.data))
             self.queue.sort(key=lambda item: int(item.get("position", 0)))
 
+    def turn_activity(self) -> list[dict[str, Any]]:
+        """Summarize deduplicated loaded tools without inventing turn boundaries."""
+        turns: dict[tuple[str, str], dict[str, Any]] = {}
+        for tool in self.tools.values():
+            sid, tid = tool.get("sid"), tool.get("tid")
+            if not isinstance(sid, str) or not sid or not isinstance(tid, str) or not tid:
+                continue
+            summary = turns.setdefault(
+                (sid, tid),
+                {
+                    "sid": sid,
+                    "tid": tid,
+                    "total": 0,
+                    "failed": 0,
+                    "categories": dict.fromkeys(TOOL_CATEGORIES, 0),
+                },
+            )
+            summary["total"] += 1
+            summary["failed"] += tool.get("success") is False
+            summary["categories"][tool_category(tool.get("kind"))] += 1
+        return [turns[key] for key in sorted(turns)]
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "active": self.active,
@@ -271,6 +311,7 @@ class HarnessState:
             "requests": self.requests,
             "assistant": self.assistant,
             "tools": self.tools,
+            "turnActivity": self.turn_activity(),
             "actionStatus": self.action_status,
             "plan": self.plan,
             "subagents": self.subagents,

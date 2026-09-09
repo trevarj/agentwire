@@ -9,6 +9,105 @@ from agentwire.protocol import ProtocolError, fragment_envelope, new_envelope
 from agentwire.reference_client import ProtocolClient, run_jsonl
 
 
+def test_activity_counts_loaded_tools_once_and_only_explicit_failures() -> None:
+    client = ProtocolClient()
+    client.state.session_id = "session"
+    started = new_envelope(
+        "tool.started",
+        "event",
+        "agent",
+        session_id="session",
+        turn_id="turn",
+        item_id="tool",
+        data={"kind": "shell", "input": "pytest"},
+    )
+    completed = new_envelope(
+        "tool.completed",
+        "event",
+        "agent",
+        session_id="session",
+        turn_id="turn",
+        item_id="tool",
+        data={"success": False, "output": "failure"},
+    )
+    for event in (started, completed, completed):
+        client.state.apply(event)
+    for iid, tid, kind, extra in [
+        ("tool", "another-turn", "file edit", {"success": True, "diff": "+code"}),
+        ("unknown", "turn", "MCP tool", {"label": "shell", "output": "tests passed"}),
+        ("unattributed", None, "shell", {"success": False}),
+    ]:
+        client.state.apply(
+            new_envelope(
+                "tool.completed",
+                "event",
+                "agent",
+                session_id="session",
+                turn_id=tid,
+                item_id=iid,
+                data={"kind": kind, **extra},
+            )
+        )
+    activity = client.state.turn_activity()
+    assert activity == [
+        {
+            "sid": "session",
+            "tid": "another-turn",
+            "total": 1,
+            "failed": 0,
+            "categories": {
+                "commands": 0,
+                "edits": 1,
+                "reads": 0,
+                "web": 0,
+                "agents": 0,
+                "other": 0,
+            },
+        },
+        {
+            "sid": "session",
+            "tid": "turn",
+            "total": 2,
+            "failed": 1,
+            "categories": {
+                "commands": 1,
+                "edits": 0,
+                "reads": 0,
+                "web": 0,
+                "agents": 0,
+                "other": 1,
+            },
+        },
+    ]
+    merged = client.state.tools['["session","turn","tool"]']
+    assert (merged["input"], merged["output"]) == ("pytest", "failure")
+    # Derived counts follow the loaded projection; there is no second store.
+    del client.state.tools['["session","turn","unknown"]']
+    assert client.state.turn_activity()[1]["total"] == 1
+
+
+def test_activity_counts_unfinished_tools_and_resets_with_binding() -> None:
+    client = ProtocolClient()
+    client.state.session_id = "s"
+    client.state.apply(
+        new_envelope(
+            "tool.updated",
+            "event",
+            "agent",
+            session_id="s",
+            turn_id="t",
+            item_id="web",
+            data={"kind": "web search"},
+        )
+    )
+    assert client.state.turn_activity()[0]["total"] == 1
+    assert client.state.turn_activity()[0]["categories"]["web"] == 1
+    client.state.apply(
+        new_envelope("binding.changed", "event", "agent", data={"session": {"sid": "new"}})
+    )
+    assert client.state.turn_activity() == []
+
+
 def test_outputs_without_item_ids_remain_distinct_after_snapshot() -> None:
     client = ProtocolClient()
     client.state.session_id = "s1"
