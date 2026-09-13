@@ -6,7 +6,9 @@ import inspect
 import json
 import logging
 import re
-from collections.abc import AsyncIterator, Mapping, Sequence
+import sys
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -14,8 +16,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from agentwire import cli
 from agentwire.backends.base import Backend, BackendError
-from agentwire.bridge import FAST_READ_ACTION_KINDS, Bridge
+from agentwire.bridge import AUDIO_TAG, FAST_READ_ACTION_KINDS, MAX_CONTENT_BYTES, Bridge
 from agentwire.config import (
     BridgeConfig,
     CodexConfig,
@@ -24,9 +27,12 @@ from agentwire.config import (
     OmpConfig,
     OpenCodeConfig,
     PiConfig,
+    PMConfig,
     SecretsConfig,
     StackConfig,
+    VoiceConfig,
 )
+from agentwire.control import ControlError, DelegateRequest, ReportRequest, send_control_request
 from agentwire.irc import IRCMessage
 from agentwire.models import (
     BackendEvent,
@@ -45,7 +51,9 @@ from agentwire.protocol import (
     encode_envelope,
     new_envelope,
 )
+from agentwire.reference_client import HarnessState
 from agentwire.state import StateStore
+from agentwire.voice import VoiceError, VoiceMessage, voice_action_id
 
 
 class FakeIRC:
@@ -196,6 +204,8 @@ def make_bridge(
     channels: Mapping[str, str] | None = None,
     backend_name: str = "codex",
     dedicated_channels: bool = False,
+    voice: VoiceConfig | None = None,
+    pm: PMConfig | None = None,
 ) -> tuple[Bridge, FakeIRC, FakeBackend]:
     irc = FakeIRC(account)
     backend = FakeBackend(str(tmp_path))
@@ -231,6 +241,8 @@ def make_bridge(
             if backend_name == "omp"
             else None
         ),
+        voice=voice,
+        pm=pm,
     )
     return Bridge(config, irc, {backend_name: backend}), irc, backend  # type: ignore[arg-type]
 
@@ -1406,6 +1418,142 @@ async def test_sync_returns_correlated_hello_and_snapshot(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["approval", "question"])
+async def test_sync_recovers_pending_request_until_resolved(tmp_path: Path, kind: str) -> None:
+    bridge, irc, backend = make_bridge(tmp_path, backend_name="omp")
+    await bridge._handle_topic("#omp", "agentwire:v1;account=trev;agent=bridge;backend=omp")
+    runtime = bridge.channels["#omp"]
+    runtime.binding = ChannelBinding("omp", "s1", str(tmp_path))
+    runtime.busy = True
+    runtime.active_turn = "t1"
+    question = Question("target", "Target", "Which target?", ("preview", "production"))
+    decision = AsyncMock()
+    if kind == "approval":
+        backend.resolve_approval = decision  # type: ignore[method-assign]
+        response = {"allow": False}
+        expected_decision = ("backend-request", False)
+    else:
+        backend.resolve_question = decision  # type: ignore[method-assign]
+        response = {"answers": [["preview"]]}
+        expected_decision = ("backend-request", (question,), [["preview"]])
+    await bridge._handle_backend_event(
+        "#omp",
+        BackendEvent(
+            "approval" if kind == "approval" else "question",
+            "omp",
+            session_id="s1",
+            turn_id="t1",
+            item_id="tool-1",
+            request_token="backend-request",
+            text="Run the deployment command?",
+            questions=(question,) if kind == "question" else (),
+        ),
+    )
+    opened = irc.sent[-1][1]
+    connected = HarnessState(epoch=bridge.epoch, session_id="s1")
+    connected.apply(opened)
+    irc.sent.clear()
+
+    sync = new_envelope("sync.request", "action", "client", device="phone")
+    await bridge._handle_action("#omp", sync)
+
+    assert [(event.kind, event.reply) for _, event, _ in irc.sent[:2]] == [
+        ("agent.hello", sync.id),
+        ("channel.snapshot", sync.id),
+    ]
+    reopened = HarnessState()
+    for _, event, _ in irc.sent:
+        reopened.apply(Envelope.from_dict(event.to_dict()))
+        connected.apply(event)
+    request_id = next(iter(reopened.requests))
+    assert request_id == opened.request_id
+    assert reopened.requests == connected.requests
+    assert (reopened.session_id, reopened.turn_id, reopened.busy) == ("s1", "t1", True)
+    recovered = reopened.requests[request_id]
+    if kind == "approval":
+        assert recovered["summary"] == "Run the deployment command?"
+        assert recovered["choices"] == ["allow_once", "deny"]
+    else:
+        assert recovered["questions"][0]["prompt"] == "Which target?"
+        assert recovered["questions"][0]["options"] == ["preview", "production"]
+    replay = irc.sent[-1][1]
+    assert (replay.session_id, replay.turn_id, replay.item_id) == ("s1", "t1", "tool-1")
+    assert replay.id != opened.id
+    assert irc.sent[-1][2] is None
+    decision.assert_not_awaited()
+    irc.sent.clear()
+
+    answer = new_envelope(
+        "request.respond",
+        "action",
+        "client",
+        epoch=reopened.epoch,
+        device="phone",
+        session_id=reopened.session_id,
+        request_id=request_id,
+        data=response,
+    )
+    await bridge._handle_action("#omp", answer)
+    for _, event, _ in irc.sent:
+        reopened.apply(event)
+        connected.apply(event)
+    assert reopened.requests == connected.requests == {}
+    irc.sent.clear()
+
+    await bridge._handle_action(
+        "#omp", new_envelope("sync.request", "action", "client", device="phone")
+    )
+    for _, event, _ in irc.sent:
+        reopened.apply(event)
+        connected.apply(event)
+    assert reopened.requests == connected.requests == {}
+    decision.assert_awaited_once_with(*expected_decision)
+    assert backend.sent == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["resolved", "binding", "activation"])
+async def test_sync_does_not_replay_requests_after_state_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    bridge, irc, _backend = make_bridge(tmp_path)
+    await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+    runtime = bridge.channels["#codex"]
+    runtime.binding = ChannelBinding("codex", "s1", str(tmp_path))
+    await bridge._handle_backend_event(
+        "#codex",
+        BackendEvent("approval", "codex", session_id="s1", request_token=7, text="Run command?"),
+    )
+    irc.sent.clear()
+    sync = new_envelope("sync.request", "action", "client", device="phone")
+    send_protocol = irc.send_protocol
+
+    async def change_after_snapshot(
+        channel: str, envelope: Envelope, preview: str | None = None
+    ) -> None:
+        await send_protocol(channel, envelope, preview)
+        if envelope.kind == "channel.snapshot" and envelope.reply == sync.id:
+            if change == "resolved":
+                await bridge._handle_backend_event(
+                    channel,
+                    BackendEvent("request_resolved", "codex", session_id="s1", request_token=7),
+                )
+            elif change == "binding":
+                await bridge._set_binding(channel, SessionSummary("s2", str(tmp_path), "Other"))
+            else:
+                runtime.activation = None
+
+    monkeypatch.setattr(irc, "send_protocol", change_after_snapshot)
+    await bridge._handle_action("#codex", sync)
+
+    consumer = HarnessState()
+    for _, event, _ in irc.sent:
+        consumer.apply(event)
+    assert consumer.requests == {}
+    assert "request.opened" not in [event.kind for _, event, _ in irc.sent]
+
+
+@pytest.mark.asyncio
 async def test_live_prompt_is_acknowledged_and_deduplicated(tmp_path: Path) -> None:
     bridge, irc, backend = make_bridge(tmp_path)
     await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
@@ -2358,3 +2506,1175 @@ async def test_irc_ingress_terminalizes_claim_when_suspended_during_accepted_emi
         release.set()
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
+
+
+VOICE_URL = "https://files.invalid/note?signature=private-value"
+VOICE_BODY = f"[voice 0:03 audio/ogg expires=2099-01-01T00:00:00Z] {VOICE_URL}#waveform=123"
+
+
+async def _wait_until(predicate: Callable[[], bool]) -> None:
+    async with asyncio.timeout(3):
+        while not predicate():
+            await asyncio.sleep(0.005)
+
+
+@contextlib.asynccontextmanager
+async def _running_bridge(bridge: Bridge) -> AsyncIterator[None]:
+    runner = asyncio.create_task(bridge.run())
+    try:
+        await _wait_until(
+            lambda: (
+                runner.done()
+                or (
+                    len(bridge._action_workers) == len(bridge.channels)
+                    and (bridge.config.pm is None or bridge.config.pm.control_socket.exists())
+                )
+            )
+        )
+        if runner.done():
+            await runner
+            raise AssertionError("bridge exited before serving")
+        yield
+    finally:
+        await bridge.close()
+        await asyncio.gather(runner, return_exceptions=True)
+
+
+async def _activate_bound(bridge: Bridge, channel: str, sid: str = "s1") -> None:
+    backend = bridge.channels[channel].backend
+    await bridge._handle_topic(channel, f"agentwire:v1;account=trev;agent=bridge;backend={backend}")
+    bridge.channels[channel].binding = ChannelBinding(
+        backend, sid, str(bridge.config.bridge.allowed_roots[0])
+    )
+
+
+def _voice_message(
+    channel: str = "#codex",
+    *,
+    body: str = VOICE_BODY,
+    account: str = "trev",
+    tags: Mapping[str, str | None] | None = None,
+    command: str = "PRIVMSG",
+) -> IRCMessage:
+    return IRCMessage(
+        channel,
+        account,
+        "phone",
+        body,
+        MappingProxyType(dict(tags) if tags is not None else {AUDIO_TAG: "1"}),
+        command,
+    )
+
+
+async def _irc_barrier(bridge: Bridge, irc: FakeIRC, channel: str = "#codex") -> None:
+    action = new_envelope("sync.request", "action", "phone", device="phone")
+    await _send_irc_action(irc, channel, action)
+    await _wait_until(lambda: any(event.reply == action.id for _, event, _ in irc.sent))
+
+
+async def _finish_voice(bridge: Bridge, irc: FakeIRC) -> None:
+    await _irc_barrier(bridge, irc)
+    assert bridge._voice_queue is not None
+    await asyncio.wait_for(bridge._voice_queue.join(), 3)
+    for queue in bridge._action_queues.values():
+        await asyncio.wait_for(queue.join(), 3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["idle", "steer", "queue"])
+async def test_live_voice_uses_normal_prompt_delivery_and_visible_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delivery: str
+) -> None:
+    bridge, irc, backend = make_bridge(tmp_path, voice=VoiceConfig(tmp_path / "model.bin"))
+    transcribe = AsyncMock(return_value="Please explain the failing check.")
+    monkeypatch.setattr("agentwire.bridge.transcribe_voice", transcribe)
+    async with _running_bridge(bridge):
+        await _activate_bound(bridge, "#codex")
+        runtime = bridge.channels["#codex"]
+        runtime.busy = delivery != "idle"
+        runtime.settings["delivery"] = delivery
+        irc.sent.clear()
+        await irc.incoming.put(_voice_message())
+        await _finish_voice(bridge, irc)
+        content = "[voice] Please explain the failing check."
+        action_id = voice_action_id("trev", "#codex", "codex", "s1", VOICE_URL)
+        receipt = await bridge.state.action_status(action_id, "#codex", "trev", "codex")
+        assert receipt is not None and receipt.status == "succeeded"
+        initial_kind = "queue.item.added" if delivery == "queue" else "user.prompt"
+        visible = [(event, preview) for _, event, preview in irc.sent if event.kind == initial_kind]
+        assert [(event.data["content"], preview) for event, preview in visible] == [
+            (content, content)
+        ]
+        assert visible[0][0].item_id == action_id
+        assert visible[0][0].session_id == "s1"
+        transcribe.assert_awaited_once_with(
+            VoiceMessage(3, "audio/ogg", VOICE_URL), bridge.config.voice.model_path
+        )
+        if delivery == "steer":
+            assert backend.steered == [("s1", content)]
+            assert backend.sent == []
+        elif delivery == "queue":
+            assert backend.sent == []
+            assert not any(event.kind == "user.prompt" for _, event, _ in irc.sent)
+            await bridge._handle_backend_event(
+                "#codex", BackendEvent("turn_done", "codex", session_id="s1")
+            )
+            assert backend.sent == [("s1", content)]
+            assert await bridge.state.list_queue("#codex", "s1") == []
+        else:
+            assert backend.sent == [("s1", content)]
+
+
+@pytest.mark.asyncio
+async def test_voice_requires_marker_command_owner_and_static_active_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    bridge, irc, backend = make_bridge(
+        tmp_path,
+        channels={"#codex": "codex", "#inactive": "codex", "#unbound": "codex"},
+        voice=VoiceConfig(tmp_path / "model.bin"),
+    )
+    transcribe = AsyncMock(return_value="Allowed")
+    monkeypatch.setattr("agentwire.bridge.transcribe_voice", transcribe)
+    async with _running_bridge(bridge):
+        await _activate_bound(bridge, "#codex")
+        await bridge._handle_topic(
+            "#unbound", "agentwire:v1;account=trev;agent=bridge;backend=codex"
+        )
+        bridge.channels["#inactive"].binding = ChannelBinding("codex", "s1", str(tmp_path))
+        bridge._install_channel("#dynamic", "codex")
+        await _activate_bound(bridge, "#dynamic")
+        with caplog.at_level(logging.WARNING, logger="agentwire.bridge"):
+            for message in (
+                _voice_message(tags={}),
+                _voice_message(tags={AUDIO_TAG: "0"}),
+                _voice_message(tags={AUDIO_TAG: ""}),
+                _voice_message(tags={AUDIO_TAG: "true"}),
+                _voice_message(command="NOTICE"),
+                _voice_message(command="TAGMSG"),
+                _voice_message(account=""),
+                _voice_message(account="mallory"),
+                _voice_message(tags={AUDIO_TAG: "1", "draft/playback": "private-tag"}),
+                _voice_message(tags={AUDIO_TAG: "1", "znc.in/playback": "private-tag"}),
+                _voice_message("#inactive"),
+                _voice_message("#unbound"),
+                _voice_message("#dynamic"),
+                _voice_message("#unknown"),
+                _voice_message(body="ordinary channel conversation"),
+            ):
+                await irc.incoming.put(message)
+            await _finish_voice(bridge, irc)
+        transcribe.assert_not_awaited()
+        assert backend.sent == []
+        assert backend.steered == []
+        assert not any(event.kind == "action.accepted" for _, event, _ in irc.sent)
+        logs = caplog.text
+        assert "authenticated channel owner" in logs and "history playback" in logs
+        assert VOICE_URL not in logs and "private-tag" not in logs
+        runtime = bridge.channels["#codex"]
+        activation = runtime.activation
+        assert activation is not None
+        runtime.activation = replace(activation, account="mallory")
+        await irc.incoming.put(_voice_message(account="mallory"))
+        await _irc_barrier(bridge, irc, "#unbound")
+        assert bridge._voice_queue is not None
+        await asyncio.wait_for(bridge._voice_queue.join(), 3)
+        transcribe.assert_not_awaited()
+        runtime.activation = activation
+        await irc.incoming.put(_voice_message())
+        await _finish_voice(bridge, irc)
+        assert backend.sent == [("s1", "[voice] Allowed")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("playback", ["draft/playback", "znc.in/playback"])
+async def test_playback_is_rejected_before_voice_or_protocol_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, playback: str
+) -> None:
+    bridge, irc, backend = make_bridge(tmp_path, voice=VoiceConfig(tmp_path / "model.bin"))
+    transcribe = AsyncMock()
+    monkeypatch.setattr("agentwire.bridge.transcribe_voice", transcribe)
+    async with _running_bridge(bridge):
+        await _activate_bound(bridge, "#codex")
+        irc.sent.clear()
+        for command in ("PRIVMSG", "TAGMSG"):
+            await irc.incoming.put(
+                _voice_message(
+                    command=command,
+                    body=VOICE_BODY.replace("[voice ", "[voice encrypted "),
+                    tags={AUDIO_TAG: "1", PROTOCOL_TAG: "malformed private payload", playback: ""},
+                )
+            )
+        await _finish_voice(bridge, irc)
+        assert not any(event.kind == "action.failed" for _, event, _ in irc.sent)
+        transcribe.assert_not_awaited()
+        assert backend.sent == []
+
+
+@pytest.mark.asyncio
+async def test_absent_voice_config_never_transcribes_audio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, irc, backend = make_bridge(tmp_path)
+    transcribe = AsyncMock()
+    monkeypatch.setattr("agentwire.bridge.transcribe_voice", transcribe)
+    async with _running_bridge(bridge):
+        await _activate_bound(bridge, "#codex")
+        await irc.incoming.put(_voice_message())
+        await _irc_barrier(bridge, irc)
+        transcribe.assert_not_awaited()
+        assert backend.sent == []
+
+
+@pytest.mark.asyncio
+async def test_voice_errors_are_safe_visible_and_preclaim_failures_remain_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    bridge, irc, backend = make_bridge(tmp_path, voice=VoiceConfig(tmp_path / "model.bin"))
+    transcribe = AsyncMock(
+        side_effect=[VoiceError("audio download failed"), RuntimeError(VOICE_URL), "Recovered"]
+    )
+    monkeypatch.setattr("agentwire.bridge.transcribe_voice", transcribe)
+    async with _running_bridge(bridge):
+        await _activate_bound(bridge, "#codex")
+        irc.sent.clear()
+        await irc.incoming.put(
+            _voice_message(body=VOICE_BODY.replace("[voice ", "[voice encrypted "))
+        )
+        await _finish_voice(bridge, irc)
+        transcribe.assert_not_awaited()
+        action_id = voice_action_id("trev", "#codex", "codex", "s1", VOICE_URL)
+        for category in ("audio download failed", "unexpected voice failure"):
+            await irc.incoming.put(_voice_message())
+            await _finish_voice(bridge, irc)
+            failures = [event for _, event, _ in irc.sent if event.kind == "action.failed"]
+            assert failures[-1].reply is None
+            assert failures[-1].data == {"message": f"Voice transcription failed: {category}"}
+            assert await bridge.state.action_status(action_id, "#codex", "trev", "codex") is None
+        await irc.incoming.put(_voice_message())
+        await _finish_voice(bridge, irc)
+        assert backend.sent == [("s1", "[voice] Recovered")]
+        assert transcribe.await_count == 3
+        assert VOICE_URL not in repr(irc.sent) + repr(irc.notices) + caplog.text
+
+
+@pytest.mark.asyncio
+async def test_voice_retry_suppresses_inflight_cpu_and_durable_duplicate_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, irc, backend = make_bridge(tmp_path, voice=VoiceConfig(tmp_path / "model.bin"))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def transcribe(_message: VoiceMessage, _model: Path) -> str:
+        entered.set()
+        await release.wait()
+        return "Once"
+
+    transcription = AsyncMock(side_effect=transcribe)
+    monkeypatch.setattr("agentwire.bridge.transcribe_voice", transcription)
+    async with _running_bridge(bridge):
+        await _activate_bound(bridge, "#codex")
+        await irc.incoming.put(_voice_message())
+        await asyncio.wait_for(entered.wait(), 3)
+        await irc.incoming.put(_voice_message(body=VOICE_BODY.replace("waveform=123", "key=other")))
+        await _irc_barrier(bridge, irc)
+        assert bridge._voice_queue is not None and bridge._voice_queue.empty()
+        bridge.epoch = "rotated-live-epoch"
+        release.set()
+        await _finish_voice(bridge, irc)
+        await irc.incoming.put(_voice_message())
+        await _finish_voice(bridge, irc)
+        transcription.assert_awaited_once()
+        assert backend.sent == [("s1", "[voice] Once")]
+
+
+@pytest.mark.asyncio
+async def test_voice_queue_full_does_not_block_irc_and_rejected_note_can_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, irc, backend = make_bridge(tmp_path, voice=VoiceConfig(tmp_path / "model.bin"))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def transcribe(message: VoiceMessage, _model: Path) -> str:
+        entered.set()
+        await release.wait()
+        return message.fetch_url.rsplit("/", 1)[-1]
+
+    transcription = AsyncMock(side_effect=transcribe)
+    monkeypatch.setattr("agentwire.bridge.transcribe_voice", transcription)
+    async with _running_bridge(bridge):
+        await _activate_bound(bridge, "#codex")
+        runtime = bridge.channels["#codex"]
+        runtime.busy = True
+        runtime.settings["delivery"] = "steer"
+        await irc.incoming.put(
+            _voice_message(body="[voice 0:01 audio/ogg] https://files.invalid/0")
+        )
+        await asyncio.wait_for(entered.wait(), 3)
+        for number in range(1, 6):
+            await irc.incoming.put(
+                _voice_message(body=f"[voice 0:01 audio/ogg] https://files.invalid/{number}")
+            )
+        await _irc_barrier(bridge, irc)
+        assert bridge._voice_queue is not None and bridge._voice_queue.qsize() == 4
+        failures = [event for _, event, _ in irc.sent if event.kind == "action.failed"]
+        assert [event.data for event in failures] == [
+            {"message": "Voice transcription failed: voice queue full"}
+        ]
+        rejected = voice_action_id("trev", "#codex", "codex", "s1", "https://files.invalid/5")
+        assert await bridge.state.action_status(rejected, "#codex", "trev", "codex") is None
+        release.set()
+        await _finish_voice(bridge, irc)
+        assert backend.steered == [("s1", f"[voice] {number}") for number in range(5)]
+        await irc.incoming.put(
+            _voice_message(body="[voice 0:01 audio/ogg] https://files.invalid/5")
+        )
+        await _finish_voice(bridge, irc)
+        assert backend.steered[-1] == ("s1", "[voice] 5")
+        assert transcription.await_count == 6
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["accepted", "succeeded", "failed", "uncertain"])
+async def test_voice_restart_uses_scoped_retained_action_receipts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
+) -> None:
+    first, _, _ = make_bridge(tmp_path, voice=VoiceConfig(tmp_path / "model.bin"))
+    action_id = voice_action_id("trev", "#codex", "codex", "s1", VOICE_URL)
+    action = new_envelope(
+        "turn.prompt",
+        "action",
+        first.instance,
+        id=action_id,
+        epoch=first.epoch,
+        device="bridge-voice",
+        session_id="s1",
+        data={"content": "[voice] Already accepted"},
+    )
+    await first.state.set("#codex", ChannelBinding("codex", "s1", str(tmp_path)))
+    await first.state.claim_action(action, "#codex", "trev", "codex")
+    if status != "accepted":
+        await first.state.finish_action(action_id, status)
+    await first.close()
+    bridge, irc, backend = make_bridge(tmp_path, voice=VoiceConfig(tmp_path / "model.bin"))
+    transcribe = AsyncMock(return_value="Different recording")
+    monkeypatch.setattr("agentwire.bridge.transcribe_voice", transcribe)
+    async with _running_bridge(bridge):
+        assert backend.attached_sessions == ["s1"]
+        await bridge._handle_topic("#codex", "agentwire:v1;account=trev;agent=bridge;backend=codex")
+        await irc.incoming.put(_voice_message())
+        await _finish_voice(bridge, irc)
+        transcribe.assert_not_awaited()
+        assert backend.sent == []
+        receipt = await bridge.state.action_status(action_id, "#codex", "trev", "codex")
+        assert receipt is not None
+        assert receipt.status == ("uncertain" if status == "accepted" else status)
+        await irc.incoming.put(_voice_message(body=VOICE_BODY.replace("/note?", "/different?")))
+        await _finish_voice(bridge, irc)
+        assert backend.sent == [("s1", "[voice] Different recording")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["sid", "activation", "runtime"])
+async def test_voice_revalidates_capture_after_transcription_before_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    bridge, irc, backend = make_bridge(tmp_path, voice=VoiceConfig(tmp_path / "model.bin"))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def transcribe(_message: VoiceMessage, _model: Path) -> str:
+        entered.set()
+        await release.wait()
+        return "Pinned"
+
+    monkeypatch.setattr("agentwire.bridge.transcribe_voice", transcribe)
+    async with _running_bridge(bridge):
+        await _activate_bound(bridge, "#codex")
+        await irc.incoming.put(_voice_message())
+        await asyncio.wait_for(entered.wait(), 3)
+        sid = "s2" if change == "sid" else "s1"
+        if change == "runtime":
+            await bridge._remove_channel("#codex")
+            bridge._install_channel("#codex", "codex")
+        await _activate_bound(bridge, "#codex", sid)
+        release.set()
+        await _finish_voice(bridge, irc)
+        assert backend.sent == []
+        action_id = voice_action_id("trev", "#codex", "codex", "s1", VOICE_URL)
+        assert await bridge.state.action_status(action_id, "#codex", "trev", "codex") is None
+        failures = [event for _, event, _ in irc.sent if event.kind == "action.failed"]
+        assert failures[-1].data == {"message": "Voice transcription failed: binding changed"}
+        await irc.incoming.put(_voice_message())
+        await _finish_voice(bridge, irc)
+        assert backend.sent == [(sid, "[voice] Pinned")]
+
+
+@pytest.mark.asyncio
+async def test_bridge_shutdown_reaps_transcription_before_state_close_and_leaves_no_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, irc, backend = make_bridge(tmp_path, voice=VoiceConfig(tmp_path / "model.bin"))
+    entered, reaped = asyncio.Event(), asyncio.Event()
+
+    async def transcribe(_message: VoiceMessage, _model: Path) -> str:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await asyncio.sleep(0)
+            reaped.set()
+        raise AssertionError("cancelled transcription returned")
+
+    original_close = bridge.state.close
+
+    async def close_state() -> None:
+        assert reaped.is_set()
+        await original_close()
+
+    monkeypatch.setattr("agentwire.bridge.transcribe_voice", transcribe)
+    monkeypatch.setattr(bridge.state, "close", close_state)
+    async with _running_bridge(bridge):
+        await _activate_bound(bridge, "#codex")
+        await irc.incoming.put(_voice_message())
+        await asyncio.wait_for(entered.wait(), 3)
+        await irc.incoming.put(_voice_message(body=VOICE_BODY.replace("/note?", "/queued?")))
+        await _irc_barrier(bridge, irc)
+        await bridge.close()
+        assert reaped.is_set()
+        assert backend.sent == []
+        assert bridge._voice_queue is not None and bridge._voice_queue.empty()
+        assert bridge._voice_inflight == set()
+    recovered = StateStore(bridge.config.bridge.state_file)
+    try:
+        action_id = voice_action_id("trev", "#codex", "codex", "s1", VOICE_URL)
+        assert await recovered.action_status(action_id, "#codex", "trev", "codex") is None
+    finally:
+        await recovered.close()
+
+
+def _pm_bridge(tmp_path: Path) -> tuple[Bridge, FakeIRC, FakeBackend]:
+    return make_bridge(
+        tmp_path,
+        channels={"#pm": "codex", "#worker": "codex", "#other": "codex"},
+        pm=PMConfig(
+            tmp_path / "c.sock",
+            "#pm",
+            MappingProxyType({"touch-hockey": "#worker", "motd-dev": "#other"}),
+        ),
+    )
+
+
+@pytest.mark.parametrize("command", ["run", "stack"])
+@pytest.mark.parametrize("manual", [False, True])
+def test_runtime_cli_manual_approval_controls_pm_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, manual: bool
+) -> None:
+    bridge, irc, backend = _pm_bridge(tmp_path)
+    decision = AsyncMock()
+    backend.resolve_approval = decision  # type: ignore[method-assign]
+
+    async def launch(config: Config) -> None:
+        bridge.config = config
+        try:
+            await _activate_bound(bridge, "#pm")
+            await bridge._handle_backend_event(
+                "#pm",
+                BackendEvent("approval", "codex", session_id="s1", request_token=0),
+            )
+            await bridge._handle_action(
+                "#pm", new_envelope("sync.request", "action", "client", device="phone")
+            )
+            client = HarnessState()
+            for _, event, _ in irc.sent:
+                client.apply(event)
+            if manual:
+                request = next(iter(client.requests.values()))
+                assert request["choices"] == ["allow_once", "deny"]
+                decision.assert_not_awaited()
+            else:
+                assert client.requests == {}
+                assert bridge.channels["#pm"].requests == {}
+                decision.assert_awaited_once_with(0, True)
+        finally:
+            await bridge.close()
+
+    monkeypatch.setattr(cli, "load_config", lambda _path: bridge.config)
+    monkeypatch.setattr(cli, "run_bridge", launch)
+    monkeypatch.setattr(cli, "run_stack", launch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["agentwire", "--config", str(bridge.config.path), command]
+        + (["--manual-approval"] if manual else []),
+    )
+    cli.main()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("backend_name", "boundary"),
+    [
+        ("codex", "no-pm"),
+        ("codex", "question"),
+        ("omp", "inactive"),
+        ("pi", "unbound"),
+        ("claude", "non-pm"),
+        ("pi", "non-pm"),
+        ("omp", "non-pm"),
+        ("codex", "closing"),
+    ],
+)
+async def test_pm_auto_approval_leaves_other_requests_manual(
+    tmp_path: Path, backend_name: str, boundary: str
+) -> None:
+    bridge, irc, backend = make_bridge(
+        tmp_path,
+        backend_name=backend_name,
+        channels={
+            "#pm": backend_name,
+            "#worker": backend_name,
+            f"#{backend_name}": backend_name,
+        },
+        pm=(
+            PMConfig(tmp_path / "c.sock", "#pm", MappingProxyType({"project": "#worker"}))
+            if boundary != "no-pm"
+            else None
+        ),
+    )
+    decision = AsyncMock()
+    answer = AsyncMock()
+    backend.resolve_approval = decision  # type: ignore[method-assign]
+    backend.resolve_question = answer  # type: ignore[method-assign]
+    channel = f"#{backend_name}" if boundary == "non-pm" else "#worker"
+    try:
+        await _activate_bound(bridge, channel)
+        runtime = bridge.channels[channel]
+        if boundary == "unbound":
+            runtime.binding = None
+        elif boundary == "closing":
+            runtime.closing_session = True
+        kind = "question" if boundary == "question" else "approval"
+        await bridge._handle_backend_event(
+            channel,
+            BackendEvent(
+                kind,
+                backend_name,
+                session_id="other" if boundary == "inactive" else "s1",
+                request_token=7,
+                questions=(Question("target", "Target", "Which target?", ("preview",)),)
+                if kind == "question"
+                else (),
+            ),
+        )
+        opened = irc.sent[-1][1]
+        assert opened.kind == "request.opened"
+        assert opened.request_id in runtime.requests
+        assert opened.data["type"] == kind
+        assert opened.data["inactive"] is (boundary in {"inactive", "unbound"})
+        decision.assert_not_awaited()
+        answer.assert_not_awaited()
+        assert backend.sent == []
+    finally:
+        await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_pm_auto_approval_resolves_once_across_sync_and_manual_races(tmp_path: Path) -> None:
+    bridge, irc, backend = make_bridge(
+        tmp_path,
+        backend_name="omp",
+        channels={"#pm": "omp", "#worker": "omp"},
+        pm=PMConfig(tmp_path / "c.sock", "#pm", MappingProxyType({"project": "#worker"})),
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def resolve(_token: str | int, _allow: bool) -> None:
+        entered.set()
+        await release.wait()
+
+    decision = AsyncMock(side_effect=resolve)
+    backend.resolve_approval = decision  # type: ignore[method-assign]
+    opening: asyncio.Task[None] | None = None
+    try:
+        await _activate_bound(bridge, "#worker")
+        runtime = bridge.channels["#worker"]
+        runtime.busy, runtime.active_turn = True, "t1"
+        queued = await bridge.state.enqueue("next", "#worker", "s1", "Next prompt", 2)
+        opening = asyncio.create_task(
+            bridge._handle_backend_event(
+                "#worker",
+                BackendEvent("approval", "omp", session_id="s1", turn_id="t1", request_token=0),
+            )
+        )
+        await asyncio.wait_for(entered.wait(), 3)
+        irc.sent.clear()
+        await bridge._handle_action(
+            "#worker", new_envelope("sync.request", "action", "client", device="phone")
+        )
+        client = HarnessState()
+        for _, event, _ in irc.sent:
+            client.apply(event)
+        request_id = next(iter(client.requests))
+        irc.sent.clear()
+        for kind in ("request.respond", "request.skip"):
+            action = new_envelope(
+                kind,
+                "action",
+                "client",
+                epoch=bridge.epoch,
+                device="phone",
+                session_id="s1",
+                request_id=request_id,
+                data={"allow": False} if kind == "request.respond" else {},
+            )
+            await bridge._handle_action("#worker", action)
+            assert [event.kind for _, event, _ in irc.sent if event.reply == action.id] == [
+                "action.accepted",
+                "action.failed",
+            ]
+        assert request_id in runtime.requests
+        decision.assert_awaited_once_with(0, True)
+        release.set()
+        await asyncio.wait_for(opening, 3)
+        await bridge._handle_backend_event(
+            "#worker",
+            BackendEvent("request_resolved", "omp", session_id="s1", request_token=0),
+        )
+        for _, event, _ in irc.sent:
+            client.apply(event)
+        assert client.requests == runtime.requests == {}
+        assert [
+            event.request_id for _, event, _ in irc.sent if event.kind == "request.resolved"
+        ] == [request_id]
+        assert (runtime.busy, runtime.active_turn) == (True, "t1")
+        assert await bridge.state.list_queue("#worker", "s1") == [queued]
+        assert backend.sent == []
+
+        irc.sent.clear()
+        await bridge._handle_action(
+            "#worker", new_envelope("sync.request", "action", "client", device="phone")
+        )
+        reopened = HarnessState()
+        for _, event, _ in irc.sent:
+            reopened.apply(event)
+        assert reopened.requests == {}
+        decision.assert_awaited_once_with(0, True)
+        await bridge._handle_backend_event(
+            "#worker", BackendEvent("turn_done", "omp", session_id="s1", turn_id="t1")
+        )
+        assert backend.sent == [("s1", "Next prompt")]
+    finally:
+        release.set()
+        if opening is not None:
+            await asyncio.gather(opening, return_exceptions=True)
+        await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_pm_auto_approval_failure_remains_recoverable_and_safe(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    bridge, irc, backend = _pm_bridge(tmp_path)
+    sensitive = "PRIVATE backend transport details"
+    decision = AsyncMock(side_effect=RuntimeError(sensitive))
+    backend.resolve_approval = decision  # type: ignore[method-assign]
+    try:
+        await _activate_bound(bridge, "#worker")
+        irc.sent.clear()
+        with caplog.at_level(logging.WARNING, logger="agentwire.bridge"):
+            await bridge._handle_backend_event(
+                "#worker",
+                BackendEvent(
+                    "approval", "codex", session_id="s1", request_token=9, text="Run command?"
+                ),
+            )
+        opened = irc.sent[-1][1]
+        request_id = opened.request_id
+        assert opened.kind == "request.opened"
+        assert "manual" in irc.sent[-1][2].lower()
+        assert any(
+            record.levelno == logging.WARNING and record.name == "agentwire.bridge"
+            for record in caplog.records
+        )
+        assert sensitive not in caplog.text + repr(irc.sent) + repr(irc.notices)
+        assert not any(event.kind == "request.resolved" for _, event, _ in irc.sent)
+        irc.sent.clear()
+        await bridge._handle_action(
+            "#worker", new_envelope("sync.request", "action", "client", device="phone")
+        )
+        client = HarnessState()
+        for _, event, _ in irc.sent:
+            client.apply(event)
+        assert client.requests[request_id]["choices"] == ["allow_once", "deny"]
+        assert irc.sent[-1][1].id != opened.id
+        decision.assert_awaited_once_with(9, True)
+        decision.side_effect = None
+        irc.sent.clear()
+        await bridge._handle_action(
+            "#worker",
+            new_envelope(
+                "request.respond",
+                "action",
+                "client",
+                epoch=bridge.epoch,
+                device="phone",
+                session_id="s1",
+                request_id=request_id,
+                data={"allow": False},
+            ),
+        )
+        for _, event, _ in irc.sent:
+            client.apply(event)
+        assert client.requests == bridge.channels["#worker"].requests == {}
+        assert decision.await_count == 2
+        decision.assert_awaited_with(9, False)
+        assert backend.sent == []
+    finally:
+        await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_control_socket_routes_only_scoped_delegations_and_worker_reports(
+    tmp_path: Path,
+) -> None:
+    bridge, irc, backend = _pm_bridge(tmp_path)
+    async with _running_bridge(bridge):
+        for channel, sid in (("#pm", "coordinator"), ("#worker", "worker"), ("#other", "other")):
+            await _activate_bound(bridge, channel, sid)
+        irc.sent.clear()
+        path = bridge.config.pm.control_socket
+        delegated = await send_control_request(
+            path, DelegateRequest("touch-hockey", "TH-0001", "Read the project package name.")
+        )
+        await asyncio.wait_for(bridge._action_queues["#worker"].join(), 3)
+        reported = await send_control_request(
+            path, ReportRequest("touch-hockey", "TH-0001", "done", "Package is touch-hockey.")
+        )
+        await asyncio.wait_for(bridge._action_queues["#pm"].join(), 3)
+        delegation = (
+            "[pm delegation project=touch-hockey task=TH-0001]\nRead the project package name.\n\n"
+            "Do not edit the PM board. Report exactly one done or blocked result "
+            "through the Agentwire PM report operation."
+        )
+        report_text = (
+            "[worker report project=touch-hockey task=TH-0001 status=done]\n"
+            "Package is touch-hockey."
+        )
+        assert backend.sent == [("worker", delegation), ("coordinator", report_text)]
+        prompts = [
+            (channel, event, preview)
+            for channel, event, preview in irc.sent
+            if event.kind == "user.prompt"
+        ]
+        assert [(channel, event.item_id, preview) for channel, event, preview in prompts] == [
+            ("#worker", delegated, delegation),
+            ("#pm", reported, report_text),
+        ]
+        for action_id, channel in ((delegated, "#worker"), (reported, "#pm")):
+            receipt = await bridge.state.action_status(action_id, channel, "trev", "codex")
+            assert receipt is not None and receipt.status == "succeeded"
+            assert await bridge.state.action_status(action_id, "#other", "trev", "codex") is None
+        bridge.channels["#pm"].busy = False
+        unknown_task = await send_control_request(
+            path, ReportRequest("touch-hockey", "TH-9999", "blocked", "Needs PM reconciliation.")
+        )
+        await asyncio.wait_for(bridge._action_queues["#pm"].join(), 3)
+        assert backend.sent[-1] == (
+            "coordinator",
+            "[worker report project=touch-hockey task=TH-9999 status=blocked]\n"
+            "Needs PM reconciliation.",
+        )
+        assert unknown_task not in {delegated, reported}
+
+
+@pytest.mark.asyncio
+async def test_control_policy_rejections_do_not_claim_or_prompt_and_listener_survives(
+    tmp_path: Path,
+) -> None:
+    bridge, irc, backend = _pm_bridge(tmp_path)
+    async with _running_bridge(bridge):
+        path = bridge.config.pm.control_socket
+        irc.sent.clear()
+        for request, category in (
+            (DelegateRequest("unmapped", "TH-0001", "Denied"), "unknown project"),
+            (ReportRequest("unmapped", "TH-0001", "done", "Denied"), "unknown project"),
+            (DelegateRequest("touch-hockey", "TH-0001", "Denied"), "channel unavailable"),
+            (ReportRequest("touch-hockey", "TH-0001", "blocked", "Denied"), "channel unavailable"),
+        ):
+            with pytest.raises(ControlError, match=f"^{category}$"):
+                await send_control_request(path, request)
+        await bridge._handle_topic(
+            "#worker", "agentwire:v1;account=trev;agent=bridge;backend=codex"
+        )
+        with pytest.raises(ControlError, match="^channel unavailable$"):
+            await send_control_request(path, DelegateRequest("touch-hockey", "TH-0001", "Unbound"))
+        assert backend.sent == []
+        assert not any(event.kind == "action.accepted" for _, event, _ in irc.sent)
+        await _activate_bound(bridge, "#worker", "worker")
+        await send_control_request(path, DelegateRequest("touch-hockey", "TH-0001", "Allowed"))
+        await asyncio.wait_for(bridge._action_queues["#worker"].join(), 3)
+        assert backend.sent[0][0] == "worker"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["delegate", "report"])
+async def test_control_bounds_final_wrapped_utf8_content_before_durable_ingress(
+    tmp_path: Path, operation: str
+) -> None:
+    bridge, irc, backend = _pm_bridge(tmp_path)
+    if operation == "delegate":
+        prefix = "[pm delegation project=touch-hockey task=TH-0001]\n"
+        suffix = (
+            "\n\nDo not edit the PM board. Report exactly one done or blocked result "
+            "through the Agentwire PM report operation."
+        )
+        channel, sid = "#worker", "worker"
+    else:
+        prefix = "[worker report project=touch-hockey task=TH-0001 status=done]\n"
+        suffix = ""
+        channel, sid = "#pm", "coordinator"
+    text_bytes = MAX_CONTENT_BYTES - len((prefix + suffix).encode())
+    text = "é" * (text_bytes // 2) + "x" * (text_bytes % 2)
+
+    def request(content: str) -> DelegateRequest | ReportRequest:
+        if operation == "delegate":
+            return DelegateRequest("touch-hockey", "TH-0001", content)
+        return ReportRequest("touch-hockey", "TH-0001", "done", content)
+
+    async with _running_bridge(bridge):
+        await _activate_bound(bridge, channel, sid)
+        irc.sent.clear()
+        with pytest.raises(ControlError, match="^content too large$"):
+            await send_control_request(bridge.config.pm.control_socket, request(text + "x"))
+        assert backend.sent == []
+        assert not any(event.kind == "action.accepted" for _, event, _ in irc.sent)
+        await send_control_request(bridge.config.pm.control_socket, request(text))
+        await asyncio.wait_for(bridge._action_queues[channel].join(), 3)
+        assert backend.sent == [(sid, prefix + text + suffix)]
+        assert len(backend.sent[0][1].encode()) == MAX_CONTENT_BYTES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["claim", "dispatch"])
+async def test_control_binding_switch_fails_the_pinned_action_not_the_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    bridge, irc, backend = _pm_bridge(tmp_path)
+    entered, release = asyncio.Event(), asyncio.Event()
+    if phase == "claim":
+        original_claim = bridge.state.claim_action
+
+        async def claim(*args: Any, **kwargs: Any) -> str | None:
+            entered.set()
+            await release.wait()
+            return await original_claim(*args, **kwargs)
+
+        monkeypatch.setattr(bridge.state, "claim_action", claim)
+    else:
+        original_dispatch = bridge._dispatch_action
+
+        async def dispatch(channel: str, action: Envelope, nick: str = "") -> None:
+            entered.set()
+            await release.wait()
+            await original_dispatch(channel, action, nick)
+
+        monkeypatch.setattr(bridge, "_dispatch_action", dispatch)
+    async with _running_bridge(bridge):
+        await _activate_bound(bridge, "#worker", "original")
+        sending = asyncio.create_task(
+            send_control_request(
+                bridge.config.pm.control_socket,
+                DelegateRequest("touch-hockey", "TH-0001", "Stay with the original session."),
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            if phase == "dispatch":
+                # A receipt acknowledges ingress, not successful task execution.
+                action_id = await asyncio.wait_for(sending, 3)
+                receipt = await bridge.state.action_status(action_id, "#worker", "trev", "codex")
+                assert receipt is not None and receipt.status == "accepted"
+            bridge.channels["#worker"].binding = ChannelBinding(
+                "codex", "replacement", str(tmp_path)
+            )
+            release.set()
+            action_id = await asyncio.wait_for(sending, 3)
+            await asyncio.wait_for(bridge._action_queues["#worker"].join(), 3)
+            receipt = await bridge.state.action_status(action_id, "#worker", "trev", "codex")
+            assert receipt is not None and receipt.status == "failed"
+            assert backend.sent == []
+            assert any(
+                event.kind == "action.failed" and event.reply == action_id
+                for _, event, _ in irc.sent
+            )
+        finally:
+            release.set()
+            sending.cancel()
+            await asyncio.gather(sending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_control_activation_race_does_not_acknowledge_unqueued_action(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, irc, backend = _pm_bridge(tmp_path)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_send = irc.send_protocol
+
+    async def send(channel: str, envelope: Envelope, preview: str | None = None) -> None:
+        if envelope.kind == "action.accepted":
+            entered.set()
+            await release.wait()
+        await original_send(channel, envelope, preview)
+
+    monkeypatch.setattr(irc, "send_protocol", send)
+    async with _running_bridge(bridge):
+        await _activate_bound(bridge, "#worker", "worker")
+        sending = asyncio.create_task(
+            send_control_request(
+                bridge.config.pm.control_socket,
+                DelegateRequest("touch-hockey", "TH-0001", "Do not cross activation."),
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            await bridge._handle_topic("#worker", "ordinary topic")
+            release.set()
+            with pytest.raises(ControlError, match="^binding changed$"):
+                await asyncio.wait_for(sending, 3)
+            action_id = next(
+                event.reply for _, event, _ in irc.sent if event.kind == "action.accepted"
+            )
+            receipt = await bridge.state.action_status(action_id, "#worker", "trev", "codex")
+            assert receipt is not None and receipt.status == "failed"
+            assert backend.sent == []
+            assert bridge._action_queues["#worker"].empty()
+        finally:
+            release.set()
+            sending.cancel()
+            await asyncio.gather(sending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_bridge_control_starts_after_restore_and_workers_and_closes_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, _, backend = _pm_bridge(tmp_path)
+    await bridge.state.set("#worker", ChannelBinding("codex", "restored", str(tmp_path)))
+    order: list[str] = []
+    original_restore = bridge._restore_bindings
+    original_start = bridge._control_server.start
+    original_close = bridge._control_server.close
+    original_state_close = bridge.state.close
+
+    async def irc_ready(_timeout: float = 30) -> None:
+        order.append("irc-ready")
+
+    async def backend_ready(_timeout: float = 30) -> None:
+        order.append("backend-ready")
+
+    async def restore() -> None:
+        await original_restore()
+        order.append("restored")
+
+    async def control_start() -> None:
+        assert {"irc-ready", "backend-ready", "restored"} <= set(order)
+        assert backend.attached_sessions == ["restored"]
+        assert set(bridge._action_workers) == set(bridge.channels)
+        assert set(bridge._status_workers) == set(bridge.channels)
+        await original_start()
+        order.append("control-start")
+
+    async def control_close() -> None:
+        order.append("control-close")
+        assert all(not task.done() for task in bridge._action_workers.values())
+        await original_close()
+
+    async def backend_close() -> None:
+        assert "control-close" in order
+        order.append("backend-close")
+
+    async def state_close() -> None:
+        assert "control-close" in order
+        assert all(task.done() for task in bridge._action_workers.values())
+        order.append("state-close")
+        await original_state_close()
+
+    monkeypatch.setattr(bridge.irc, "wait_ready", irc_ready)
+    monkeypatch.setattr(backend, "wait_ready", backend_ready)
+    monkeypatch.setattr(bridge, "_restore_bindings", restore)
+    monkeypatch.setattr(bridge._control_server, "start", control_start)
+    monkeypatch.setattr(bridge._control_server, "close", control_close)
+    monkeypatch.setattr(backend, "close", backend_close)
+    monkeypatch.setattr(bridge.state, "close", state_close)
+    async with _running_bridge(bridge):
+        await _wait_until(lambda: "control-start" in order)
+        await bridge.close()
+        assert not bridge.config.pm.control_socket.exists()
+        assert (
+            order.index("control-close") < order.index("backend-close") < order.index("state-close")
+        )
+
+
+@pytest.mark.asyncio
+async def test_ingest_boolean_means_descriptor_was_handed_to_a_live_queue(tmp_path: Path) -> None:
+    bridge, _, _ = make_bridge(tmp_path)
+    try:
+        await _activate_bound(bridge, "#codex")
+        mutation = new_envelope(
+            "turn.prompt",
+            "action",
+            "phone",
+            device="phone",
+            epoch=bridge.epoch,
+            session_id="s1",
+            data={"content": "Queued"},
+        )
+        assert await bridge._ingest_action("#codex", mutation) is True
+        assert await bridge._ingest_action("#codex", mutation) is False
+        assert bridge._action_queues["#codex"].qsize() == 1
+        for _ in range(32):
+            query = new_envelope(
+                "action.status.request",
+                "action",
+                "phone",
+                device="phone",
+                epoch=bridge.epoch,
+                data={"actionId": mutation.id},
+            )
+            assert await bridge._ingest_action("#codex", query) is True
+        assert await bridge._ingest_action("#codex", query) is False
+        await bridge.close()
+        assert await bridge._ingest_action("#codex", mutation) is False
+    finally:
+        await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_voice_checks_binding_before_spending_more_transcription_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge, irc, backend = make_bridge(
+        tmp_path,
+        channels={"#codex": "codex", "#second": "codex"},
+        voice=VoiceConfig(tmp_path / "model.bin"),
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def transcribe(_message: VoiceMessage, _model: Path) -> str:
+        entered.set()
+        await release.wait()
+        return "First only"
+
+    transcription = AsyncMock(side_effect=transcribe)
+    monkeypatch.setattr("agentwire.bridge.transcribe_voice", transcription)
+    async with _running_bridge(bridge):
+        await _activate_bound(bridge, "#codex", "first")
+        await _activate_bound(bridge, "#second", "second")
+        await irc.incoming.put(_voice_message())
+        await asyncio.wait_for(entered.wait(), 3)
+        await irc.incoming.put(_voice_message("#second"))
+        await _irc_barrier(bridge, irc)
+        bridge.channels["#second"].binding = ChannelBinding("codex", "replacement", str(tmp_path))
+        release.set()
+        await _finish_voice(bridge, irc)
+        transcription.assert_awaited_once()
+        assert backend.sent == [("first", "[voice] First only")]
+        second_id = voice_action_id("trev", "#second", "codex", "second", VOICE_URL)
+        assert await bridge.state.action_status(second_id, "#second", "trev", "codex") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["steer", "queue"])
+async def test_busy_local_control_prompts_have_one_readable_initial_event(
+    tmp_path: Path, delivery: str
+) -> None:
+    bridge, irc, backend = _pm_bridge(tmp_path)
+    async with _running_bridge(bridge):
+        await _activate_bound(bridge, "#pm", "coordinator")
+        runtime = bridge.channels["#pm"]
+        runtime.busy = True
+        runtime.settings["delivery"] = delivery
+        irc.sent.clear()
+        action_id = await send_control_request(
+            bridge.config.pm.control_socket,
+            ReportRequest("touch-hockey", "TH-0001", "blocked", "Need a decision."),
+        )
+        await asyncio.wait_for(bridge._action_queues["#pm"].join(), 3)
+        content = (
+            "[worker report project=touch-hockey task=TH-0001 status=blocked]\nNeed a decision."
+        )
+        events = [
+            (event, preview)
+            for _, event, preview in irc.sent
+            if event.kind in {"user.prompt", "queue.item.added"}
+        ]
+        assert [(event.kind, event.item_id, preview) for event, preview in events] == [
+            ("user.prompt" if delivery == "steer" else "queue.item.added", action_id, content)
+        ]
+        if delivery == "steer":
+            assert backend.steered == [("coordinator", content)]
+        else:
+            assert backend.sent == []
+            assert [item.text for item in await bridge.state.list_queue("#pm", "coordinator")] == [
+                content
+            ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["voice", "control"])
+async def test_queued_local_prompt_cannot_drain_into_a_replacement_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str
+) -> None:
+    bridge, irc, backend = make_bridge(
+        tmp_path,
+        channels={"#codex": "codex", "#pm": "codex"},
+        voice=VoiceConfig(tmp_path / "model.bin"),
+        pm=PMConfig(tmp_path / "c.sock", "#pm", MappingProxyType({"touch-hockey": "#codex"})),
+    )
+    monkeypatch.setattr("agentwire.bridge.transcribe_voice", AsyncMock(return_value="Pinned queue"))
+    async with _running_bridge(bridge):
+        await _activate_bound(bridge, "#codex", "original")
+        await _activate_bound(bridge, "#pm", "original")
+        channel = "#codex" if source == "voice" else "#pm"
+        runtime = bridge.channels[channel]
+        runtime.busy = True
+        if source == "voice":
+            await irc.incoming.put(_voice_message())
+            await _finish_voice(bridge, irc)
+        else:
+            await send_control_request(
+                bridge.config.pm.control_socket,
+                ReportRequest("touch-hockey", "TH-0001", "done", "Pinned queue"),
+            )
+            await asyncio.wait_for(bridge._action_queues[channel].join(), 3)
+        original_queue = await bridge.state.list_queue(channel, "original")
+        assert len(original_queue) == 1
+        entered, release = asyncio.Event(), asyncio.Event()
+        original_list = bridge.state.list_queue
+
+        async def list_queue(target: str, sid: str) -> list[Any]:
+            items = await original_list(target, sid)
+            if target == channel and sid == "original":
+                entered.set()
+                await release.wait()
+            return items
+
+        monkeypatch.setattr(bridge.state, "list_queue", list_queue)
+        runtime.busy = False
+        draining = asyncio.create_task(bridge._drain_queue(channel))
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            await bridge._set_binding(
+                channel, SessionSummary("replacement", str(tmp_path), "replacement", busy=True)
+            )
+            release.set()
+            await asyncio.wait_for(draining, 3)
+            assert backend.sent == []
+            assert runtime.busy is True
+            assert await original_list(channel, "original") == original_queue
+            assert await original_list(channel, "replacement") == []
+        finally:
+            release.set()
+            draining.cancel()
+            await asyncio.gather(draining, return_exceptions=True)

@@ -14,6 +14,7 @@ from typing import Any
 
 from agentwire.backends.base import Backend, BackendError
 from agentwire.config import Config, ConfigError, resolve_workspace
+from agentwire.control import ControlError, ControlServer, DelegateRequest, ReportRequest
 from agentwire.diagnostics import DiagnosticCheck, report
 from agentwire.irc import IRCClient, IRCMessage
 from agentwire.models import BackendEvent, ChannelBinding, Question, SessionSummary
@@ -33,6 +34,13 @@ from agentwire.protocol import (
 from agentwire.redaction import scan_secrets
 from agentwire.state import QueuedPrompt, StateStore
 from agentwire.text import clean_block, clean_text, safe_one_line, truncate_utf8
+from agentwire.voice import (
+    VoiceError,
+    VoiceMessage,
+    parse_voice_message,
+    transcribe_voice,
+    voice_action_id,
+)
 
 MAX_CONTENT_BYTES = 64 * 1024
 MAX_PREVIEW_BYTES = 4 * 1024
@@ -53,6 +61,7 @@ STATUS_ACTION_KIND = "action.status.request"
 DIAGNOSTICS_ACTION_KIND = "diagnostics.request"
 FAST_READ_ACTION_KINDS = frozenset({STATUS_ACTION_KIND, DIAGNOSTICS_ACTION_KIND})
 STATUS_QUEUE_LIMIT = 32
+AUDIO_TAG = "+trevarj.github.io/audio"
 # Diagnostics name channels, accounts, kinds, and reasons. They never carry
 # prompt text, tool output, tag values, or credentials.
 LOGGER = logging.getLogger("agentwire.bridge")
@@ -70,9 +79,13 @@ _SENSITIVE_QUESTION_RE = re.compile(
 class PendingRequest:
     token: str | int
     kind: str
+    opened_data: dict[str, Any]
     session_id: str | None = None
+    turn_id: str | None = None
+    item_id: str | None = None
     questions: tuple[Question, ...] = ()
     redacted: bool = False
+    resolving: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -87,6 +100,17 @@ class ActionDescriptor:
     claimed: bool
     runtime_identity: object
     activation: TopicActivation
+
+
+@dataclass(slots=True, frozen=True)
+class VoiceJob:
+    channel: str
+    runtime_identity: object
+    activation: TopicActivation
+    backend: str
+    session_id: str
+    message: VoiceMessage
+    action_id: str
 
 
 @dataclass(slots=True)
@@ -145,6 +169,15 @@ class Bridge:
         self._status_queues: dict[str, asyncio.Queue[ActionDescriptor]] = {}
         self._status_workers: dict[str, asyncio.Task[None]] = {}
         self._tasks: list[asyncio.Task[None]] = []
+        self._voice_queue: asyncio.Queue[VoiceJob] | None = (
+            asyncio.Queue(maxsize=4) if config.voice is not None else None
+        )
+        self._voice_inflight: set[str] = set()
+        self._control_server = (
+            ControlServer(config.pm.control_socket, self._control_request)
+            if config.pm is not None
+            else None
+        )
         self._managed_channels: set[str] = set()
         self._closing_channels: set[str] = set()
         self._closed = False
@@ -176,12 +209,39 @@ class Bridge:
                     for name, backend in self.backends.items()
                 ),
             ]
+            if self._voice_queue is not None:
+                self._tasks.append(asyncio.create_task(self._voice_loop(), name="bridge-voice"))
+            # Channel workers have a shorter lifetime than these permanent
+            # services, but close() still owns and reaps every underlying task.
+            service_tasks = tuple(self._tasks)
             for channel in self.channels:
                 self._start_action_worker(channel)
                 self._start_status_worker(channel)
-            await asyncio.gather(*self._tasks)
+            if self._control_server is not None:
+                await self._control_server.start()
+            await asyncio.gather(
+                *service_tasks,
+                *(
+                    self._wait_channel_worker(channel, worker)
+                    for workers in (self._action_workers, self._status_workers)
+                    for channel, worker in workers.items()
+                ),
+            )
         finally:
             await self.close()
+
+    async def _wait_channel_worker(self, channel: str, worker: asyncio.Task[None]) -> None:
+        try:
+            await worker
+        except asyncio.CancelledError:
+            # Removal relinquishes ownership before cancelling, possibly before
+            # the worker's coroutine even starts. Other cancellation stays fatal.
+            if (
+                self._closed
+                or self._action_workers.get(channel) is worker
+                or self._status_workers.get(channel) is worker
+            ):
+                raise
 
     def _install_channel(self, channel: str, backend: str) -> ChannelRuntime:
         value = channel.lower()
@@ -240,6 +300,8 @@ class Bridge:
         if self._closed:
             return
         self._closed = True
+        if self._control_server is not None:
+            await self._control_server.close()
         current = asyncio.current_task()
         for runtime in self.channels.values():
             for _payload, pending in runtime.observed_status_pending.values():
@@ -264,6 +326,11 @@ class Bridge:
             if task is not current:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
+        if self._voice_queue is not None:
+            while not self._voice_queue.empty():
+                self._voice_queue.get_nowait()
+                self._voice_queue.task_done()
+        self._voice_inflight.clear()
         await asyncio.gather(
             self.irc.close(),
             *(backend.close() for backend in self.backends.values()),
@@ -295,6 +362,10 @@ class Bridge:
             message = await self.irc.recv()
             value: str | None = None
             try:
+                if "draft/playback" in message.tags or "znc.in/playback" in message.tags:
+                    if PROTOCOL_TAG in message.tags or AUDIO_TAG in message.tags:
+                        self._log_drop(message, "it is history playback, which is never replayed")
+                    continue
                 # 331 is "no topic is set". Treating it as an empty topic is
                 # what turns an unset topic into a stated fact rather than an
                 # absence indistinguishable from a reply that never arrived.
@@ -309,6 +380,13 @@ class Bridge:
                             # Runs even when validation raised, so a channel that failed for one
                             # reason still counts toward the summary of what never came up.
                             await self._report_inert_channels()
+                    continue
+                if (
+                    self._voice_queue is not None
+                    and message.command == "PRIVMSG"
+                    and message.tags.get(AUDIO_TAG) == "1"
+                ):
+                    await self._queue_voice(message)
                     continue
                 value = message.tags.get(PROTOCOL_TAG)
                 if not isinstance(value, str):
@@ -326,9 +404,6 @@ class Bridge:
                         f" owner account {runtime.activation.account}",
                     )
                     continue
-                if "draft/playback" in message.tags or "znc.in/playback" in message.tags:
-                    self._log_drop(message, "it is history playback, which is never replayed")
-                    continue
                 envelope = self._reassemblers[message.channel].add(value)
                 if envelope is not None:
                     await self._ingest_action(message.channel, envelope, message.nick)
@@ -344,6 +419,155 @@ class Bridge:
                 await self._emit_failure(message.channel, None, str(exc))
             except Exception:
                 await self._emit_failure(message.channel, None, "unexpected bridge failure")
+
+    async def _queue_voice(self, message: IRCMessage) -> None:
+        runtime = self.channels.get(message.channel)
+        if (
+            self._closed
+            or self._voice_queue is None
+            or message.channel not in self.config.irc.channels
+            or runtime is None
+            or runtime.activation is None
+            or runtime.binding is None
+        ):
+            return
+        activation = runtime.activation
+        if not message.account == activation.account == self.config.bridge.owner_account:
+            self._log_drop(message, "voice requires the authenticated channel owner")
+            return
+        try:
+            parsed = parse_voice_message(message.text)
+        except VoiceError as exc:
+            await self._emit_failure(message.channel, None, f"Voice transcription failed: {exc}")
+            return
+        if parsed is None:
+            return
+        action_id = voice_action_id(
+            activation.account,
+            message.channel,
+            runtime.backend,
+            runtime.binding.session_id,
+            parsed.fetch_url,
+        )
+        if action_id in self._voice_inflight:
+            return
+        job = VoiceJob(
+            message.channel,
+            runtime.identity,
+            activation,
+            runtime.backend,
+            runtime.binding.session_id,
+            parsed,
+            action_id,
+        )
+        try:
+            self._voice_queue.put_nowait(job)
+        except asyncio.QueueFull:
+            await self._emit_failure(
+                message.channel, None, "Voice transcription failed: voice queue full"
+            )
+            return
+        self._voice_inflight.add(action_id)
+
+    def _voice_job_is_current(self, job: VoiceJob) -> bool:
+        if not self._captured_runtime_is_current(job.channel, job.runtime_identity, job.activation):
+            return False
+        runtime = self.channels[job.channel]
+        return (
+            runtime.backend == job.backend
+            and runtime.binding is not None
+            and runtime.binding.session_id == job.session_id
+        )
+
+    async def _voice_loop(self) -> None:
+        queue = self._voice_queue
+        voice = self.config.voice
+        if queue is None or voice is None:
+            return
+        while True:
+            job = await queue.get()
+            try:
+                receipt = await self.state.action_status(
+                    job.action_id, job.channel, job.activation.account, job.backend
+                )
+                if receipt is not None:
+                    continue
+                if not self._voice_job_is_current(job):
+                    raise VoiceError("binding changed")
+                transcript = await transcribe_voice(job.message, voice.model_path)
+                if not self._voice_job_is_current(job):
+                    raise VoiceError("binding changed")
+                action = new_envelope(
+                    "turn.prompt",
+                    "action",
+                    self.instance,
+                    id=job.action_id,
+                    epoch=self.epoch,
+                    device="bridge-voice",
+                    session_id=job.session_id,
+                    data={"content": f"[voice] {transcript}"},
+                )
+                if not await self._ingest_action(job.channel, action):
+                    raise VoiceError("request not accepted")
+            except VoiceError as exc:
+                await self._emit_failure(job.channel, None, f"Voice transcription failed: {exc}")
+            except Exception:
+                await self._emit_failure(
+                    job.channel, None, "Voice transcription failed: unexpected voice failure"
+                )
+            finally:
+                self._voice_inflight.discard(job.action_id)
+                queue.task_done()
+
+    async def _control_request(self, request: DelegateRequest | ReportRequest) -> str:
+        pm = self.config.pm
+        if self._closed or pm is None:
+            raise ControlError("control unavailable")
+        project_channel = pm.projects.get(request.project)
+        if project_channel is None:
+            raise ControlError("unknown project")
+        if isinstance(request, DelegateRequest):
+            channel = project_channel
+            content = (
+                f"[pm delegation project={request.project} task={request.task}]\n"
+                f"{request.text}\n\n"
+                "Do not edit the PM board. Report exactly one done or blocked result "
+                "through the Agentwire PM report operation."
+            )
+        else:
+            channel = pm.coordinator_channel
+            content = (
+                f"[worker report project={request.project} task={request.task} "
+                f"status={request.status}]\n{request.text}"
+            )
+        if len(content.encode("utf-8")) > MAX_CONTENT_BYTES:
+            raise ControlError("content too large")
+        runtime = self.channels.get(channel)
+        if runtime is None or runtime.activation is None or runtime.binding is None:
+            raise ControlError("channel unavailable")
+        activation = runtime.activation
+        identity = runtime.identity
+        if not self._captured_runtime_is_current(channel, identity, activation):
+            raise ControlError("channel unavailable")
+        sid = runtime.binding.session_id
+        action = new_envelope(
+            "turn.prompt",
+            "action",
+            self.instance,
+            epoch=self.epoch,
+            device="local-control",
+            session_id=sid,
+            data={"content": content},
+        )
+        if not await self._ingest_action(channel, action):
+            if (
+                not self._captured_runtime_is_current(channel, identity, activation)
+                or runtime.binding is None
+                or runtime.binding.session_id != sid
+            ):
+                raise ControlError("binding changed")
+            raise ControlError("request not accepted")
+        return action.id
 
     @staticmethod
     def _malformed_status_reply(value: str | None) -> str | None:
@@ -722,20 +946,20 @@ class Bridge:
 
     async def _ingest_action(
         self, channel: str, action: Envelope, requester_nick: str = ""
-    ) -> None:
+    ) -> bool:
         """Claim mutations at authenticated ingress before serial dispatch."""
         descriptor = await self._prepare_action(channel, action, requester_nick)
         if descriptor is None:
-            return
+            return False
         if not self._descriptor_is_trusted(channel, descriptor):
             await self._fail_unqueued_action(descriptor, "channel changed before execution")
-            return
+            return False
         if action.kind in FAST_READ_ACTION_KINDS:
             try:
                 queue = self._status_queues.get(channel)
                 if queue is None:
                     await self._fail_unqueued_action(descriptor, "channel changed before execution")
-                    return
+                    return False
                 queue.put_nowait(descriptor)
             except asyncio.QueueFull:
                 reason = (
@@ -744,16 +968,20 @@ class Bridge:
                     else "too many diagnostics requests"
                 )
                 await self._emit_failure(channel, action.id, reason)
-            return
+                return False
+            return True
         queue = self._action_queues.get(channel)
         if queue is None:
             await self._fail_unqueued_action(descriptor, "channel changed before execution")
-            return
-        await queue.put(descriptor)
+            return False
+        queue.put_nowait(descriptor)
+        return True
 
     async def _prepare_action(
         self, channel: str, action: Envelope, requester_nick: str
     ) -> ActionDescriptor | None:
+        if self._closed:
+            return None
         if action.message_type != "action":
             # A relayed published event is never a command. Expected traffic,
             # so this stays below warning level.
@@ -843,7 +1071,8 @@ class Bridge:
     ) -> bool:
         runtime = self.channels.get(channel)
         return bool(
-            runtime is not None
+            not self._closed
+            and runtime is not None
             and runtime.identity is runtime_identity
             and runtime.activation is activation
             and activation.account == self.config.bridge.owner_account
@@ -924,8 +1153,32 @@ class Bridge:
             await handler(channel, action)
 
     async def _action_sync(self, channel: str, action: Envelope) -> None:
+        runtime = self.channels[channel]
+        activation = runtime.activation
+        binding = runtime.binding
         await self._emit_hello(channel, reply=action.id)
         await self._emit_snapshot(channel, reply=action.id)
+        # Actions are serialized, but backend resolutions can arrive during sync.
+        for request_id in list(runtime.requests):
+            if (
+                activation is None
+                or not self._captured_runtime_is_current(channel, runtime.identity, activation)
+                or runtime.binding is not binding
+            ):
+                return
+            pending = runtime.requests.get(request_id)
+            if pending is None:
+                continue
+            await self._emit(
+                channel,
+                "request.opened",
+                session_id=pending.session_id,
+                turn_id=pending.turn_id,
+                item_id=pending.item_id,
+                request_id=request_id,
+                data=pending.opened_data,
+                journal=False,
+            )
 
     async def _fast_read(
         self, channel: str, action: Envelope, descriptor: ActionDescriptor
@@ -1513,6 +1766,13 @@ class Bridge:
         runtime = self.channels[channel]
         binding = self._require_binding(runtime, action)
         text = self._content(action)
+        prompt = self._safe_user_prompt(text)
+        content = prompt.get("content")
+        preview = (
+            self._preview(content)
+            if action.device in {"bridge-voice", "local-control"} and isinstance(content, str)
+            else None
+        )
         if runtime.busy:
             if runtime.settings.get("delivery") == "steer":
                 await self.backends[runtime.backend].steer(
@@ -1524,7 +1784,8 @@ class Bridge:
                     session_id=binding.session_id,
                     turn_id=runtime.active_turn,
                     item_id=action.item_id or action.id,
-                    data=self._safe_user_prompt(text),
+                    data=prompt,
+                    preview=preview,
                 )
                 return
             item = await self.state.enqueue(
@@ -1534,7 +1795,7 @@ class Bridge:
                 text,
                 self.config.bridge.queue_limit,
             )
-            await self._emit_queue_item(channel, "queue.item.added", item)
+            await self._emit_queue_item(channel, "queue.item.added", item, preview=preview)
             return
         runtime.active_turn = await self.backends[runtime.backend].send_message(
             binding.session_id, text
@@ -1546,7 +1807,8 @@ class Bridge:
             session_id=binding.session_id,
             turn_id=runtime.active_turn,
             item_id=action.item_id or action.id,
-            data=self._safe_user_prompt(text),
+            data=prompt,
+            preview=preview,
         )
 
     async def _action_steer(self, channel: str, action: Envelope) -> None:
@@ -1556,13 +1818,20 @@ class Bridge:
             raise ValueError("session has no active turn")
         text = self._content(action)
         await self.backends[runtime.backend].steer(binding.session_id, runtime.active_turn, text)
+        prompt = self._safe_user_prompt(text)
+        content = prompt.get("content")
         await self._emit(
             channel,
             "user.prompt",
             session_id=binding.session_id,
             turn_id=runtime.active_turn,
             item_id=action.item_id or action.id,
-            data=self._safe_user_prompt(text),
+            data=prompt,
+            preview=(
+                self._preview(content)
+                if action.device in {"bridge-voice", "local-control"} and isinstance(content, str)
+                else None
+            ),
         )
 
     async def _action_cancel(self, channel: str, action: Envelope) -> None:
@@ -1623,17 +1892,19 @@ class Bridge:
             runtime.binding is None or runtime.binding.session_id != pending.session_id
         ):
             raise ValueError("reattach the request's session before responding")
-        backend = self.backends[self.channels[channel].backend]
         if pending.kind == "approval":
             allow = action.data.get("allow")
             if not isinstance(allow, bool):
                 raise ProtocolError("approval response requires boolean allow")
-            await backend.resolve_approval(pending.token, allow)
+            await self._resolve_approval(channel, request_id, allow)
+            return
         else:
             answers = action.data.get("answers")
             if not isinstance(answers, list) or not all(isinstance(item, list) for item in answers):
                 raise ProtocolError("question response requires an answers array")
-            await backend.resolve_question(pending.token, pending.questions, answers)
+            await self.backends[runtime.backend].resolve_question(
+                pending.token, pending.questions, answers
+            )
         self.channels[channel].requests.pop(request_id, None)
         await self._emit(channel, "request.resolved", request_id=request_id)
 
@@ -1647,13 +1918,28 @@ class Bridge:
             runtime.binding is None or runtime.binding.session_id != pending.session_id
         ):
             raise ValueError("reattach the request's session before skipping")
-        backend = self.backends[self.channels[channel].backend]
         if pending.kind == "approval":
-            await backend.resolve_approval(pending.token, False)
+            await self._resolve_approval(channel, request_id, False)
+            return
         else:
-            await backend.resolve_question(pending.token, pending.questions, None)
+            await self.backends[runtime.backend].resolve_question(
+                pending.token, pending.questions, None
+            )
         self.channels[channel].requests.pop(request_id, None)
         await self._emit(channel, "request.resolved", request_id=request_id)
+
+    async def _resolve_approval(self, channel: str, request_id: str, allow: bool) -> None:
+        runtime = self.channels[channel]
+        pending = runtime.requests[request_id]
+        if pending.resolving:
+            raise ValueError("request response is already in progress")
+        pending.resolving = True
+        try:
+            await self.backends[runtime.backend].resolve_approval(pending.token, allow)
+        finally:
+            pending.resolving = False
+        if runtime.requests.pop(request_id, None) is not None:
+            await self._emit(channel, "request.resolved", request_id=request_id)
 
     async def _backend_loop(self, backend: Backend) -> None:
         async for event in backend.events():
@@ -1808,14 +2094,6 @@ class Bridge:
             q.secret or _SENSITIVE_QUESTION_RE.search(f"{q.header} {q.prompt}")
             for q in event.questions
         )
-        pending = PendingRequest(
-            token=event.request_token if event.request_token is not None else request_id,
-            kind=event.kind,
-            session_id=event.session_id,
-            questions=event.questions,
-            redacted=secret_question,
-        )
-        runtime.requests[request_id] = pending
         if secret_question:
             data = {"type": "question", "redacted": True, "canSkip": True}
             preview = "Sensitive agent question requires the attached TUI; it may be skipped here"
@@ -1848,6 +2126,38 @@ class Bridge:
         if inactive:
             data["sid"] = event.session_id
             preview = "Agent request waiting in an inactive session; reattach to respond"
+        runtime.requests[request_id] = PendingRequest(
+            token=event.request_token if event.request_token is not None else request_id,
+            kind=event.kind,
+            opened_data=data,
+            session_id=event.session_id,
+            turn_id=event.turn_id,
+            item_id=event.item_id,
+            questions=event.questions,
+            redacted=secret_question,
+        )
+        pm = self.config.pm
+        if (
+            self.config.auto_approve
+            and pm is not None
+            and (channel == pm.coordinator_channel or channel in pm.projects.values())
+            and event.kind == "approval"
+            and not inactive
+            and runtime.activation is not None
+            and self._captured_runtime_is_current(channel, runtime.identity, runtime.activation)
+            and runtime.binding is not None
+            and runtime.binding.session_id == event.session_id
+            and not runtime.closing_session
+        ):
+            try:
+                await self._resolve_approval(channel, request_id, True)
+            except Exception as exc:
+                if request_id not in runtime.requests:
+                    raise
+                LOGGER.warning("%s: automatic approval failed (%s)", channel, type(exc).__name__)
+                preview = "Automatic approval failed; review the pending request manually"
+            else:
+                return
         await self._emit(
             channel,
             "request.opened",
@@ -1868,28 +2178,39 @@ class Bridge:
             or runtime.closing_session
         ):
             return
+        binding = runtime.binding
+        activation = runtime.activation
+        backend = runtime.backend
         # Claim delivery before awaiting so completion and close recovery cannot
         # both dispatch the same queue head. Keep it until the backend accepts it.
         runtime.busy = True
         try:
-            items = await self.state.list_queue(channel, runtime.binding.session_id)
+            items = await self.state.list_queue(channel, binding.session_id)
+            if (
+                not self._captured_runtime_is_current(channel, runtime.identity, activation)
+                or runtime.binding is not binding
+            ):
+                if runtime.binding is binding:
+                    runtime.busy = False
+                return
             if not items:
                 runtime.busy = False
                 return
             item = items[0]
-            runtime.active_turn = await self.backends[runtime.backend].send_message(
-                runtime.binding.session_id, item.text
-            )
+            turn_id = await self.backends[backend].send_message(binding.session_id, item.text)
+            if runtime.binding is binding:
+                runtime.active_turn = turn_id
         except BaseException:
-            runtime.busy = False
+            if runtime.binding is binding:
+                runtime.busy = False
             raise
         await self.state.delete_queue(item.id)
         await self._emit_queue_item(channel, "queue.item.removed", item)
         await self._emit(
             channel,
             "user.prompt",
-            session_id=runtime.binding.session_id,
-            turn_id=runtime.active_turn,
+            session_id=binding.session_id,
+            turn_id=turn_id,
             item_id=item.id,
             data=self._safe_user_prompt(item.text),
         )
@@ -1956,7 +2277,13 @@ class Bridge:
         )
 
     async def _emit_queue_item(
-        self, channel: str, kind: str, item: QueuedPrompt, visible: bool = False
+        self,
+        channel: str,
+        kind: str,
+        item: QueuedPrompt,
+        visible: bool = False,
+        *,
+        preview: str | None = None,
     ) -> None:
         await self._emit(
             channel,
@@ -1964,7 +2291,8 @@ class Bridge:
             session_id=item.session_id,
             item_id=item.id,
             data=self._queue_data(item),
-            preview=(
+            preview=preview
+            or (
                 f"Queued prompt {'updated' if kind == 'queue.item.updated' else 'deleted'}"
                 if visible
                 else None

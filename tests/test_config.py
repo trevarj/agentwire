@@ -7,6 +7,7 @@ import pytest
 
 from agentwire.cli import default_config_path
 from agentwire.config import (
+    Config,
     ConfigError,
     _path,
     install_secret_env,
@@ -237,3 +238,119 @@ def test_codex_only_config_ignores_pi_table_and_rejects_unknown_backend(
     bad = _write_config(tmp_path, '{ "#other" = "gemini" }')
     with pytest.raises(ConfigError, match="unsupported backend"):
         load_config(bad)
+
+
+def test_voice_and_pm_are_optional_for_existing_positional_callers(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, '{ "#codex" = "codex", "#omp" = "omp" }')
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write("\n[omp]\n")
+    config = load_config(config_path)
+    legacy = Config(
+        config.path,
+        config.bridge,
+        config.secrets,
+        config.irc,
+        config.codex,
+        config.opencode,
+        config.stack,
+        config.claude,
+        config.pi,
+        config.omp,
+    )
+    assert legacy == config
+    assert config.voice is None
+    assert config.pm is None
+
+
+def test_voice_and_pm_expand_paths_and_normalize_static_channels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("AGENTWIRE_TEST_WORKSPACE", str(tmp_path / "Workspace"))
+    config_path = _write_config(
+        tmp_path, '{ "#PM" = "codex", "#Touch-Hockey" = "codex", "#motd-dev" = "codex" }'
+    )
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write('\n[voice]\nmodel_path = "~/.local/share/whisper/model.bin"\n')
+    voice_only = load_config(config_path)
+    assert voice_only.pm is None
+    assert voice_only.voice is not None
+    assert voice_only.voice.model_path == tmp_path / ".local/share/whisper/model.bin"
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            '\n[pm]\ncontrol_socket = "$AGENTWIRE_TEST_WORKSPACE/.agentwire/control.sock"\n'
+            'coordinator_channel = " #PM "\n'
+            'projects = { " touch-hockey " = " #TOUCH-HOCKEY ", "motd-dev" = "#motd-dev" }\n'
+        )
+    config = load_config(config_path)
+    assert config.voice == voice_only.voice
+    assert config.pm is not None
+    assert config.pm.control_socket == tmp_path / "Workspace/.agentwire/control.sock"
+    assert config.pm.coordinator_channel == "#pm"
+    assert config.pm.projects == {"touch-hockey": "#touch-hockey", "motd-dev": "#motd-dev"}
+    with pytest.raises(TypeError):
+        config.pm.projects["other"] = "#pm"  # type: ignore[index]
+    text = config_path.read_text(encoding="utf-8")
+    config_path.write_text(
+        text.replace('[voice]\nmodel_path = "~/.local/share/whisper/model.bin"\n', ""),
+        encoding="utf-8",
+    )
+    pm_only = load_config(config_path)
+    assert pm_only.voice is None
+    assert pm_only.pm == config.pm
+
+
+@pytest.mark.parametrize(
+    "table",
+    [
+        "voice = false\n",
+        "pm = false\n",
+        '[voice]\nmodel_path = ""\n',
+        "[voice]\nmodel_path = 123\n",
+        "[voice]\n",
+        '[pm]\ncoordinator_channel = "#pm"\nprojects = { worker = "#worker" }\n',
+        '[pm]\ncontrol_socket = "/control.sock"\nprojects = { worker = "#worker" }\n',
+    ],
+)
+def test_optional_feature_tables_require_typed_fields(tmp_path: Path, table: str) -> None:
+    config_path = _write_config(tmp_path, '{ "#pm" = "codex", "#worker" = "codex" }')
+    config_path.write_text(table + config_path.read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_config(config_path)
+
+
+@pytest.mark.parametrize(
+    ("coordinator", "projects"),
+    [
+        ("#pm", "[]"),
+        ("#pm", "{}"),
+        ("#pm", '{ " " = "#worker" }'),
+        ("#pm", '{ worker = "" }'),
+        ("#pm", "{ worker = 123 }"),
+        ("#pm", '{ worker = "#worker", " worker " = "#other" }'),
+        ("#pm", '{ worker = "#worker", worker = "#other" }'),
+        ("#pm", '{ worker = "#worker", other = "#WORKER" }'),
+        ("#pm", '{ worker = "#PM" }'),
+        ("#pm", '{ worker = "#unconfigured" }'),
+        ("#unconfigured", '{ worker = "#worker" }'),
+    ],
+)
+def test_pm_rejects_empty_duplicate_or_unconfigured_routes(
+    tmp_path: Path, coordinator: str, projects: str
+) -> None:
+    config_path = _write_config(
+        tmp_path, '{ "#pm" = "codex", "#worker" = "codex", "#other" = "codex" }'
+    )
+    with config_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            '\n[pm]\ncontrol_socket = "~/Workspace/.agentwire/control.sock"\n'
+            f'coordinator_channel = "{coordinator}"\nprojects = {projects}\n'
+        )
+    with pytest.raises(ConfigError):
+        load_config(config_path)
+
+
+def test_static_channels_reject_case_insensitive_duplicates(tmp_path: Path) -> None:
+    config_path = _write_config(tmp_path, '{ "#worker" = "codex", "#WORKER" = "codex" }')
+    with pytest.raises(ConfigError):
+        load_config(config_path)

@@ -46,6 +46,8 @@ extension (see [`docs/pi-socket.md`](docs/pi-socket.md)), which the bridge disco
 live, and sessions nobody is running are created or resumed by a bridge-owned `pi --mode rpc`
 subprocess speaking the same protocol. Live TUI sessions answer their own extension dialogs in
 the terminal; only bridge-spawned sessions relay dialogs as Agentwire questions and approvals.
+A missing `pi` binary warns at stack startup instead of stopping other backends;
+creating Pi sessions still requires it.
 Optional `[pi].dedicated_channels = true` creates each new Pi session in a private, ephemeral
 `#pi-<short-id>` channel. Channels survive IRC reconnects but not a bridge process restart; Pi's
 JSONL session remains resumable. Closing stops only its bridge-owned RPC process; static channels
@@ -92,6 +94,41 @@ projects by channel — is supported: set `account` and `agent` to the same name
 `owner_account` match the bridge nickname. Separate accounts remain the safer split, since one
 shared credential can both publish state and issue owner commands. Removing the prefix suspends
 the harness and pauses queue dispatch without canceling active backend work.
+
+### Voice notes and PM control
+
+The optional `[voice]` table in [`config.example.toml`](config.example.toml) enables
+workstation transcription of motd voice notes. Notes must be unencrypted OGG or MP4,
+at most 15 minutes and 25 MiB, with the canonical audio tag and an HTTPS upload URL.
+Only the authenticated owner can submit them in an activated channel with a bound
+session. Playback is ignored; retries use the normal durable action receipts.
+The Nix apps provide FFmpeg and Whisper; configure a verified Whisper model file
+and check availability with `agentwire doctor --json`.
+
+The optional `[pm]` table maps project names to static worker channels and one
+coordinator channel. Its Unix socket trusts other same-user coding processes:
+use a real, user-owned mode-0700 parent directory; the socket itself is mode 0600.
+Workers do not need the private Agentwire configuration or IRC credentials:
+
+```console
+agentwire delegate --socket ~/Workspace/.agentwire/control.sock \
+  --project touch-hockey --task TH-0001 --text 'Report the project name without changing files.'
+agentwire report --socket ~/Workspace/.agentwire/control.sock \
+  --project touch-hockey --task TH-0001 --status done --text 'The project name is touch-hockey.'
+```
+
+Success prints the accepted action UUID, not task completion. A lost response means
+the outcome is unknown: reconcile target-channel receipts before manually retrying.
+Raw socket clients must write one LF-terminated JSON request and half-close their
+write side before reading the response; the CLI handles this framing. Delegation
+can only target configured projects, and reports only target the coordinator.
+
+Tool approvals are automatic by default for the active, bound sessions in the
+configured PM coordinator and project channels. Questions, inactive sessions,
+and unrelated channels remain manual; sandbox restrictions are unchanged.
+Use `nix run .#stack -- --manual-approval` (or `agentwire run --manual-approval`)
+to require manual tool approval in PM channels too. Failed automatic approvals
+remain available for manual review rather than being reported as resolved.
 
 ## Reference client
 

@@ -6,9 +6,11 @@ import json
 import logging
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from agentwire.config import ConfigError, load_config
+from agentwire.control import ControlError, DelegateRequest, ReportRequest, send_control_request
 from agentwire.stack import (
     StackError,
     codex_tui,
@@ -36,12 +38,19 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         type=Path,
-        default=default_config_path(),
         help="live private config file",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("run", help="run only the bridge")
-    subparsers.add_parser("stack", help="run the tunnel, backends, and bridge")
+    for command, help_text in (
+        ("run", "run only the bridge"),
+        ("stack", "run the tunnel, backends, and bridge"),
+    ):
+        runtime = subparsers.add_parser(command, help=help_text)
+        runtime.add_argument(
+            "--manual-approval",
+            action="store_true",
+            help="require manual approval in PM coordinator and project channels",
+        )
     doctor_parser = subparsers.add_parser("doctor", help="validate the live setup")
     doctor_parser.add_argument(
         "--json", action="store_true", help="emit a structured diagnostic report"
@@ -50,6 +59,14 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("codex-tui", help="attach the Codex TUI")
     opencode = subparsers.add_parser("opencode-tui", help="attach the OpenCode TUI")
     opencode.add_argument("cwd", nargs="?", default=os.getcwd())
+    for command in ("delegate", "report"):
+        control = subparsers.add_parser(command, help=f"{command} a scoped PM task")
+        control.add_argument("--socket", type=Path, required=True)
+        control.add_argument("--project", required=True)
+        control.add_argument("--task", required=True)
+        control.add_argument("--text", required=True)
+        if command == "report":
+            control.add_argument("--status", choices=("done", "blocked"), required=True)
     return parser
 
 
@@ -71,6 +88,21 @@ def configure_logging() -> None:
 def main() -> None:
     arguments = _parser().parse_args()
     configure_logging()
+    if arguments.command in {"delegate", "report"}:
+        request = (
+            DelegateRequest(arguments.project, arguments.task, arguments.text)
+            if arguments.command == "delegate"
+            else ReportRequest(arguments.project, arguments.task, arguments.status, arguments.text)
+        )
+        try:
+            action_id = asyncio.run(send_control_request(arguments.socket.expanduser(), request))
+        except ControlError as exc:
+            print(f"agentwire: {exc}", file=sys.stderr)
+            raise SystemExit(1) from None
+        print(action_id)
+        return
+    if arguments.config is None:
+        arguments.config = default_config_path()
     if arguments.command == "doctor" and arguments.json:
         result = doctor_report(arguments.config)
         print(json.dumps(result, separators=(",", ":"), sort_keys=True))
@@ -79,6 +111,8 @@ def main() -> None:
         return
     try:
         config = load_config(arguments.config)
+        if arguments.command in {"run", "stack"}:
+            config = replace(config, auto_approve=not arguments.manual_approval)
         if arguments.command == "run":
             asyncio.run(run_bridge(config))
         elif arguments.command == "stack":

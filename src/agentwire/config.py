@@ -137,6 +137,18 @@ class StackConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class VoiceConfig:
+    model_path: Path
+
+
+@dataclass(slots=True, frozen=True)
+class PMConfig:
+    control_socket: Path
+    coordinator_channel: str
+    projects: Mapping[str, str]
+
+
+@dataclass(slots=True, frozen=True)
 class Config:
     path: Path
     bridge: BridgeConfig
@@ -145,11 +157,14 @@ class Config:
     codex: CodexConfig | None
     opencode: OpenCodeConfig | None
     stack: StackConfig
-    # Trails the required sections so existing positional construction keeps
-    # working for deployments and tests that never enable Claude.
+    # Optional sections trail the required ones to preserve positional callers.
     claude: ClaudeConfig | None = None
     pi: PiConfig | None = None
     omp: OmpConfig | None = None
+    voice: VoiceConfig | None = None
+    pm: PMConfig | None = None
+    # Runtime-only policy; the CLI can require manual approval for PM channels.
+    auto_approve: bool = True
 
 
 # Only the modes that keep Agentwire's approval routing meaningful are accepted.
@@ -200,6 +215,8 @@ def load_config(path: str | Path) -> Config:
             raise ConfigError(f"invalid IRC channel: {channel!r}")
         if backend not in {"codex", "opencode", "claude", "pi", "omp"}:
             raise ConfigError(f"unsupported backend {backend!r} for {channel}")
+        if channel.lower() in channels:
+            raise ConfigError("[irc].channels must have unique channel names")
         channels[channel.lower()] = backend
 
     codex = _table(raw, "codex") if "codex" in channels.values() else None
@@ -208,6 +225,25 @@ def load_config(path: str | Path) -> Config:
     pi = _table(raw, "pi") if "pi" in channels.values() else None
     omp = _table(raw, "omp") if "omp" in channels.values() else None
     stack = _table(raw, "stack")
+    voice = _table(raw, "voice") if "voice" in raw else None
+    pm = _table(raw, "pm") if "pm" in raw else None
+    projects: dict[str, str] = {}
+    if pm is not None:
+        projects_raw = _table(pm, "projects")
+        if not projects_raw:
+            raise ConfigError("[pm].projects must be a non-empty table")
+        for project, channel in projects_raw.items():
+            if (
+                not isinstance(project, str)
+                or not project.strip()
+                or not isinstance(channel, str)
+                or not channel.strip()
+            ):
+                raise ConfigError("[pm].projects must map non-empty project names to channel names")
+            project = project.strip()
+            if project in projects:
+                raise ConfigError("[pm].projects must have unique project names")
+            projects[project] = channel.strip().lower()
     permission_mode = "default"
     if claude is not None:
         permission_mode = _optional_str(claude, "permission_mode", "claude") or "default"
@@ -302,6 +338,20 @@ def load_config(path: str | Path) -> Config:
             if omp is not None
             else None
         ),
+        voice=(
+            VoiceConfig(model_path=_path(_required_str(voice, "model_path", "voice")))
+            if voice is not None
+            else None
+        ),
+        pm=(
+            PMConfig(
+                control_socket=_path(_required_str(pm, "control_socket", "pm")),
+                coordinator_channel=_required_str(pm, "coordinator_channel", "pm").lower(),
+                projects=MappingProxyType(projects),
+            )
+            if pm is not None
+            else None
+        ),
     )
     _validate_cross_fields(result)
     return result
@@ -316,6 +366,12 @@ def _validate_cross_fields(config: Config) -> None:
     for root in config.bridge.allowed_roots:
         if not root.is_absolute():
             raise ConfigError(f"allowlisted root is not absolute: {root}")
+    if config.pm is not None:
+        targets = (config.pm.coordinator_channel, *config.pm.projects.values())
+        if any(channel not in config.irc.channels for channel in targets):
+            raise ConfigError("[pm] channels must be statically configured in [irc].channels")
+        if len(set(targets)) != len(targets):
+            raise ConfigError("[pm] coordinator and project channels must be distinct")
 
 
 def load_secret_env(path: Path) -> dict[str, str]:

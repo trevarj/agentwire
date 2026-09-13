@@ -236,3 +236,32 @@ def test_doctor_reports_omp_binary_and_live_sockets(
 
     assert "omp: /bin/omp" in results
     assert f"omp sockets: 1 live in {socket_dir}" in results
+
+
+def test_doctor_warns_when_pi_binary_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agentwire import stack
+
+    config = SimpleNamespace(
+        path=tmp_path / "config.toml",
+        secrets=SimpleNamespace(env_file=tmp_path / "secrets.env"),
+        irc=SimpleNamespace(ca_file=tmp_path / "ca.pem"),
+        stack=SimpleNamespace(ssh_binary="ssh"),
+        codex=None,
+        opencode=None,
+        claude=None,
+        pi=SimpleNamespace(binary="pi", socket_dir=tmp_path),
+        omp=None,
+    )
+    monkeypatch.setattr(stack, "_private_file", lambda *_args: None)
+    monkeypatch.setattr(stack, "install_secret_env", lambda _config: None)
+    monkeypatch.setattr(stack.ssl, "create_default_context", lambda **_kwargs: None)
+    monkeypatch.setattr(stack.shutil, "which", lambda name: None if name == "pi" else "/bin/ssh")
+
+    results = stack.doctor(config)  # type: ignore[arg-type]
+
+    assert any(result.startswith("warning:") and "pi" in result for result in results)
+    monkeypatch.setattr(stack.shutil, "which", lambda _name: None)
+    with pytest.raises(stack.StackError):
+        stack.doctor(config)  # type: ignore[arg-type]

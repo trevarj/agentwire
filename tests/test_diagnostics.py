@@ -20,7 +20,7 @@ from agentwire.backends.codex import CodexBackend
 from agentwire.backends.omp import OmpBackend
 from agentwire.backends.opencode import OpenCodeBackend
 from agentwire.backends.pi import PiBackend
-from agentwire.config import ClaudeConfig, OmpConfig, PiConfig
+from agentwire.config import ClaudeConfig, OmpConfig, PiConfig, VoiceConfig
 from agentwire.diagnostics import DiagnosticCheck, report, validate_report
 from agentwire.irc import IRCMessage, _OutgoingMessage
 from agentwire.protocol import (
@@ -131,6 +131,45 @@ def test_doctor_collects_independent_failures_without_secret_values(
     assert by_code["runtime.live"]["status"] == "unknown"
     assert "private-secret" not in json.dumps(value)
     assert "/private" not in json.dumps(value)
+    assert not {"binary.ffmpeg", "binary.whisper", "voice.model"} & by_code.keys()
+
+
+@pytest.mark.parametrize(
+    ("missing_binary", "model_kind"),
+    [(None, "regular"), ("ffmpeg", "missing"), ("whisper-cli", "directory"), (None, "unreadable")],
+)
+def test_doctor_voice_checks_are_independent_and_do_not_disclose_paths(
+    tmp_path: Path, monkeypatch, capsys, missing_binary: str | None, model_kind: str
+) -> None:
+    bridge, _irc, _backend = make_bridge(tmp_path)
+    model = tmp_path / "private-model-name.bin"
+    if model_kind == "directory":
+        model.mkdir()
+    elif model_kind != "missing":
+        model.write_bytes(b"private-model-content")
+        if model_kind == "unreadable":
+            model.chmod(0o000)
+            monkeypatch.setattr(stack.os, "access", lambda _path, _mode: False)
+    config = replace(bridge.config, voice=VoiceConfig(model))
+    config.path.write_text("placeholder")
+    config.path.chmod(0o600)
+    monkeypatch.setattr(stack, "load_config", lambda _path: config)
+    monkeypatch.setattr(
+        stack.shutil, "which", lambda binary: None if binary == missing_binary else "/private/bin"
+    )
+    value = stack.doctor_report(config.path)
+    validate_report(value)
+    by_code = {check["code"]: check for check in value["checks"]}
+    assert by_code["binary.ffmpeg"]["status"] == ("error" if missing_binary == "ffmpeg" else "ok")
+    assert by_code["binary.whisper"]["status"] == (
+        "error" if missing_binary == "whisper-cli" else "ok"
+    )
+    assert by_code["voice.model"]["status"] == ("ok" if model_kind == "regular" else "error")
+    captured = capsys.readouterr()
+    serialized = json.dumps(value) + captured.out + captured.err
+    assert "/private" not in serialized
+    assert "private-model" not in serialized
+    assert str(tmp_path) not in serialized
 
 
 @pytest.mark.asyncio

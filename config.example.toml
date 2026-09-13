@@ -74,3 +74,17 @@ remote_host = "127.0.0.1"
 remote_port = 6698
 remote_cert_path = "/path/to/ergo/fullchain.pem"
 startup_timeout = 30
+
+# Optional. Voice transcription is disabled when this table is absent.
+# [voice]
+# model_path = "~/.local/share/whisper/ggml-base.en-q5_1.bin"
+
+# Optional. PM control is disabled when this table is absent.
+# The coordinator and projects must name distinct static [irc].channels, e.g.
+# channels = { "#pm" = "omp", "#touch-hockey" = "codex", "#motd-dev" = "omp" }
+# Tool approvals in these PM channels are automatic for active bound sessions.
+# Use stack/run --manual-approval to opt out; questions remain interactive.
+# [pm]
+# control_socket = "~/Workspace/.agentwire/control.sock"
+# coordinator_channel = "#pm"
+# projects = { "touch-hockey" = "#touch-hockey", "motd-dev" = "#motd-dev" }

@@ -169,9 +169,13 @@ it also rejects `hist:true` actions and playback-tagged messages. Reconnecting c
 Mutating actions emit `action.accepted` before invoking a backend and exactly one of
 `action.succeeded`, `action.failed`, or `action.uncertain` afterward. Each carries the action UUID
 in `reply`, and mutations are deduplicated durably by UUID. Read actions (`sync.request`, workspace
-and session listing, and history) are safe to repeat and return only their reply-correlated data;
+and session listing, and history) are safe to repeat and return reply-correlated data;
 `history.end` terminates a history response. Any action can still return `action.failed`. Clients
 MUST NOT automatically retry a mutation merely because an acknowledgement is missing.
+After the correlated sync snapshot, Agentwire also republishes still-pending `request.opened`
+events with fresh event UUIDs and the original request, session, turn, and item IDs. Clients
+upsert these live requests by `rid`; replay does not resolve a request or repeat a tool action.
+Resolved requests are not replayed, and these recovery events are not added to history.
 
 `action.status.request` is a fast, reply-correlated read. Its `data.actionId` is a mutation UUID
 and its optional `data.channel` selects the original channel; omitting it selects the receiving

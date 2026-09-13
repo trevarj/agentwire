@@ -207,6 +207,8 @@ def doctor_report(path: Path) -> dict[str, Any]:
         backend = getattr(config, name)
         if backend is not None:
             binaries[name] = backend.binary
+    if config.voice is not None:
+        binaries.update({"ffmpeg": "ffmpeg", "whisper": "whisper-cli"})
     available = {}
     for name, binary in binaries.items():
         available[name] = check(
@@ -215,6 +217,20 @@ def doctor_report(path: Path) -> dict[str, Any]:
             f"{name} executable is available.",
             f"{name} executable is unavailable.",
             "Check executable availability in the project environment.",
+        )
+    if config.voice is not None:
+
+        def validate_voice_model() -> None:
+            model_path = config.voice.model_path
+            if not model_path.is_file() or not os.access(model_path, os.R_OK):
+                raise StackError("voice model unavailable")
+
+        check(
+            "voice.model",
+            validate_voice_model,
+            "Voice model is a readable regular file.",
+            "Voice model is unavailable, unreadable, or not a regular file.",
+            "Install a readable regular Whisper model file.",
         )
     if config.claude is not None:
         # CLI auth status is the existing bounded local doctor probe. Live IRC
@@ -295,7 +311,14 @@ def doctor(config: Config) -> list[str]:
         checks["pi"] = config.pi.binary
     if config.omp is not None:
         checks["omp"] = config.omp.binary
-    results = [f"{label}: {_binary(binary)}" for label, binary in checks.items()]
+    results = []
+    for label, binary in checks.items():
+        try:
+            results.append(f"{label}: {_binary(binary)}")
+        except StackError:
+            if label != "pi":
+                raise
+            results.append("warning: pi binary is not on PATH; creating Pi sessions is unavailable")
     results.append("ergo fakelag: disable privately or exempt bot with nofakelag-only oper class")
     if config.claude is not None:
         results.append(f"claude auth: {_claude_credentials(config.claude)}")

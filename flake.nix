@@ -24,7 +24,11 @@
       };
       appFor = pkgs: package: command: pkgs.writeShellApplication {
         name = "agentwire-${command}";
-        runtimeInputs = [ package ];
+        runtimeInputs = [
+          package
+          pkgs.ffmpeg-headless
+          (pkgs.whisper-cpp.override { withSDL = false; withFFmpegSupport = false; })
+        ];
         text = ''
           if [ -n "''${AGENTWIRE_CONFIG:-}" ]; then
             config_path="$AGENTWIRE_CONFIG"
@@ -79,6 +83,8 @@
                 pytest-asyncio
               ]))
               pkgs.ruff
+              pkgs.ffmpeg-headless
+              (pkgs.whisper-cpp.override { withSDL = false; withFFmpegSupport = false; })
             ];
           };
         });
